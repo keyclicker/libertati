@@ -26,7 +26,7 @@ She is a bit of a troll, but she is also a good listener.
 You play the role in chat. Respond with regular text. without any special formatting.
 """
 
-greeter_prompt = f"""Greeting you with a smile and a wave. I am {bot_name}, and I want to speak about politics today."""
+greeter_prompt = f"""Доброго дня, чате! Я {bot_full_name}. Я тут, щоб поговорити про лібертаріанство."""
 
 # Message Filters
 #==============================================================================
@@ -39,7 +39,7 @@ filter_random = FilterRandom()
 
 class FilterReplyToMe(filters.MessageFilter):
     def filter(self, message):
-        return message.reply_to_message and message.reply_to_message.from_user.name == "@libertati_bot"
+        return message.reply_to_message and message.reply_to_message.from_user.name == bot_tg_name
 
 filter_reply_to_me = FilterReplyToMe()
 
@@ -55,22 +55,32 @@ def get_gpt_response(messages: list[dict]):
     response_text = response['choices'][0]['message']['content']
 
     # log bot response
-    logging.info("[Ana Tati]: " + response_text)
+    logging.info(f"Response:\n{bot_full_name} ({bot_name}): {response_text}")
     return response_text
 
 
-def tg_to_gpt(message):
+def tg_to_gpt(message: Message):
     message_text = message.text
     user_full_name = message.from_user.full_name
     user_name = message.from_user.name
 
     role = "assistant" if user_name == bot_tg_name else "user"
-    content = f"{user_full_name}({user_name}): {message_text}" if role == "user" else message_text
+    content = f"{user_full_name} ({user_name}): {message_text}" if role == "user" else message_text
     content = re.sub(bot_tg_name, bot_name, content)
     
     return (
        {"role": role, "content": content} 
     )
+
+
+def gpt_list_to_text(message: list[dict]):
+    text = "\n"
+    for m in message:
+        if m['role'] == "user":
+            text += m['content'] + "\n"
+        elif m['role'] == "assistant":
+            text += f"{bot_full_name} ({bot_name}): " + m['content'] + "\n"
+    return text
 
 
 def wrap_gpt_thread(thread_messages: list[dict]):
@@ -80,7 +90,6 @@ def wrap_gpt_thread(thread_messages: list[dict]):
         {"role": "assistant", "content": greeter_prompt},
         *thread_messages
     ]
-
     return messages
 
 # Message log
@@ -93,13 +102,13 @@ class TgMessageLog:
     # def __del__(self):
 
     def add_message(self, message: Message):
-        if message.chat_id not in self.data:
-            self.data[message.chat_id] = {}
+        if message.chat.id not in self.data:
+            self.data[message.chat.id] = {}
 
-        self.data[message.chat_id][message.id] = message
+        self.data[message.chat.id][message.message_id] = message
 
     def get_message(self, chat_id: int, message_id: int):
-        self.data.get(chat_id, {}).get(message_id, None)
+        return self.data.get(chat_id, {}).get(message_id, None)
 
     def get_thread(self, message: Message, max_len):
         thread_len = 0
@@ -112,7 +121,7 @@ class TgMessageLog:
             reply_to = cur_message.reply_to_message
 
             if reply_to:
-                h_message = self.get_message(reply_to.chat_id, reply_to.message_id);
+                h_message = self.get_message(reply_to.chat.id, reply_to.message_id);
                 cur_message = h_message or reply_to
             else:
                 cur_message = None
@@ -138,22 +147,23 @@ async def history(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 
 async def echo(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    message = update.message
+
     # add message to history and log
-    tg_message_log.add_message(update.message)
-    logging.info(f"Chat id: {update.effective_chat.id}")
+    tg_message_log.add_message(message)
+    logging.info(f"Chat id: {message.chat.id}")
 
     # get message log, with max_thread_len characters
-    gpt_thread = tg_message_log.get_gpt_thread(update.message, max_thread_len)
-
-    logging.info(f"Thread: {gpt_thread}")
+    gpt_thread = tg_message_log.get_gpt_thread(message, max_thread_len)
+    logging.info(f"Thread: {gpt_list_to_text(gpt_thread)}")
 
     messages = wrap_gpt_thread(gpt_thread)
     response_text = get_gpt_response(messages)
 
     # send response
     bot_message = await context.bot.send_message(
-        chat_id=update.effective_chat.id,
-        reply_to_message_id=update.message.message_id,
+        chat_id=message.chat.id,
+        reply_to_message_id=message.message_id,
         text=response_text
     )
 
