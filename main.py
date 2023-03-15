@@ -97,6 +97,11 @@ def wrap_gpt_thread(thread_messages: list[dict]):
     ]
     return messages
 
+
+def filter_output_message(message: str):
+    return re.sub(fr"({bot_full_name}|{bot_name}|) *({bot_full_name}|{bot_name}|) *: *", "", message)
+
+
 # Message log
 #==============================================================================
 # class that handles message history
@@ -164,6 +169,7 @@ async def echo(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     messages = wrap_gpt_thread(gpt_thread)
     response_text = get_gpt_response(messages)
+    response_text = filter_output_message(response_text)
 
     # send response
     bot_message = await context.bot.send_message(
