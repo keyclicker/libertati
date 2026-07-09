@@ -20,6 +20,8 @@ dependencies = [
 
 [project.scripts]
 libertati = "libertati.main:run"
+libertati-trigger = "libertati.trigger:main"
+libertati-login = "libertati.login:main"
 
 [dependency-groups]
 dev = [

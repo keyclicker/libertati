@@ -55,3 +55,33 @@ async def test_unknown_tool_returns_error(toolbox):
 async def test_bad_path_returns_error(toolbox):
     out = json.loads(await toolbox.dispatch("read_memory", {"path": "../oops.md"}))
     assert "error" in out
+
+
+class FakeReader:
+    supports_reading = True
+
+    async def read_source(self, source, limit=15):
+        return [make_message("interesting channel post", message_id=1, handle="@author")]
+
+
+async def test_read_telegram_unavailable_without_reader(toolbox):
+    out = json.loads(await toolbox.dispatch("read_telegram", {"source": "@chan"}))
+    assert "error" in out
+
+
+async def test_read_telegram_public_only_refuses_numeric(history, memory):
+    tb = ToolBox(history, memory, StubNews(), reader=FakeReader(), public_only=True)
+    out = json.loads(await tb.dispatch("read_telegram", {"source": "-100123"}))
+    assert "error" in out
+
+
+async def test_read_telegram_reads_public_channel(history, memory):
+    tb = ToolBox(history, memory, StubNews(), reader=FakeReader(), public_only=True)
+    out = json.loads(await tb.dispatch("read_telegram", {"source": "@chan"}))
+    assert "interesting channel post" in out["transcript"]
+
+
+async def test_read_telegram_numeric_allowed_when_public_only_off(history, memory):
+    tb = ToolBox(history, memory, StubNews(), reader=FakeReader(), public_only=False)
+    out = json.loads(await tb.dispatch("read_telegram", {"source": "-100123"}))
+    assert "interesting channel post" in out["transcript"]

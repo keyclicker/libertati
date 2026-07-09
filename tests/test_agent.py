@@ -80,3 +80,21 @@ async def test_dream_writes_diary(settings, history, memory):
     assert "свободу" in reflection
     diary = memory.read(memory.diary_path())
     assert "свободу" in diary
+
+
+async def test_browse_returns_remark_and_notes(settings, history, memory, tool_call):
+    script = [
+        assistant(tool_calls=[tool_call("c1", "update_memory",
+                  {"path": "reading.md", "content": "- цікавий пост про ринки"})]),
+        assistant("бачила в каналі мут про ринки, лол"),
+    ]
+    agent, _ = build_agent(settings, history, memory, script)
+    remark = await agent.browse("канал @markets", "author: ринки падають")
+    assert "ринки" in remark
+    assert "ринки" in memory.read("reading.md")
+
+
+async def test_browse_pass(settings, history, memory):
+    agent, _ = build_agent(settings, history, memory, [assistant("PASS")])
+    remark = await agent.browse("канал @dull", "author: нічого цікавого")
+    assert remark.strip().upper() == "PASS"

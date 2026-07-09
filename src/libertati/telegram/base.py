@@ -24,6 +24,7 @@ class IncomingMessage:
     reply_to_id: int | None = None
     is_group: bool = False
     chat_title: str | None = None
+    chat_username: str | None = None    # public chat @username, if any
     ts: float | None = None
     from_self: bool = False             # message authored by the bot/account itself
 
@@ -33,6 +34,17 @@ class OutgoingMessage:
     chat_id: int
     text: str
     reply_to_id: int | None = None
+
+
+@dataclass(slots=True)
+class Source:
+    """A chat/channel the account can read from."""
+
+    id: int
+    title: str | None = None
+    username: str | None = None         # public @username, if any
+    kind: str = "chat"                  # "channel" | "group" | "user"
+    is_public: bool = False
 
 
 class TelegramClient(ABC):
@@ -47,6 +59,14 @@ class TelegramClient(ABC):
     async def _dispatch(self, message: IncomingMessage) -> None:
         if self._handler is not None:
             await self._handler(message)
+
+    async def connect(self) -> None:
+        """Establish the connection and learn our own identity, without blocking.
+
+        Adapters override this; the default is a no-op so lightweight test doubles
+        and one-shot tooling can rely on it.
+        """
+        return None
 
     @abstractmethod
     async def start(self) -> None:
@@ -66,3 +86,15 @@ class TelegramClient(ABC):
     @abstractmethod
     def self_username(self) -> str | None:
         """The bot/account username, once connected."""
+
+    # -- reading other chats/channels (account mode only) -------------------
+    # Concrete no-op defaults so bot-mode adapters inherit "unsupported".
+    @property
+    def supports_reading(self) -> bool:
+        return False
+
+    async def list_readable_sources(self, limit: int = 100) -> list[Source]:
+        return []
+
+    async def read_source(self, source: int | str, limit: int = 20) -> list[IncomingMessage]:
+        return []

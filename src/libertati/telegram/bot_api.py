@@ -17,6 +17,7 @@ def _to_incoming(msg: agot.Message, self_id: int | None) -> IncomingMessage:
     name = user.full_name if user else None
     reply_to = msg.reply_to_message.message_id if msg.reply_to_message else None
     is_group = msg.chat.type in ("group", "supergroup")
+    chat_username = f"@{msg.chat.username}" if getattr(msg.chat, "username", None) else None
     return IncomingMessage(
         chat_id=msg.chat.id,
         message_id=msg.message_id,
@@ -26,6 +27,7 @@ def _to_incoming(msg: agot.Message, self_id: int | None) -> IncomingMessage:
         reply_to_id=reply_to,
         is_group=is_group,
         chat_title=msg.chat.title or (name if not is_group else None),
+        chat_username=chat_username,
         ts=msg.date.timestamp() if msg.date else None,
         from_self=bool(self_id and user and user.id == self_id),
     )
@@ -49,11 +51,14 @@ class BotApiClient(TelegramClient):
     def self_username(self) -> str | None:
         return self._username
 
-    async def start(self) -> None:
+    async def connect(self) -> None:
         me = await self._bot.get_me()
         self._self_id = me.id
         self._username = f"@{me.username}" if me.username else None
         log.info("Bot API mode online as %s", self._username)
+
+    async def start(self) -> None:
+        await self.connect()
         await self._dp.start_polling(self._bot, handle_signals=False)
 
     async def send_message(

@@ -9,6 +9,7 @@ from ..logging import get_logger
 from ..news.reader import NewsReader, format_digest
 from ..storage.history import HistoryStore
 from ..storage.memory import MemoryStore
+from ..telegram.base import IncomingMessage, TelegramClient
 
 log = get_logger("llm.tools")
 
@@ -93,6 +94,25 @@ TOOL_SCHEMAS: list[dict[str, Any]] = [
             },
         },
     },
+    {
+        "type": "function",
+        "function": {
+            "name": "read_telegram",
+            "description": (
+                "Read the most recent messages of a Telegram channel or chat (by @username or "
+                "numeric id). Only works when running as a user account; may be limited to "
+                "public @channels."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "source": {"type": "string", "description": "@username or numeric chat id"},
+                    "limit": {"type": "integer", "default": 15},
+                },
+                "required": ["source"],
+            },
+        },
+    },
 ]
 
 
@@ -104,10 +124,14 @@ class ToolBox:
         history: HistoryStore,
         memory: MemoryStore,
         news: NewsReader,
+        reader: TelegramClient | None = None,
+        public_only: bool = True,
     ) -> None:
         self.history = history
         self.memory = memory
         self.news = news
+        self.reader = reader
+        self.public_only = public_only
 
     @property
     def schemas(self) -> list[dict[str, Any]]:
@@ -159,3 +183,31 @@ class ToolBox:
     async def _tool_read_news(self, args: dict[str, Any]) -> str:
         items = await self.news.fetch(topic=args.get("topic"))
         return json.dumps({"digest": format_digest(items)}, ensure_ascii=False)
+
+    async def _tool_read_telegram(self, args: dict[str, Any]) -> str:
+        if self.reader is None or not self.reader.supports_reading:
+            return json.dumps(
+                {"error": "reading Telegram is only available in account mode"}
+            )
+        source = str(args["source"]).strip()
+        if self.public_only and not source.startswith("@"):
+            return json.dumps(
+                {"error": "only public @channels may be read (browse_public_only is on)"}
+            )
+        messages = await self.reader.read_source(source, limit=int(args.get("limit", 15)))
+        return json.dumps(
+            {"source": source, "transcript": format_transcript(messages)},
+            ensure_ascii=False,
+        )
+
+
+def format_transcript(messages: list[IncomingMessage], limit: int = 40) -> str:
+    if not messages:
+        return "(no messages)"
+    lines = []
+    for m in messages[-limit:]:
+        who = m.user_name or m.user_handle or "?"
+        text = " ".join((m.text or "").split())
+        if text:
+            lines.append(f"{who}: {text}")
+    return "\n".join(lines) if lines else "(no text messages)"

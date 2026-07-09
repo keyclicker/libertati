@@ -100,3 +100,57 @@ async def test_dispatch_calls_handler():
     d.on_message(handler)
     await d._dispatch(IncomingMessage(chat_id=1, message_id=1, text="yo"))
     assert received and received[0].text == "yo"
+
+
+def test_bot_api_maps_chat_username():
+    from types import SimpleNamespace
+
+    from libertati.telegram.bot_api import _to_incoming
+
+    msg = SimpleNamespace(
+        chat=SimpleNamespace(id=5, type="supergroup", title="G", username="publicgroup"),
+        message_id=9,
+        text="hi",
+        caption=None,
+        from_user=SimpleNamespace(id=42, username="alice", full_name="Alice A"),
+        reply_to_message=None,
+        date=None,
+    )
+    inc = _to_incoming(msg, self_id=1)
+    assert inc.chat_username == "@publicgroup"
+
+
+async def test_base_reading_unsupported_by_default():
+    class Dummy(TelegramClient):
+        async def start(self): ...
+        async def send_message(self, chat_id, text, reply_to_id=None): return None
+        async def stop(self): ...
+        @property
+        def self_username(self): return "@x"
+
+    d = Dummy()
+    assert d.supports_reading is False
+    assert await d.list_readable_sources() == []
+    assert await d.read_source("@anything") == []
+
+
+def test_account_message_to_incoming():
+    from datetime import UTC, datetime
+    from types import SimpleNamespace
+
+    from libertati.telegram.account import _message_to_incoming
+
+    msg = SimpleNamespace(
+        id=7,
+        message="hello there",
+        sender=SimpleNamespace(username="bob", first_name="Bob", last_name="B"),
+        reply_to_msg_id=None,
+        date=datetime(2021, 1, 1, tzinfo=UTC),
+        out=False,
+    )
+    inc = _message_to_incoming(msg, chat_id=99, title="Chan", username="@chan")
+    assert inc.chat_id == 99
+    assert inc.text == "hello there"
+    assert inc.user_handle == "@bob"
+    assert inc.user_name == "Bob B"
+    assert inc.chat_username == "@chan"

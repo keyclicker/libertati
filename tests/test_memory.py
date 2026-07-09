@@ -50,5 +50,5 @@ def test_non_md_rejected(memory):
 def test_snapshot(memory):
     memory.overwrite("world.md", "news")
     snap = memory.snapshot()
-    assert set(snap) == {"self.md", "world.md", "social.md", "todo.md"}
+    assert set(snap) == {"self.md", "world.md", "social.md", "todo.md", "reading.md"}
     assert snap["world.md"].strip() == "news"

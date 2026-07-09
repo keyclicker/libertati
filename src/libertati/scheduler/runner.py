@@ -77,6 +77,20 @@ class Scheduler:
                 replace_existing=True,
                 next_run_time=datetime.now() + timedelta(seconds=30),
             )
+        if s.browse_enabled:
+            if self.client.supports_reading:
+                self._scheduler.add_job(
+                    self._plan_browses,
+                    CronTrigger(hour=0, minute=2),
+                    id="plan_browses",
+                    replace_existing=True,
+                )
+                self._plan_browses()
+            else:
+                log.warning(
+                    "browse_enabled is set but reading is unsupported in %s mode; skipping",
+                    s.telegram_mode,
+                )
         self._scheduler.start()
         log.info("scheduler started")
 
@@ -99,6 +113,25 @@ class Scheduler:
         if planned == 0:
             log.info("no heartbeat slots left today")
 
+    def _plan_browses(self) -> None:
+        now = datetime.now()
+        planned = 0
+        for i in range(max(1, self.settings.browse_times_per_day)):
+            when = _random_time_in_day(now)
+            if when <= now:
+                continue
+            self._scheduler.add_job(
+                jobs.browse_job,
+                DateTrigger(run_date=when),
+                args=[self.agent, self.client, self.history, self.settings],
+                id=f"browse_{i}",
+                replace_existing=True,
+            )
+            planned += 1
+            log.info("browse scheduled at %s", when.strftime("%H:%M"))
+        if planned == 0:
+            log.info("no browse slots left today")
+
     def shutdown(self) -> None:
         if self._scheduler.running:
             self._scheduler.shutdown(wait=False)
@@ -112,4 +145,11 @@ def _random_time_today(now: datetime, slot: int) -> datetime:
         start, end = time(17, 0), time(22, 0)
     minutes = random.randint(0, (end.hour - start.hour) * 60 + (end.minute - start.minute))
     base = now.replace(hour=start.hour, minute=start.minute, second=0, microsecond=0)
+    return base + timedelta(minutes=minutes)
+
+
+def _random_time_in_day(now: datetime, start_hour: int = 8, end_hour: int = 23) -> datetime:
+    """A random time within the [start_hour, end_hour] window today."""
+    minutes = random.randint(0, (end_hour - start_hour) * 60)
+    base = now.replace(hour=start_hour, minute=0, second=0, microsecond=0)
     return base + timedelta(minutes=minutes)

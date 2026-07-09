@@ -56,6 +56,16 @@ class Settings(BaseSettings):
         default_factory=lambda: list(DEFAULT_NEWS_FEEDS)
     )
 
+    # Chats the bot is allowed to talk in (ids and/or @usernames). Empty = everywhere.
+    allowed_chats: Annotated[list[str], NoDecode] = Field(default_factory=list)
+
+    # --- Browsing (reading other chats/channels; account mode only) ---------
+    browse_enabled: bool = False
+    browse_channels: Annotated[list[str], NoDecode] = Field(default_factory=list)
+    browse_public_only: bool = True
+    browse_times_per_day: int = 3
+    browse_read_limit: int = 15
+
     # --- Persona ------------------------------------------------------------
     bot_full_name: str = "Ana Tati"
     bot_handle: str = "@libertati"
@@ -64,13 +74,22 @@ class Settings(BaseSettings):
     # --- Logging ------------------------------------------------------------
     log_level: str = "INFO"
 
-    @field_validator("news_feeds", mode="before")
+    @field_validator("news_feeds", "allowed_chats", "browse_channels", mode="before")
     @classmethod
-    def _split_feeds(cls, v: object) -> object:
+    def _split_csv(cls, v: object) -> object:
         # allow comma-separated env value
         if isinstance(v, str):
             return [item.strip() for item in v.split(",") if item.strip()]
         return v
+
+    def is_chat_allowed(self, chat_id: int, username: str | None) -> bool:
+        """Whether the bot may proactively talk in this chat."""
+        if not self.allowed_chats:
+            return True
+        allowed = {entry.lstrip("@").lower() for entry in self.allowed_chats}
+        if str(chat_id) in allowed:
+            return True
+        return bool(username and username.lstrip("@").lower() in allowed)
 
     def validate_runtime(self) -> None:
         """Assert the settings required for the chosen mode are present."""

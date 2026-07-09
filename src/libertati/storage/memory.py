@@ -8,6 +8,7 @@ Layout under ``memory_dir``::
     world.md            running digest of news & current events read
     social.md           relationship graph, who-knows-whom, open threads
     todo.md             follow-ups to raise with users during heartbeat
+    reading.md          interesting things read while browsing other chats/channels
     diary/<date>.md     nightly dream reflections
 """
 
@@ -30,7 +31,7 @@ def slugify(value: str) -> str:
 class MemoryStore:
     """Reads and writes markdown memory files, sandboxed to ``root``."""
 
-    GENERAL_FILES = ("self.md", "world.md", "social.md", "todo.md")
+    GENERAL_FILES = ("self.md", "world.md", "social.md", "todo.md", "reading.md")
 
     def __init__(self, root: Path | str) -> None:
         self.root = Path(root).resolve()

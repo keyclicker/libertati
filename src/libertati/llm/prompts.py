@@ -61,3 +61,12 @@ def dream_instruction(s: Settings) -> str:
         "групи (group/<slug>.md), світ (world.md) та себе (self.md) через update_memory. "
         "Наприкінці напиши короткий щоденниковий запис-роздум (2-5 речень) — його збережуть."
     )
+
+
+def browse_instruction(s: Settings, source_desc: str, content: str) -> str:
+    return (
+        f"Ти щойно почитала {source_desc}. Ось нещодавні повідомлення звідти:\n\n{content}\n\n"
+        "Якщо трапилось щось цікаве — коротко занотуй це у reading.md через update_memory "
+        "(mode=append). Потім, якщо є що обговорити з людьми, поверни ОДНУ коротку репліку "
+        "для чату в своєму стилі. Якщо нічого вартого уваги — поверни рівно 'PASS'."
+    )

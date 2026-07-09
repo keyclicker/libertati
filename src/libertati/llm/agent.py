@@ -151,6 +151,21 @@ class Agent:
             self.memory.append(self.memory.diary_path(), entry)
         return reflection
 
+    async def browse(self, source_desc: str, content: str) -> str:
+        """React to messages read from another chat/channel.
+
+        The model may save something to reading.md, then returns a chat remark or 'PASS'.
+        """
+        messages: list[dict[str, Any]] = [
+            {"role": "system", "content": prompts.system_prompt(self.settings)},
+            {"role": "system", "content": self._memory_context_general()},
+            {
+                "role": "user",
+                "content": prompts.browse_instruction(self.settings, source_desc, content),
+            },
+        ]
+        return await self._run_loop(messages)
+
     def _memory_context_general(self) -> str:
         parts = ["## Памʼять (нотатки)"]
         for name, content in self.memory.snapshot().items():

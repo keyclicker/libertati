@@ -42,6 +42,8 @@ class App:
             return
         if not self.settings.respond_to_all:
             return
+        if not self.settings.is_chat_allowed(incoming.chat_id, incoming.chat_username):
+            return
         try:
             reply = await self.agent.respond(incoming)
         except Exception as exc:  # noqa: BLE001
@@ -55,16 +57,26 @@ class App:
         if sent is not None:
             await self.history.add_message(sent, role="assistant")
 
-    async def run(self) -> None:
-        await self.db.connect()
+    def _build_runtime(self) -> None:
+        """Assemble history/agent/scheduler (assumes the DB is already connected)."""
         self.history = HistoryStore(self.db, self.settings.max_thread_chars)
         llm = LLMClient(self.settings)
-        tools = ToolBox(self.history, self.memory, self.news)
+        tools = ToolBox(
+            self.history,
+            self.memory,
+            self.news,
+            reader=self.client,
+            public_only=self.settings.browse_public_only,
+        )
         self.agent = Agent(self.settings, llm, tools, self.history, self.memory)
         self.scheduler = Scheduler(
             self.settings, self.agent, self.client, self.history, self.memory, self.news
         )
 
+    async def run(self) -> None:
+        await self.db.connect()
+        self._build_runtime()
+        assert self.scheduler is not None
         self.client.on_message(self._on_message)
         self.scheduler.start()
         log.info("libertati is up (mode=%s)", self.settings.telegram_mode)
