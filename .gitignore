@@ -131,3 +131,15 @@ dmypy.json
 log/
 .DS_Store
 .idea/
+.vscode/
+
+# libertati runtime state
+/data/
+/memory/*
+!/memory/.gitkeep
+*.session
+*.session-journal
+.ruff_cache/
+
+# uv
+# (uv.lock IS committed)
