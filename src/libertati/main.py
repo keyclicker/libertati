@@ -4,7 +4,9 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
+import random
 
+from .behavior import mentions_bot, typing_delay_seconds
 from .config import Settings, load_settings
 from .llm.agent import Agent
 from .llm.client import LLMClient
@@ -32,7 +34,11 @@ class App:
             content_max=settings.log_content_max_chars,
         )
         self.db = Database(settings.db_path)
-        self.memory = MemoryStore(settings.memory_dir, events=self.events)
+        self.memory = MemoryStore(
+            settings.memory_dir,
+            events=self.events,
+            max_file_chars=settings.memory_max_file_chars,
+        )
         self.news = NewsReader(settings.news_feeds)
         self.client = build_client(settings)
         # history/agent are built after the DB connects
@@ -66,6 +72,13 @@ class App:
             skip = "respond_to_all_off"
         elif not allowed:
             skip = "not_allowed"
+        elif (
+            incoming.is_group
+            and not await self._is_addressed(incoming)
+            and random.random() >= self.settings.group_reply_chance
+        ):
+            # Like a person, stay out of most ambient group chatter unless spoken to.
+            skip = "ambient_group"
         if skip is not None:
             self.events.emit("skip", reason=skip, chat_id=incoming.chat_id)
             return
@@ -78,6 +91,10 @@ class App:
             return
         if not reply:
             return
+        if self.settings.typing_delay_enabled:
+            await asyncio.sleep(
+                typing_delay_seconds(reply, self.settings.typing_delay_max_seconds)
+            )
         sent = await self.client.send_message(
             incoming.chat_id, reply, reply_to_id=incoming.message_id
         )
@@ -86,6 +103,17 @@ class App:
         )
         if sent is not None:
             await self.history.add_message(sent, role="assistant")
+
+    async def _is_addressed(self, incoming: IncomingMessage) -> bool:
+        """Whether this group message is aimed at the bot (mention or reply-to-us)."""
+        s = self.settings
+        if mentions_bot(incoming.text, [s.bot_username, s.bot_handle, s.bot_full_name]):
+            return True
+        if incoming.reply_to_id is not None and self.history is not None:
+            replied = await self.history.get_message(incoming.chat_id, incoming.reply_to_id)
+            if replied is not None and replied.role == "assistant":
+                return True
+        return False
 
     def _build_runtime(self) -> None:
         """Assemble history/agent/scheduler (assumes the DB is already connected)."""

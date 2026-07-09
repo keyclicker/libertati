@@ -35,10 +35,16 @@ class MemoryStore:
 
     GENERAL_FILES = ("self.md", "world.md", "social.md", "todo.md", "reading.md")
 
-    def __init__(self, root: Path | str, events: EventLogger | None = None) -> None:
+    def __init__(
+        self,
+        root: Path | str,
+        events: EventLogger | None = None,
+        max_file_chars: int | None = None,
+    ) -> None:
         self.root = Path(root).resolve()
         self.root.mkdir(parents=True, exist_ok=True)
         self.events = events or NULL_EVENTS
+        self.max_file_chars = max_file_chars
 
     # -- path safety ---------------------------------------------------------
     def _resolve(self, rel: str) -> Path:
@@ -55,11 +61,26 @@ class MemoryStore:
         path = self._resolve(rel)
         return path.read_text(encoding="utf-8") if path.exists() else ""
 
+    def _trim(self, text: str) -> str:
+        """Keep a memory file under ``max_file_chars`` by dropping its oldest lines.
+
+        A leading ``#`` header line (the file's title) is preserved; the rest is kept
+        tail-first, since recent notes are the most relevant.
+        """
+        cap = self.max_file_chars
+        if not cap or len(text) <= cap:
+            return text
+        lines = text.splitlines()
+        header = [lines.pop(0)] if lines and lines[0].startswith("#") else []
+        while lines and len("\n".join(header + lines)) + 1 > cap:
+            lines.pop(0)
+        return "\n".join(header + lines).rstrip() + "\n"
+
     def overwrite(self, rel: str, content: str, _mode: str = "overwrite") -> None:
         path = self._resolve(rel)
         old_len = len(self.read(rel))
         path.parent.mkdir(parents=True, exist_ok=True)
-        new_text = content.rstrip() + "\n"
+        new_text = self._trim(content.rstrip() + "\n")
         tmp = path.with_suffix(path.suffix + ".tmp")
         tmp.write_text(new_text, encoding="utf-8")
         tmp.replace(path)

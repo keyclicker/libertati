@@ -66,6 +66,30 @@ def test_memory_write_emits_event(tmp_path):
     assert writes[1]["delta"] > 0
 
 
+def test_max_file_chars_trims_oldest_keeping_header(tmp_path):
+    from libertati.storage.memory import MemoryStore
+
+    mem = MemoryStore(tmp_path / "mem", max_file_chars=120)
+    mem.overwrite("world.md", "# Світ")
+    for i in range(50):
+        mem.append("world.md", f"- подія номер {i}")
+    content = mem.read("world.md")
+    assert len(content) <= 120
+    assert content.startswith("# Світ")  # header preserved
+    assert "подія номер 49" in content   # most recent kept
+    assert "подія номер 0" not in content  # oldest trimmed away
+
+
+def test_no_cap_keeps_everything(tmp_path):
+    from libertati.storage.memory import MemoryStore
+
+    mem = MemoryStore(tmp_path / "mem")  # no cap
+    for i in range(200):
+        mem.append("world.md", f"- line {i}")
+    assert "line 0" in mem.read("world.md")
+    assert "line 199" in mem.read("world.md")
+
+
 def test_snapshot(memory):
     memory.overwrite("world.md", "news")
     snap = memory.snapshot()

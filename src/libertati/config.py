@@ -45,10 +45,23 @@ class Settings(BaseSettings):
     db_path: Path = Path("data/libertati.db")
     memory_dir: Path = Path("memory")
     max_thread_chars: int = 5000
-    history_context_messages: int = 25
+    # On top of the reply thread, include a small window of recent chat messages so the
+    # bot also sees what's happening *now*, not only the (possibly old) thread it replies to.
+    recent_context_messages: int = 20
+    recent_context_chars: int = 1200
+    # Hard cap per memory file on disk; oldest lines are trimmed past this.
+    memory_max_file_chars: int = 4000
+    # Per-file budget when a memory file is injected into the prompt (keeps the tail).
+    memory_context_file_chars: int = 700
 
     # --- Behaviour ----------------------------------------------------------
     respond_to_all: bool = True
+    # In group chats, always reply when addressed (mentioned / replied-to); for other
+    # ("ambient") group messages reply only with this probability, to feel less bot-like.
+    group_reply_chance: float = 0.25
+    # Human-like pause before sending, scaled by reply length (seconds/char), capped.
+    typing_delay_enabled: bool = True
+    typing_delay_max_seconds: float = 5.0
     heartbeat_enabled: bool = True
     dream_enabled: bool = True
     news_refresh_hours: int = 6

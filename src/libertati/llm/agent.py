@@ -20,6 +20,12 @@ from .tools import ToolBox
 log = get_logger("llm.agent")
 
 
+def _clip(text: str, limit: int) -> str:
+    """Keep a note's most recent ``limit`` chars, marking a head trim with an ellipsis."""
+    text = text.strip()
+    return text if len(text) <= limit else "…" + text[-limit:]
+
+
 @dataclass(slots=True)
 class HeartbeatAction:
     target: str
@@ -95,25 +101,32 @@ class Agent:
         return (message.content or "").strip()
 
     # -- context helpers -----------------------------------------------------
-    def _memory_context(self, incoming: IncomingMessage) -> str:
+    def _memory_context(self, incoming: IncomingMessage | None = None) -> str:
+        """Build the memory snapshot for the prompt.
+
+        General files plus (when replying) the relevant user/group note. Each file is
+        clipped to a per-file budget so unbounded logs never blow up the context.
+        """
+        cap = self.settings.memory_context_file_chars
+        files: dict[str, str] = dict(self.memory.snapshot())
+        if incoming is not None:
+            if incoming.user_handle:
+                files[f"user/{incoming.user_handle}"] = self.memory.read_user(
+                    incoming.user_handle
+                )
+            if incoming.is_group and incoming.chat_title:
+                files[f"group/{incoming.chat_title}"] = self.memory.read_group(
+                    incoming.chat_title
+                )
         parts = ["## Памʼять (нотатки)"]
-        snap = self.memory.snapshot()
-        for name, content in snap.items():
+        for name, content in files.items():
             if content.strip():
-                parts.append(f"### {name}\n{content.strip()}")
-        if incoming.user_handle:
-            user_mem = self.memory.read_user(incoming.user_handle)
-            if user_mem.strip():
-                parts.append(f"### user/{incoming.user_handle}\n{user_mem.strip()}")
-        if incoming.is_group and incoming.chat_title:
-            group_mem = self.memory.read_group(incoming.chat_title)
-            if group_mem.strip():
-                parts.append(f"### group/{incoming.chat_title}\n{group_mem.strip()}")
+                parts.append(f"### {name}\n{_clip(content, cap)}")
         return "\n\n".join(parts)
 
-    def _thread_to_messages(self, thread: list[StoredMessage]) -> list[dict[str, Any]]:
+    def _stored_to_messages(self, stored: list[StoredMessage]) -> list[dict[str, Any]]:
         out: list[dict[str, Any]] = []
-        for m in thread:
+        for m in stored:
             if m.role == "assistant":
                 out.append({"role": "assistant", "content": m.text})
             else:
@@ -121,21 +134,46 @@ class Agent:
                 out.append({"role": "user", "content": f"{who}: {m.text}"})
         return out
 
+    async def _conversation(self, incoming: IncomingMessage) -> list[StoredMessage]:
+        """The reply thread plus a bounded window of recent chat messages.
+
+        The thread is the focused reply chain; on top of it we add the newest messages in
+        the chat (up to ``recent_context_chars``) that aren't already in the thread, so the
+        bot sees current activity even when replying to something old. The union is returned
+        in chronological order.
+        """
+        thread = await self.history.get_thread(incoming)
+        keys = {(m.chat_id, m.message_id) for m in thread}
+        recent = await self.history.recent(
+            incoming.chat_id, limit=self.settings.recent_context_messages
+        )
+        budget = self.settings.recent_context_chars
+        for m in reversed(recent):  # newest first, fill the budget
+            if (m.chat_id, m.message_id) in keys:
+                continue
+            if len(m.text) > budget:
+                break
+            budget -= len(m.text)
+            keys.add((m.chat_id, m.message_id))
+            thread.append(m)
+        thread.sort(key=lambda m: (m.ts or 0.0, m.message_id))
+        return thread
+
     # -- public entry points -------------------------------------------------
     async def respond(self, incoming: IncomingMessage) -> str:
-        thread = await self.history.get_thread(incoming)
+        convo = await self._conversation(incoming)
         memory_ctx = self._memory_context(incoming)
         messages: list[dict[str, Any]] = [
             {"role": "system", "content": prompts.system_prompt(self.settings)},
             {"role": "system", "content": memory_ctx},
-            *self._thread_to_messages(thread),
+            *self._stored_to_messages(convo),
             {"role": "system", "content": prompts.response_instruction(self.settings)},
         ]
         with self.events.turn(
             "respond",
             chat_id=incoming.chat_id,
             user=incoming.user_handle or incoming.user_name,
-            thread_len=len(thread),
+            thread_len=len(convo),
             memory_bytes=len(memory_ctx),
         ):
             reply = await self._run_loop(messages)
@@ -146,7 +184,7 @@ class Agent:
         chats = await self.history.active_chats(limit=10)
         messages: list[dict[str, Any]] = [
             {"role": "system", "content": prompts.system_prompt(self.settings)},
-            {"role": "system", "content": self._memory_context_general()},
+            {"role": "system", "content": self._memory_context()},
             {
                 "role": "system",
                 "content": "Активні чати: " + json.dumps(chats, ensure_ascii=False),
@@ -174,7 +212,7 @@ class Agent:
     async def dream(self) -> str:
         messages: list[dict[str, Any]] = [
             {"role": "system", "content": prompts.system_prompt(self.settings)},
-            {"role": "system", "content": self._memory_context_general()},
+            {"role": "system", "content": self._memory_context()},
             {"role": "user", "content": prompts.dream_instruction(self.settings)},
         ]
         with self.events.turn("dream"):
@@ -192,7 +230,7 @@ class Agent:
         """
         messages: list[dict[str, Any]] = [
             {"role": "system", "content": prompts.system_prompt(self.settings)},
-            {"role": "system", "content": self._memory_context_general()},
+            {"role": "system", "content": self._memory_context()},
             {
                 "role": "user",
                 "content": prompts.browse_instruction(self.settings, source_desc, content),
@@ -206,10 +244,3 @@ class Agent:
                 preview=self.events.redact(remark),
             )
             return remark
-
-    def _memory_context_general(self) -> str:
-        parts = ["## Памʼять (нотатки)"]
-        for name, content in self.memory.snapshot().items():
-            if content.strip():
-                parts.append(f"### {name}\n{content.strip()}")
-        return "\n\n".join(parts)
