@@ -3,10 +3,12 @@
 from __future__ import annotations
 
 import json
+import time
 from typing import Any
 
 from ..logging import get_logger
 from ..news.reader import NewsReader, format_digest
+from ..observability import NULL_EVENTS, EventLogger
 from ..storage.history import HistoryStore
 from ..storage.memory import MemoryStore
 from ..telegram.base import IncomingMessage, TelegramClient
@@ -126,26 +128,46 @@ class ToolBox:
         news: NewsReader,
         reader: TelegramClient | None = None,
         public_only: bool = True,
+        events: EventLogger | None = None,
     ) -> None:
         self.history = history
         self.memory = memory
         self.news = news
         self.reader = reader
         self.public_only = public_only
+        self.events = events or NULL_EVENTS
 
     @property
     def schemas(self) -> list[dict[str, Any]]:
         return TOOL_SCHEMAS
 
     async def dispatch(self, name: str, arguments: dict[str, Any]) -> str:
+        started = time.perf_counter()
+        error: str | None = None
         try:
             handler = getattr(self, f"_tool_{name}", None)
             if handler is None:
-                return json.dumps({"error": f"unknown tool {name}"})
-            return await handler(arguments)
+                error = f"unknown tool {name}"
+                return json.dumps({"error": error})
+            result = await handler(arguments)
+            return result
         except Exception as exc:  # noqa: BLE001 - surface tool errors to the model
             log.warning("tool %s failed: %s", name, exc)
-            return json.dumps({"error": str(exc)})
+            error = str(exc)
+            return json.dumps({"error": error})
+        finally:
+            acc = self.events.current_acc()
+            if acc is not None:
+                acc.tool_calls += 1
+            self.events.emit(
+                "tool_call",
+                name=name,
+                args=self.events.redact(json.dumps(arguments, ensure_ascii=False)),
+                ok=error is None,
+                error=error,
+                latency_ms=round((time.perf_counter() - started) * 1000),
+                result_len=len(result) if error is None else 0,
+            )
 
     async def _tool_search_history(self, args: dict[str, Any]) -> str:
         results = await self.history.search(args["query"], limit=int(args.get("limit", 10)))

@@ -47,6 +47,25 @@ def test_non_md_rejected(memory):
         memory.read("self.txt")
 
 
+def test_memory_write_emits_event(tmp_path):
+    import json
+
+    from libertati.observability import EventLogger
+    from libertati.storage.memory import MemoryStore
+
+    ev = EventLogger(path=tmp_path / "e.jsonl", enabled=True)
+    mem = MemoryStore(tmp_path / "mem", events=ev)
+    mem.append("todo.md", "- one")
+    mem.append("todo.md", "- two")
+    ev.close()
+    rows = [json.loads(x) for x in (tmp_path / "e.jsonl").read_text().splitlines()]
+    writes = [r for r in rows if r["type"] == "memory_write"]
+    assert len(writes) == 2
+    assert writes[0]["path"] == "todo.md"
+    assert writes[0]["mode"] == "append"
+    assert writes[1]["delta"] > 0
+
+
 def test_snapshot(memory):
     memory.overwrite("world.md", "news")
     snap = memory.snapshot()

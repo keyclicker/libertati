@@ -55,6 +55,7 @@ async def _run(routine: str) -> None:
         if needs_client:
             await app.client.stop()
         await app.db.close()
+        app.events.close()
     log.info("routine %s complete", routine)
 
 

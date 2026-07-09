@@ -32,6 +32,8 @@ Docker + GitHub Actions, dual Telegram backends, and a test suite.
 - **Heartbeat** twice a day at randomized times — the bot may proactively message someone.
 - **Dreaming** once a day — it reviews history, reflects, and updates its memory.
 - **Responds to all messages** by default, or only in an **allowlist of groups** you specify.
+- **Structured event log** (JSONL) tracing every turn — LLM calls (tokens/latency), tool calls,
+  memory writes and messages, correlated by turn id — so its real behavior can be analyzed and tuned.
 
 ## Architecture
 
@@ -43,7 +45,8 @@ src/libertati/
   storage/             SQLite db + history store (FTS5) + markdown memory store
   llm/                 OpenAI client, tool schemas/dispatch, prompts, the Agent
   news/                RSS reader
-  scheduler/           APScheduler jobs (heartbeat, dream, news) + runner
+  scheduler/           APScheduler jobs (heartbeat, dream, news, browse) + runner
+  observability.py     structured JSONL event log (per-turn behavioral telemetry)
 ```
 
 The app depends only on the `TelegramClient` abstraction, so the two backends are
@@ -138,6 +141,42 @@ uv run python -m libertati.trigger news        # refresh world.md from feeds
 
 (`libertati-trigger <routine>` is installed as a console script too.)
 
+## Observability — the event log
+
+To understand (and fix) how the bot actually behaves, every turn is traced to a JSONL event log
+(`data/events.jsonl` by default). Each line is one event, and everything within a decision shares a
+`turn` id, so a single `grep` reconstructs the whole thing:
+
+```json
+{"ts":…,"turn":"t1","type":"turn_start","kind":"respond","chat_id":555,"thread_len":2,"memory_bytes":180}
+{"ts":…,"turn":"t1","type":"llm_call","model":"gpt-4o-mini","total_tokens":812,"latency_ms":430,"n_tool_calls":1}
+{"ts":…,"turn":"t1","type":"tool_call","name":"read_memory","ok":true,"latency_ms":1,"result_len":60}
+{"ts":…,"turn":"t1","type":"reply","preview":"та нічо, живу","reply_len":13}
+{"ts":…,"turn":"t1","type":"turn_end","kind":"respond","llm_calls":1,"tool_calls":1,"turn_tokens":812}
+```
+
+Event types include `inbound` / `skip` / `outbound` (message flow), `llm_call` / `llm_error`
+(model, token usage, latency), `tool_call` (name, args, timing, result size), `memory_write`
+(path, mode, size delta — the signal for memory growth/poisoning), `tool_loop_cap`, and the
+`heartbeat_result` / `dream_result` / `browse_result` outcomes.
+
+Handy queries:
+
+```bash
+# everything that happened in one decision
+grep '"turn":"t42"' data/events.jsonl | jq .
+# token spend per turn
+jq 'select(.type=="turn_end") | {turn, kind, turn_tokens}' data/events.jsonl
+# how memory is changing over time
+jq 'select(.type=="memory_write") | {path, mode, delta}' data/events.jsonl
+# tool usage frequency
+jq -r 'select(.type=="tool_call") | .name' data/events.jsonl | sort | uniq -c
+```
+
+Set `LIBERTATI_LOG_MESSAGE_CONTENT=false` to record only lengths/shapes (no message text) for
+privacy, or `LIBERTATI_EVENT_LOG_ENABLED=false` to turn it off. Run with `LIBERTATI_LOG_LEVEL=DEBUG`
+to also see the per-iteration tool decisions on stdout.
+
 ## Running the checks
 
 ```bash
@@ -184,6 +223,9 @@ In account mode the `libertati.session` file is mounted too.
 | `LIBERTATI_BROWSE_CHANNELS` | (empty) | Channels to read; empty = sample own dialogs |
 | `LIBERTATI_BROWSE_PUBLIC_ONLY` | `true` | Only read/discuss public `@channels` |
 | `LIBERTATI_BROWSE_TIMES_PER_DAY` | `3` | How many random browses per day |
+| `LIBERTATI_EVENT_LOG_ENABLED` | `true` | Write the structured JSONL event log |
+| `LIBERTATI_EVENT_LOG_PATH` | `data/events.jsonl` | Where the event log goes |
+| `LIBERTATI_LOG_MESSAGE_CONTENT` | `true` | Include (truncated) text in the event log |
 
 ## License
 

@@ -71,8 +71,12 @@ class Settings(BaseSettings):
     bot_handle: str = "@libertati"
     bot_username: str = "@libertati_bot"
 
-    # --- Logging ------------------------------------------------------------
+    # --- Logging / observability --------------------------------------------
     log_level: str = "INFO"
+    event_log_enabled: bool = True
+    event_log_path: Path = Path("data/events.jsonl")
+    log_message_content: bool = True
+    log_content_max_chars: int = 300
 
     @field_validator("news_feeds", "allowed_chats", "browse_channels", mode="before")
     @classmethod

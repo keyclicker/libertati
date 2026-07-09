@@ -85,3 +85,17 @@ async def test_read_telegram_numeric_allowed_when_public_only_off(history, memor
     tb = ToolBox(history, memory, StubNews(), reader=FakeReader(), public_only=False)
     out = json.loads(await tb.dispatch("read_telegram", {"source": "-100123"}))
     assert "interesting channel post" in out["transcript"]
+
+
+async def test_dispatch_emits_tool_call_event(history, memory, tmp_path):
+    from libertati.observability import EventLogger
+
+    ev = EventLogger(path=tmp_path / "e.jsonl", enabled=True)
+    tb = ToolBox(history, memory, StubNews(), events=ev)
+    await tb.dispatch("read_memory", {"path": "self.md"})
+    ev.close()
+    rows = [json.loads(x) for x in (tmp_path / "e.jsonl").read_text().splitlines()]
+    call = next(r for r in rows if r["type"] == "tool_call")
+    assert call["name"] == "read_memory"
+    assert call["ok"] is True
+    assert "latency_ms" in call

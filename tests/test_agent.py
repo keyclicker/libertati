@@ -98,3 +98,49 @@ async def test_browse_pass(settings, history, memory):
     agent, _ = build_agent(settings, history, memory, [assistant("PASS")])
     remark = await agent.browse("канал @dull", "author: нічого цікавого")
     assert remark.strip().upper() == "PASS"
+
+
+async def test_respond_emits_correlated_turn(settings, history, memory, tool_call, tmp_path):
+    import json
+
+    from libertati.observability import EventLogger
+
+    await history.add_message(make_message("шо там?", message_id=1))
+    ev = EventLogger(path=tmp_path / "e.jsonl", enabled=True)
+    tools = ToolBox(history, memory, NewsReader(feeds=[]), events=ev)
+    script = [
+        assistant(tool_calls=[tool_call("c1", "read_memory", {"path": "self.md"})]),
+        assistant("та нічо, живу"),
+    ]
+    agent = Agent(settings, FakeLLM(script), tools, history, memory, events=ev)
+    await agent.respond(make_message("шо там?", message_id=1))
+    ev.close()
+
+    rows = [json.loads(x) for x in (tmp_path / "e.jsonl").read_text().splitlines()]
+    types = [r["type"] for r in rows]
+    assert types[0] == "turn_start" and types[-1] == "turn_end"
+    assert "tool_call" in types and "reply" in types
+    # everything shares one turn id
+    assert len({r["turn"] for r in rows}) == 1
+    end = next(r for r in rows if r["type"] == "turn_end")
+    assert end["kind"] == "respond"
+    assert end["tool_calls"] == 1
+
+
+async def test_tool_loop_cap_emits_event(settings, history, memory, tool_call, tmp_path):
+    import json
+
+    from libertati.observability import EventLogger
+
+    ev = EventLogger(path=tmp_path / "e.jsonl", enabled=True)
+    tools = ToolBox(history, memory, NewsReader(feeds=[]), events=ev)
+    script = [
+        assistant(tool_calls=[tool_call(f"c{i}", "read_memory", {"path": "self.md"})])
+        for i in range(20)
+    ]
+    script.append(assistant("нарешті"))
+    agent = Agent(settings, FakeLLM(script), tools, history, memory, events=ev)
+    await agent.respond(make_message("hi", message_id=1))
+    ev.close()
+    rows = [json.loads(x) for x in (tmp_path / "e.jsonl").read_text().splitlines()]
+    assert any(r["type"] == "tool_loop_cap" for r in rows)

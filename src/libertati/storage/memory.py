@@ -18,6 +18,8 @@ import re
 from datetime import date
 from pathlib import Path
 
+from ..observability import NULL_EVENTS, EventLogger
+
 _SLUG_RE = re.compile(r"[^a-z0-9_-]+")
 
 
@@ -33,9 +35,10 @@ class MemoryStore:
 
     GENERAL_FILES = ("self.md", "world.md", "social.md", "todo.md", "reading.md")
 
-    def __init__(self, root: Path | str) -> None:
+    def __init__(self, root: Path | str, events: EventLogger | None = None) -> None:
         self.root = Path(root).resolve()
         self.root.mkdir(parents=True, exist_ok=True)
+        self.events = events or NULL_EVENTS
 
     # -- path safety ---------------------------------------------------------
     def _resolve(self, rel: str) -> Path:
@@ -52,17 +55,27 @@ class MemoryStore:
         path = self._resolve(rel)
         return path.read_text(encoding="utf-8") if path.exists() else ""
 
-    def overwrite(self, rel: str, content: str) -> None:
+    def overwrite(self, rel: str, content: str, _mode: str = "overwrite") -> None:
         path = self._resolve(rel)
+        old_len = len(self.read(rel))
         path.parent.mkdir(parents=True, exist_ok=True)
+        new_text = content.rstrip() + "\n"
         tmp = path.with_suffix(path.suffix + ".tmp")
-        tmp.write_text(content.rstrip() + "\n", encoding="utf-8")
+        tmp.write_text(new_text, encoding="utf-8")
         tmp.replace(path)
+        self.events.emit(
+            "memory_write",
+            path=rel,
+            mode=_mode,
+            old_len=old_len,
+            new_len=len(new_text),
+            delta=len(new_text) - old_len,
+        )
 
     def append(self, rel: str, content: str) -> None:
         existing = self.read(rel)
         joined = f"{existing.rstrip()}\n{content.strip()}" if existing else content.strip()
-        self.overwrite(rel, joined)
+        self.overwrite(rel, joined, _mode="append")
 
     def exists(self, rel: str) -> bool:
         return self._resolve(rel).exists()
