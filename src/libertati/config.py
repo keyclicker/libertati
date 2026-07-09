@@ -57,8 +57,9 @@ class Settings(BaseSettings):
     # --- Behaviour ----------------------------------------------------------
     respond_to_all: bool = True
     # In group chats, always reply when addressed (mentioned / replied-to); for other
-    # ("ambient") group messages reply only with this probability, to feel less bot-like.
-    group_reply_chance: float = 0.25
+    # ("ambient") group messages reply only with this small probability — it lurks like a
+    # person and speaks up mostly when spoken to, not on every message.
+    group_reply_chance: float = 0.05
     # Human-like pause before sending, scaled by reply length (seconds/char), capped.
     typing_delay_enabled: bool = True
     typing_delay_max_seconds: float = 5.0

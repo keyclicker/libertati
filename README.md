@@ -225,7 +225,7 @@ In account mode the `libertati.session` file is mounted too.
 | `LIBERTATI_MEMORY_MAX_FILE_CHARS` | `4000` | Disk cap per memory file (oldest lines trimmed) |
 | `LIBERTATI_MEMORY_CONTEXT_FILE_CHARS` | `700` | Per-file clip when injecting memory into the prompt |
 | `LIBERTATI_RESPOND_TO_ALL` | `true` | Master switch for replying at all |
-| `LIBERTATI_GROUP_REPLY_CHANCE` | `0.25` | Chance of replying to *ambient* group messages (always replies when addressed) |
+| `LIBERTATI_GROUP_REPLY_CHANCE` | `0.05` | Chance of replying to *ambient* group messages (always replies when addressed) |
 | `LIBERTATI_TYPING_DELAY_ENABLED` | `true` | Human-like pause before sending |
 | `LIBERTATI_TYPING_DELAY_MAX_SECONDS` | `5.0` | Cap on that pause |
 | `LIBERTATI_ALLOWED_CHATS` | (empty = all) | Chats it may proactively talk in (ids/`@usernames`) |
