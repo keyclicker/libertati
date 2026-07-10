@@ -206,6 +206,8 @@ In account mode the `libertati.session` file is mounted too.
 - **`.github/workflows/docker.yml`** — on push to `main` and on `v*` tags, builds the image and
   pushes it to `ghcr.io/<owner>/libertati` using the built-in `GITHUB_TOKEN`.
 
+See [`DEPLOYMENT.md`](DEPLOYMENT.md) for how to configure and run it on a server.
+
 ## Configuration reference
 
 | Variable | Default | Description |
