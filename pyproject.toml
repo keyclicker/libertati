@@ -1,0 +1,62 @@
+[project]
+name = "libertati"
+version = "0.2.0"
+description = "Agentic Telegram bot with persistent memory, news reading, heartbeat and dreaming."
+readme = "README.md"
+requires-python = ">=3.12"
+license = { text = "MIT" }
+dependencies = [
+    "aiogram>=3.13,<4",
+    "telethon>=1.36,<2",
+    "openai>=1.51,<2",
+    "aiosqlite>=0.20",
+    "apscheduler>=3.10,<4",
+    "pydantic>=2.9",
+    "pydantic-settings>=2.5",
+    "httpx>=0.27",
+    "feedparser>=6.0",
+    "python-dotenv>=1.0",
+]
+
+[project.scripts]
+libertati = "libertati.main:run"
+libertati-trigger = "libertati.trigger:main"
+libertati-login = "libertati.login:main"
+
+[dependency-groups]
+dev = [
+    "pytest>=8.3",
+    "pytest-asyncio>=0.24",
+    "ruff>=0.6",
+    "mypy>=1.11",
+]
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/libertati"]
+
+[tool.ruff]
+line-length = 100
+target-version = "py312"
+src = ["src", "tests"]
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "UP", "B", "W", "ASYNC"]
+ignore = ["B008"]
+
+[tool.mypy]
+python_version = "3.12"
+packages = ["libertati"]
+mypy_path = "src"
+ignore_missing_imports = true
+warn_unused_ignores = false
+disallow_untyped_defs = false
+check_untyped_defs = true
+
+[tool.pytest.ini_options]
+asyncio_mode = "auto"
+testpaths = ["tests"]
+addopts = "-q"

@@ -1,0 +1,14 @@
+services:
+  libertati:
+    build: .
+    image: ghcr.io/keyclicker/libertati:latest
+    restart: unless-stopped
+    env_file: .env
+    environment:
+      LIBERTATI_DB_PATH: /data/libertati.db
+      LIBERTATI_MEMORY_DIR: /memory
+    volumes:
+      - ./data:/data
+      - ./memory:/memory
+      # In account mode, persist the Telethon session file:
+      - ./libertati.session:/app/libertati.session

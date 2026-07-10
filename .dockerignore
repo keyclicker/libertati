@@ -1,0 +1,16 @@
+.git
+.github
+.venv
+data
+memory
+tests
+**/__pycache__
+*.pyc
+.pytest_cache
+.mypy_cache
+.ruff_cache
+.env
+*.session
+*.session-journal
+htmlcov
+.coverage*
