@@ -31,7 +31,8 @@ COPY --from=builder --chown=app:app /app /app
 ENV PATH="/app/.venv/bin:$PATH" \
     PYTHONUNBUFFERED=1 \
     LIBERTATI_DB_PATH=/data/libertati.db \
-    LIBERTATI_MEMORY_DIR=/memory
+    LIBERTATI_MEMORY_DIR=/memory \
+    LIBERTATI_EVENT_LOG_PATH=/data/events.jsonl
 
 RUN mkdir -p /data /memory && chown app:app /data /memory
 VOLUME ["/data", "/memory"]

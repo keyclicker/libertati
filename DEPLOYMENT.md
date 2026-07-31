@@ -52,9 +52,10 @@ Everything else lives in `config.toml`, which `docker-compose.yml` mounts read-o
 container — edit it on the server and restart, no rebuild needed. `LIBERTATI_*` environment
 variables override the TOML. See `README.md` for the full configuration reference.
 
-> `LIBERTATI_DB_PATH` and `LIBERTATI_MEMORY_DIR` are overridden to `/data` and `/memory` by
-> `docker-compose.yml`, which mounts `./data` and `./memory` as host volumes so state survives
-> restarts and image upgrades. Don't repoint those in `.env`.
+> `LIBERTATI_DB_PATH`, `LIBERTATI_EVENT_LOG_PATH` and `LIBERTATI_MEMORY_DIR` are overridden to
+> the `/data` and `/memory` volumes by the image/compose file, which mount `./data` and
+> `./memory` on the host so state survives restarts and image upgrades. Don't repoint those in
+> `.env` or `config.toml`.
 
 ### 2. Authenticate to GHCR (only if the package is private)
 
