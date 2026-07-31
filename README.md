@@ -66,11 +66,15 @@ The app depends only on the `TelegramClient` abstraction, so test doubles are ch
 
 ```bash
 uv sync                 # create the venv and install deps
-cp .env.example .env    # then fill in your keys
+cp .env.example .env    # then fill in your tokens
 ```
 
-Configuration is entirely via environment variables (prefix `LIBERTATI_`), loaded from `.env`.
-See `.env.example` for every option.
+Configuration is split in two:
+
+- **`config.toml`** — all non-secret settings (behaviour, browsing, persona, logging), checked
+  into the repo with sane defaults. Keys are the field names from `config.py`.
+- **`.env`** — secrets only (bot token, OpenAI key). Any `LIBERTATI_`-prefixed environment
+  variable also works and overrides `config.toml`.
 
 1. Create a bot with [@BotFather](https://t.me/BotFather), get the token.
 2. Set in `.env`:
@@ -185,6 +189,10 @@ docker compose up --build
 See [`DEPLOYMENT.md`](DEPLOYMENT.md) for how to configure and run it on a server.
 
 ## Configuration reference
+
+Each variable can be set in `config.toml` (lowercase key without the `LIBERTATI_` prefix, e.g.
+`group_reply_chance`) or as an environment variable / in `.env` (full `LIBERTATI_` name; wins
+over the TOML). Keep tokens in `.env` only.
 
 | Variable | Default | Description |
 | --- | --- | --- |

@@ -10,3 +10,5 @@ services:
     volumes:
       - ./data:/data
       - ./memory:/memory
+      # Edit settings on the server without rebuilding the image:
+      - ./config.toml:/app/config.toml:ro

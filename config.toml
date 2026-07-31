@@ -1,0 +1,66 @@
+# libertati configuration — non-secret settings only.
+# Secrets (tokens) go in .env — see .env.example.
+# LIBERTATI_* environment variables override anything set here.
+# Keys are the Settings field names from src/libertati/config.py.
+
+# ---- OpenAI ----------------------------------------------------------------
+openai_model = "gpt-4o-mini"
+openai_temperature = 1.0
+openai_max_tool_iterations = 6
+# Any OpenAI-compatible endpoint:
+# openai_base_url = "https://api.openai.com/v1"
+
+# ---- Storage ---------------------------------------------------------------
+db_path = "data/libertati.db"
+memory_dir = "memory"
+# Reply context: the reply thread (chars) plus a smaller window of recent chat
+# messages, so the bot also sees what's happening now, not only the thread.
+max_thread_chars = 5000
+recent_context_messages = 20
+recent_context_chars = 1200
+# Memory files are capped on disk (oldest lines trimmed) and clipped per-file
+# when injected into the prompt — keeps token cost bounded as notes grow.
+memory_max_file_chars = 4000
+memory_context_file_chars = 700
+
+# ---- Behaviour -------------------------------------------------------------
+respond_to_all = true
+# In groups: always reply when addressed (mentioned / replied-to); otherwise
+# reply to ambient chatter only this fraction of the time (0 = only when addressed).
+group_reply_chance = 0.05
+# Human-like pause before sending, scaled by reply length and capped (seconds).
+typing_delay_enabled = true
+typing_delay_max_seconds = 5.0
+heartbeat_enabled = true
+dream_enabled = true
+news_refresh_hours = 6
+# news_feeds = ["https://feeds.bbci.co.uk/news/world/rss.xml", "https://hnrss.org/frontpage"]
+
+# Restrict which chats the bot proactively talks in (ids and/or @usernames).
+# Empty = talk everywhere. It still logs messages it sees for memory/history.
+# allowed_chats = ["@mygroup", "-1001234567890"]
+
+# ---- Browsing (reading public channels via the t.me/s/ web preview) --------
+# When enabled, the bot randomly reads the configured public channels a few
+# times a day, notes interesting things to memory/reading.md, and may bring
+# them up. Only public @channels with the web preview enabled are readable.
+browse_enabled = false
+# Required for browsing: which public channels to read.
+# browse_channels = ["@durov", "@somenewschannel"]
+browse_times_per_day = 3
+browse_read_limit = 15
+
+# ---- Persona ---------------------------------------------------------------
+bot_full_name = "Ana Tati"
+bot_handle = "@libertati"
+bot_username = "@libertati_bot"
+
+# ---- Logging / observability -----------------------------------------------
+log_level = "INFO"
+# Structured behavioral telemetry (JSONL): every turn's LLM calls, tool calls,
+# memory writes and messages, correlated by turn id.
+event_log_enabled = true
+event_log_path = "data/events.jsonl"
+# Log message/tool text (truncated). Set false to record only lengths/shapes.
+log_message_content = true
+log_content_max_chars = 300

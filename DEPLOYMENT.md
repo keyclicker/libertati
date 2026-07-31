@@ -39,17 +39,18 @@ cd libertati
 cp .env.example .env      # then fill in real values (see below)
 ```
 
-### 1. Configure secrets (`.env`)
+### 1. Configure secrets (`.env`) and settings (`config.toml`)
 
-All config is environment variables with the `LIBERTATI_` prefix; `docker-compose.yml` loads
-`.env` via `env_file`. At minimum set:
+Secrets go in `.env` (loaded via `env_file`, gitignored — never commit it):
 
 ```
 LIBERTATI_OPENAI_API_KEY=sk-...
 LIBERTATI_BOT_TOKEN=123456:your-token
 ```
 
-See `README.md` for the full configuration reference. `.env` is gitignored — never commit it.
+Everything else lives in `config.toml`, which `docker-compose.yml` mounts read-only into the
+container — edit it on the server and restart, no rebuild needed. `LIBERTATI_*` environment
+variables override the TOML. See `README.md` for the full configuration reference.
 
 > `LIBERTATI_DB_PATH` and `LIBERTATI_MEMORY_DIR` are overridden to `/data` and `/memory` by
 > `docker-compose.yml`, which mounts `./data` and `./memory` as host volumes so state survives

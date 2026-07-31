@@ -1,4 +1,9 @@
-"""Application configuration loaded from environment / .env."""
+"""Application configuration.
+
+Non-secret settings live in ``config.toml`` (keys = field names, no prefix);
+secrets (tokens) come from ``.env`` / environment variables with the
+``LIBERTATI_`` prefix, which also override anything set in the TOML file.
+"""
 
 from __future__ import annotations
 
@@ -6,7 +11,13 @@ from pathlib import Path
 from typing import Annotated
 
 from pydantic import Field, field_validator
-from pydantic_settings import BaseSettings, NoDecode, SettingsConfigDict
+from pydantic_settings import (
+    BaseSettings,
+    NoDecode,
+    PydanticBaseSettingsSource,
+    SettingsConfigDict,
+    TomlConfigSettingsSource,
+)
 
 DEFAULT_NEWS_FEEDS = [
     "https://feeds.bbci.co.uk/news/world/rss.xml",
@@ -21,9 +32,28 @@ class Settings(BaseSettings):
     model_config = SettingsConfigDict(
         env_file=".env",
         env_file_encoding="utf-8",
+        toml_file="config.toml",
         extra="ignore",
         env_prefix="LIBERTATI_",
     )
+
+    @classmethod
+    def settings_customise_sources(
+        cls,
+        settings_cls: type[BaseSettings],
+        init_settings: PydanticBaseSettingsSource,
+        env_settings: PydanticBaseSettingsSource,
+        dotenv_settings: PydanticBaseSettingsSource,
+        file_secret_settings: PydanticBaseSettingsSource,
+    ) -> tuple[PydanticBaseSettingsSource, ...]:
+        # Precedence: init kwargs > env vars > .env > config.toml > field defaults.
+        return (
+            init_settings,
+            env_settings,
+            dotenv_settings,
+            TomlConfigSettingsSource(settings_cls),
+            file_secret_settings,
+        )
 
     # --- Telegram -----------------------------------------------------------
     bot_token: str = ""

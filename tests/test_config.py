@@ -40,3 +40,27 @@ def test_browse_defaults():
     s = _settings()
     assert s.browse_enabled is False
     assert s.browse_times_per_day == 3
+
+
+def test_toml_source_loads_values(tmp_path, monkeypatch):
+    (tmp_path / "config.toml").write_text(
+        'bot_full_name = "Toml Tati"\nbrowse_channels = ["@a", "@b"]\n'
+    )
+    monkeypatch.chdir(tmp_path)
+    s = _settings()
+    assert s.bot_full_name == "Toml Tati"
+    assert s.browse_channels == ["@a", "@b"]
+
+
+def test_env_overrides_toml(tmp_path, monkeypatch):
+    (tmp_path / "config.toml").write_text('bot_full_name = "Toml Tati"\n')
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.setenv("LIBERTATI_BOT_FULL_NAME", "Env Tati")
+    s = _settings()
+    assert s.bot_full_name == "Env Tati"
+
+
+def test_missing_toml_is_fine(tmp_path, monkeypatch):
+    monkeypatch.chdir(tmp_path)
+    s = _settings()
+    assert s.bot_full_name == "Ana Tati"
