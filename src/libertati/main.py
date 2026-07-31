@@ -97,8 +97,12 @@ class App:
             await asyncio.sleep(
                 typing_delay_seconds(reply, self.settings.typing_delay_max_seconds)
             )
+        # Quote-reply only in groups (to thread the answer); in DMs quoting every
+        # message reads like a bot.
         sent = await self.client.send_message(
-            incoming.chat_id, reply, reply_to_id=incoming.message_id
+            incoming.chat_id,
+            reply,
+            reply_to_id=incoming.message_id if incoming.is_group else None,
         )
         self.events.emit(
             "outbound", chat_id=incoming.chat_id, ok=sent is not None, text_len=len(reply)
