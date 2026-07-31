@@ -1,14 +1,14 @@
 """APScheduler wiring.
 
-- Heartbeat: twice a day at randomised times (re-rolled daily).
-- Dreaming: once a day at a randomised early-morning time.
+- Heartbeat: ``heartbeat_times_per_day`` randomised times (re-rolled daily).
+- Dreaming: ``dream_times_per_day`` randomised early-morning times.
 - News refresh: every ``news_refresh_hours`` hours.
 """
 
 from __future__ import annotations
 
 import random
-from datetime import datetime, time, timedelta
+from datetime import datetime, timedelta
 
 from apscheduler.schedulers.asyncio import AsyncIOScheduler
 from apscheduler.triggers.cron import CronTrigger
@@ -50,8 +50,8 @@ class Scheduler:
 
     def start(self) -> None:
         s = self.settings
-        if s.heartbeat_enabled:
-            # Re-plan the two random heartbeat times every day just after midnight,
+        if s.heartbeat_enabled and s.heartbeat_times_per_day > 0:
+            # Re-plan the random heartbeat times every day just after midnight,
             # and plan today's remaining ones immediately.
             self._scheduler.add_job(
                 self._plan_heartbeats,
@@ -60,17 +60,14 @@ class Scheduler:
                 replace_existing=True,
             )
             self._plan_heartbeats()
-        if s.dream_enabled:
-            hour = random.randint(3, 6)
-            minute = random.randint(0, 59)
+        if s.dream_enabled and s.dream_times_per_day > 0:
             self._scheduler.add_job(
-                jobs.dream_job,
-                CronTrigger(hour=hour, minute=minute),
-                args=[self.agent, self.memory],
-                id="dream",
+                self._plan_dreams,
+                CronTrigger(hour=0, minute=1),
+                id="plan_dreams",
                 replace_existing=True,
             )
-            log.info("dreaming scheduled daily at %02d:%02d", hour, minute)
+            self._plan_dreams()
         if s.news_feeds:
             self._scheduler.add_job(
                 jobs.news_refresh_job,
@@ -98,9 +95,10 @@ class Scheduler:
 
     def _plan_heartbeats(self) -> None:
         now = datetime.now()
+        total = self.settings.heartbeat_times_per_day
         planned = 0
-        for slot in range(2):
-            when = _random_time_today(now, slot)
+        for slot in range(total):
+            when = _slot_time(now, slot, total, start_hour=9, end_hour=22)
             if when <= now:
                 continue
             self._scheduler.add_job(
@@ -114,6 +112,26 @@ class Scheduler:
             log.info("heartbeat scheduled at %s", when.strftime("%H:%M"))
         if planned == 0:
             log.info("no heartbeat slots left today")
+
+    def _plan_dreams(self) -> None:
+        now = datetime.now()
+        total = self.settings.dream_times_per_day
+        planned = 0
+        for slot in range(total):
+            when = _slot_time(now, slot, total, start_hour=3, end_hour=7)
+            if when <= now:
+                continue
+            self._scheduler.add_job(
+                jobs.dream_job,
+                DateTrigger(run_date=when),
+                args=[self.agent, self.memory],
+                id=f"dream_{slot}",
+                replace_existing=True,
+            )
+            planned += 1
+            log.info("dreaming scheduled at %s", when.strftime("%H:%M"))
+        if planned == 0:
+            log.info("no dream slots left today")
 
     def _plan_browses(self) -> None:
         now = datetime.now()
@@ -139,14 +157,18 @@ class Scheduler:
             self._scheduler.shutdown(wait=False)
 
 
-def _random_time_today(now: datetime, slot: int) -> datetime:
-    """Random time in the morning (slot 0) or evening (slot 1) window."""
-    if slot == 0:
-        start, end = time(9, 0), time(13, 0)
-    else:
-        start, end = time(17, 0), time(22, 0)
-    minutes = random.randint(0, (end.hour - start.hour) * 60 + (end.minute - start.minute))
-    base = now.replace(hour=start.hour, minute=start.minute, second=0, microsecond=0)
+def _slot_time(
+    now: datetime, slot: int, total: int, start_hour: int, end_hour: int
+) -> datetime:
+    """Random time in the ``slot``-th of ``total`` equal windows of [start, end] today.
+
+    Splitting the window keeps the times spread over the day instead of clustering.
+    """
+    span = (end_hour - start_hour) * 60
+    lo = span * slot // total
+    hi = span * (slot + 1) // total
+    minutes = random.randint(lo, max(lo, hi - 1))
+    base = now.replace(hour=start_hour, minute=0, second=0, microsecond=0)
     return base + timedelta(minutes=minutes)
 
 

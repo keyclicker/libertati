@@ -88,7 +88,9 @@ class Settings(BaseSettings):
     typing_delay_enabled: bool = True
     typing_delay_max_seconds: float = 5.0
     heartbeat_enabled: bool = True
+    heartbeat_times_per_day: int = 2
     dream_enabled: bool = True
+    dream_times_per_day: int = 1
     news_refresh_hours: int = 6
     news_feeds: Annotated[list[str], NoDecode] = Field(
         default_factory=lambda: list(DEFAULT_NEWS_FEEDS)

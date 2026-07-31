@@ -36,10 +36,13 @@ def test_browse_channels_parsing():
     assert s.browse_channels == ["@a", "@b"]
 
 
-def test_browse_defaults():
+def test_browse_defaults(tmp_path, monkeypatch):
+    monkeypatch.chdir(tmp_path)  # shield from the repo-root config.toml
     s = _settings()
     assert s.browse_enabled is False
     assert s.browse_times_per_day == 3
+    assert s.heartbeat_times_per_day == 2
+    assert s.dream_times_per_day == 1
 
 
 def test_toml_source_loads_values(tmp_path, monkeypatch):

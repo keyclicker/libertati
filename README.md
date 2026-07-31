@@ -212,8 +212,10 @@ over the TOML). Keep tokens in `.env` only.
 | `LIBERTATI_TYPING_DELAY_ENABLED` | `true` | Human-like pause before sending |
 | `LIBERTATI_TYPING_DELAY_MAX_SECONDS` | `5.0` | Cap on that pause |
 | `LIBERTATI_ALLOWED_CHATS` | (empty = all) | Chats it may proactively talk in (ids/`@usernames`) |
-| `LIBERTATI_HEARTBEAT_ENABLED` | `true` | Enable the twice-daily heartbeat |
-| `LIBERTATI_DREAM_ENABLED` | `true` | Enable daily dreaming |
+| `LIBERTATI_HEARTBEAT_ENABLED` | `true` | Enable the heartbeat |
+| `LIBERTATI_HEARTBEAT_TIMES_PER_DAY` | `2` | Heartbeats per day (random times, 09–22) |
+| `LIBERTATI_DREAM_ENABLED` | `true` | Enable dreaming |
+| `LIBERTATI_DREAM_TIMES_PER_DAY` | `1` | Dreams per day (random times, 03–07) |
 | `LIBERTATI_NEWS_REFRESH_HOURS` | `6` | News refresh interval |
 | `LIBERTATI_NEWS_FEEDS` | (built-in list) | Comma-separated RSS/Atom feeds |
 | `LIBERTATI_BROWSE_ENABLED` | `false` | Randomly read public channels (t.me/s web preview) |

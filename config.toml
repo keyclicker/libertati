@@ -31,8 +31,12 @@ group_reply_chance = 0.05
 # Human-like pause before sending, scaled by reply length and capped (seconds).
 typing_delay_enabled = true
 typing_delay_max_seconds = 5.0
+# Proactive messaging: random times spread over the day (09-22).
 heartbeat_enabled = true
+heartbeat_times_per_day = 2
+# Reflection/memory updates: random early-morning times (03-07).
 dream_enabled = true
+dream_times_per_day = 1
 news_refresh_hours = 6
 # news_feeds = ["https://feeds.bbci.co.uk/news/world/rss.xml", "https://hnrss.org/frontpage"]
 
@@ -44,9 +48,9 @@ news_refresh_hours = 6
 # When enabled, the bot randomly reads the configured public channels a few
 # times a day, notes interesting things to memory/reading.md, and may bring
 # them up. Only public @channels with the web preview enabled are readable.
-browse_enabled = false
+browse_enabled = true
 # Required for browsing: which public channels to read.
-# browse_channels = ["@durov", "@somenewschannel"]
+browse_channels = ["@durov"]
 browse_times_per_day = 3
 browse_read_limit = 15
 
