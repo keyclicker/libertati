@@ -23,7 +23,8 @@ RUN --mount=type=cache,target=/root/.cache/uv \
 # --- runtime ------------------------------------------------------------------
 FROM python:3.12-slim-bookworm AS runtime
 
-RUN groupadd --system app && useradd --system --gid app --create-home app
+# Fixed uid/gid so host bind mounts can be chowned deterministically.
+RUN groupadd --gid 10001 app && useradd --uid 10001 --gid app --create-home app
 
 WORKDIR /app
 COPY --from=builder --chown=app:app /app /app
