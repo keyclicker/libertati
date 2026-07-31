@@ -28,6 +28,7 @@ RUN groupadd --gid 10001 app && useradd --uid 10001 --gid app --create-home app
 
 WORKDIR /app
 COPY --from=builder --chown=app:app /app /app
+COPY docker-entrypoint.sh /usr/local/bin/docker-entrypoint.sh
 
 ENV PATH="/app/.venv/bin:$PATH" \
     PYTHONUNBUFFERED=1 \
@@ -35,8 +36,10 @@ ENV PATH="/app/.venv/bin:$PATH" \
     LIBERTATI_MEMORY_DIR=/memory \
     LIBERTATI_EVENT_LOG_PATH=/data/events.jsonl
 
-RUN mkdir -p /data /memory && chown app:app /data /memory
+RUN chmod +x /usr/local/bin/docker-entrypoint.sh \
+    && mkdir -p /data /memory && chown app:app /data /memory
 VOLUME ["/data", "/memory"]
 
-USER app
+# The entrypoint starts as root to chown the bind mounts, then drops to app.
+ENTRYPOINT ["docker-entrypoint.sh"]
 CMD ["libertati"]

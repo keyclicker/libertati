@@ -37,10 +37,11 @@ Requirements: Docker + the Compose plugin.
 git clone https://github.com/keyclicker/libertati.git
 cd libertati
 cp .env.example .env      # then fill in real values (see below)
-# Pre-create the state dirs owned by the container user (uid 10001) — if Docker
-# creates them on first run they end up root-owned and the bot can't write:
-mkdir -p data memory && sudo chown -R 10001:10001 data memory
 ```
+
+The container entrypoint chowns the `./data` / `./memory` bind mounts to the app user
+(uid 10001) on startup, so no manual permission setup is needed — even when Docker creates
+the directories root-owned on first run.
 
 ### 1. Configure secrets (`.env`) and settings (`config.toml`)
 
@@ -106,8 +107,8 @@ and SSH key in GitHub **Actions secrets**, and only trigger it after the Docker 
 - **Bot silent in groups** — disable BotFather privacy mode (`/setprivacy` → Disable)
   so it receives all group messages, and remember it also only replies to ambient chatter with
   probability `LIBERTATI_GROUP_REPLY_CHANCE` (always when addressed).
-- **`PermissionError` on `/data` or `/memory` at startup** — the host dirs are root-owned
-  (Docker creates missing bind-mount dirs as root). Fix:
-  `sudo chown -R 10001:10001 data memory` (the container runs as uid 10001).
+- **`PermissionError` on `/data` or `/memory` at startup** — should not happen (the
+  entrypoint chowns the mounts to uid 10001); if it does, the image predates the
+  entrypoint — rebuild, or `sudo chown -R 10001:10001 data memory` as a stopgap.
 - **State lost after redeploy** — the `./data` / `./memory` volumes aren't mounted; check
   `docker-compose.yml` and that the directories exist and are writable.
