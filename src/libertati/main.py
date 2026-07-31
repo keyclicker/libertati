@@ -19,7 +19,8 @@ from .storage.db import Database
 from .storage.history import HistoryStore
 from .storage.memory import MemoryStore
 from .telegram.base import IncomingMessage
-from .telegram.factory import build_client
+from .telegram.bot_api import BotApiClient
+from .telegram.webpreview import WebPreviewReader
 
 log = get_logger("main")
 
@@ -40,7 +41,8 @@ class App:
             max_file_chars=settings.memory_max_file_chars,
         )
         self.news = NewsReader(settings.news_feeds)
-        self.client = build_client(settings)
+        self.client = BotApiClient(token=settings.bot_token)
+        self.reader = WebPreviewReader()
         # history/agent are built after the DB connects
         self.history: HistoryStore | None = None
         self.agent: Agent | None = None
@@ -123,15 +125,15 @@ class App:
             self.history,
             self.memory,
             self.news,
-            reader=self.client,
-            public_only=self.settings.browse_public_only,
+            reader=self.reader,
             events=self.events,
         )
         self.agent = Agent(
             self.settings, llm, tools, self.history, self.memory, events=self.events
         )
         self.scheduler = Scheduler(
-            self.settings, self.agent, self.client, self.history, self.memory, self.news
+            self.settings, self.agent, self.client, self.history, self.memory, self.news,
+            reader=self.reader,
         )
 
     async def run(self) -> None:
@@ -140,7 +142,7 @@ class App:
         assert self.scheduler is not None
         self.client.on_message(self._on_message)
         self.scheduler.start()
-        log.info("libertati is up (mode=%s)", self.settings.telegram_mode)
+        log.info("libertati is up")
         try:
             await self.client.start()
         finally:

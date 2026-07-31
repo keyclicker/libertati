@@ -6,14 +6,12 @@ from libertati.llm.agent import Agent
 from libertati.llm.tools import ToolBox
 from libertati.news.reader import NewsReader
 from libertati.scheduler import jobs
-from libertati.telegram.base import IncomingMessage, Source, TelegramClient
+from libertati.telegram.base import IncomingMessage, TelegramClient
 
 
 class FakeClient(TelegramClient):
-    def __init__(self, *, supports_reading: bool, messages=None):
+    def __init__(self):
         super().__init__()
-        self._supports = supports_reading
-        self._messages = messages or []
         self.sent: list[tuple] = []
 
     async def start(self): ...
@@ -23,19 +21,17 @@ class FakeClient(TelegramClient):
     def self_username(self):
         return "@bot"
 
-    @property
-    def supports_reading(self):
-        return self._supports
-
-    async def list_readable_sources(self, limit: int = 100):
-        return [Source(id=1, title="Ch", username="@ch", kind="channel", is_public=True)]
-
-    async def read_source(self, source, limit: int = 20):
-        return self._messages
-
     async def send_message(self, chat_id, text, reply_to_id=None):
         self.sent.append((chat_id, text))
         return IncomingMessage(chat_id=chat_id, message_id=999, text=text, from_self=True)
+
+
+class FakeReader:
+    def __init__(self, messages=None):
+        self._messages = messages or []
+
+    async def read_source(self, source, limit: int = 20):
+        return self._messages
 
 
 def _agent(settings, history, memory, script):
@@ -43,10 +39,11 @@ def _agent(settings, history, memory, script):
     return Agent(settings, FakeLLM(script), tools, history, memory)
 
 
-async def test_browse_job_noop_without_reading(settings, history, memory):
-    client = FakeClient(supports_reading=False)
+async def test_browse_job_noop_without_channels(settings, history, memory):
+    client = FakeClient()
+    reader = FakeReader(messages=[make_message("x", message_id=1)])
     agent = _agent(settings, history, memory, [assistant("should not be used")])
-    await jobs.browse_job(agent, client, history, settings)
+    await jobs.browse_job(agent, client, reader, history, settings)
     assert client.sent == []
 
 
@@ -55,12 +52,12 @@ async def test_browse_job_reads_and_discusses(history, memory):
         openai_api_key="k", bot_token="1:x",
         browse_channels=["@ch"], allowed_chats=["777"],
     )
-    client = FakeClient(
-        supports_reading=True,
+    client = FakeClient()
+    reader = FakeReader(
         messages=[make_message("ринки падають", message_id=1, handle="@a")],
     )
     agent = _agent(settings, history, memory, [assistant("ну і шо, купуй на дні 😏")])
-    await jobs.browse_job(agent, client, history, settings)
+    await jobs.browse_job(agent, client, reader, history, settings)
     assert client.sent, "expected a discuss message"
     chat_id, text = client.sent[0]
     assert chat_id == 777
@@ -72,10 +69,8 @@ async def test_browse_job_pass_sends_nothing(history, memory):
         openai_api_key="k", bot_token="1:x",
         browse_channels=["@ch"], allowed_chats=["777"],
     )
-    client = FakeClient(
-        supports_reading=True,
-        messages=[make_message("нудьга", message_id=1)],
-    )
+    client = FakeClient()
+    reader = FakeReader(messages=[make_message("нудьга", message_id=1)])
     agent = _agent(settings, history, memory, [assistant("PASS")])
-    await jobs.browse_job(agent, client, history, settings)
+    await jobs.browse_job(agent, client, reader, history, settings)
     assert client.sent == []

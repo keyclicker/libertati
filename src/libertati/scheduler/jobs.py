@@ -12,7 +12,8 @@ from ..logging import get_logger
 from ..news.reader import NewsReader, format_digest
 from ..storage.history import HistoryStore
 from ..storage.memory import MemoryStore
-from ..telegram.base import Source, TelegramClient
+from ..telegram.base import TelegramClient
+from ..telegram.webpreview import WebPreviewReader
 
 log = get_logger("scheduler.jobs")
 
@@ -22,7 +23,7 @@ async def _resolve_target(target: str, history: HistoryStore) -> int | str | Non
     if target.lstrip("-").isdigit():
         return int(target)
     chat_id = await history.chat_id_for_handle(target)
-    return chat_id if chat_id is not None else target  # Telethon accepts @username
+    return chat_id if chat_id is not None else target  # Bot API accepts @channelusername
 
 
 async def heartbeat_job(agent: Agent, client: TelegramClient, history: HistoryStore) -> None:
@@ -61,22 +62,12 @@ async def news_refresh_job(news: NewsReader, memory: MemoryStore) -> None:
     log.info("news: appended %d items to world.md", len(items))
 
 
-async def _pick_browse_source(
-    client: TelegramClient, settings: Settings
-) -> tuple[int | str, str] | None:
-    """Choose a channel/chat to read: configured list first, else a random dialog."""
-    if settings.browse_channels:
-        channel = random.choice(settings.browse_channels)
-        return channel, f"канал {channel}"
-    sources = await client.list_readable_sources()
-    if settings.browse_public_only:
-        sources = [s for s in sources if s.is_public]
-    if not sources:
+def _pick_browse_source(settings: Settings) -> tuple[str, str] | None:
+    """Choose a public channel to read from the configured list."""
+    if not settings.browse_channels:
         return None
-    src: Source = random.choice(sources)
-    ref = src.username or src.id
-    desc = f"{src.kind} {src.title or src.username or src.id}"
-    return ref, desc
+    channel = random.choice(settings.browse_channels)
+    return channel, f"канал {channel}"
 
 
 async def _pick_discuss_target(history: HistoryStore, settings: Settings) -> int | str | None:
@@ -90,18 +81,16 @@ async def _pick_discuss_target(history: HistoryStore, settings: Settings) -> int
 async def browse_job(
     agent: Agent,
     client: TelegramClient,
+    reader: WebPreviewReader,
     history: HistoryStore,
     settings: Settings,
 ) -> None:
-    if not client.supports_reading:
-        log.info("browse: reading not supported in this mode; skipping")
-        return
-    picked = await _pick_browse_source(client, settings)
+    picked = _pick_browse_source(settings)
     if picked is None:
-        log.info("browse: no source to read")
+        log.info("browse: no channels configured (LIBERTATI_BROWSE_CHANNELS)")
         return
     ref, desc = picked
-    messages = await client.read_source(ref, limit=settings.browse_read_limit)
+    messages = await reader.read_source(ref, limit=settings.browse_read_limit)
     if not messages:
         log.info("browse: %s had nothing to read", desc)
         return

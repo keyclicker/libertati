@@ -22,6 +22,7 @@ from ..news.reader import NewsReader
 from ..storage.history import HistoryStore
 from ..storage.memory import MemoryStore
 from ..telegram.base import TelegramClient
+from ..telegram.webpreview import WebPreviewReader
 from . import jobs
 
 log = get_logger("scheduler.runner")
@@ -36,6 +37,7 @@ class Scheduler:
         history: HistoryStore,
         memory: MemoryStore,
         news: NewsReader,
+        reader: WebPreviewReader | None = None,
     ) -> None:
         self.settings = settings
         self.agent = agent
@@ -43,6 +45,7 @@ class Scheduler:
         self.history = history
         self.memory = memory
         self.news = news
+        self.reader = reader
         self._scheduler = AsyncIOScheduler()
 
     def start(self) -> None:
@@ -78,7 +81,7 @@ class Scheduler:
                 next_run_time=datetime.now() + timedelta(seconds=30),
             )
         if s.browse_enabled:
-            if self.client.supports_reading:
+            if self.reader is not None and s.browse_channels:
                 self._scheduler.add_job(
                     self._plan_browses,
                     CronTrigger(hour=0, minute=2),
@@ -88,8 +91,7 @@ class Scheduler:
                 self._plan_browses()
             else:
                 log.warning(
-                    "browse_enabled is set but reading is unsupported in %s mode; skipping",
-                    s.telegram_mode,
+                    "browse_enabled is set but no reader/browse_channels configured; skipping"
                 )
         self._scheduler.start()
         log.info("scheduler started")
@@ -123,7 +125,7 @@ class Scheduler:
             self._scheduler.add_job(
                 jobs.browse_job,
                 DateTrigger(run_date=when),
-                args=[self.agent, self.client, self.history, self.settings],
+                args=[self.agent, self.client, self.reader, self.history, self.settings],
                 id=f"browse_{i}",
                 replace_existing=True,
             )

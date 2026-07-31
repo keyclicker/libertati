@@ -10,5 +10,3 @@ services:
     volumes:
       - ./data:/data
       - ./memory:/memory
-      # In account mode, persist the Telethon session file:
-      - ./libertati.session:/app/libertati.session

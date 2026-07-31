@@ -46,13 +46,7 @@ All config is environment variables with the `LIBERTATI_` prefix; `docker-compos
 
 ```
 LIBERTATI_OPENAI_API_KEY=sk-...
-# bot mode:
-LIBERTATI_TELEGRAM_MODE=bot
 LIBERTATI_BOT_TOKEN=123456:your-token
-# or account mode:
-# LIBERTATI_TELEGRAM_MODE=account
-# LIBERTATI_TG_API_ID=12345
-# LIBERTATI_TG_API_HASH=your-hash
 ```
 
 See `README.md` for the full configuration reference. `.env` is gitignored — never commit it.
@@ -70,13 +64,6 @@ The image is public by default only if you set the GHCR package visibility to pu
 ```bash
 echo "$GHCR_PAT" | docker login ghcr.io -u <github-username> --password-stdin
 ```
-
-### 3. Account mode only — create the Telethon session
-
-`docker-compose.yml` mounts `./libertati.session`. Telethon needs an interactive login once to
-create it. Easiest is to log in locally (`uv run python -m libertati.login`) and copy the
-resulting `libertati.session` to the server, or run the login inside a one-off container with a
-TTY. In **bot mode** you can delete that volume line — no session file is needed.
 
 ## Run it
 
@@ -111,10 +98,8 @@ and SSH key in GitHub **Actions secrets**, and only trigger it after the Docker 
 
 - **`denied` / `unauthorized` on `docker compose pull`** — the GHCR package is private and the
   server isn't logged in; do step 2, or make the package public.
-- **Bot silent in groups (bot mode)** — disable BotFather privacy mode (`/setprivacy` → Disable)
+- **Bot silent in groups** — disable BotFather privacy mode (`/setprivacy` → Disable)
   so it receives all group messages, and remember it also only replies to ambient chatter with
   probability `LIBERTATI_GROUP_REPLY_CHANCE` (always when addressed).
-- **Account mode won't start** — the `libertati.session` file is missing or unauthorized; recreate
-  it (step 3).
 - **State lost after redeploy** — the `./data` / `./memory` volumes aren't mounted; check
   `docker-compose.yml` and that the directories exist and are writable.

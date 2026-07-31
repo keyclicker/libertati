@@ -15,7 +15,6 @@ def setup_logging(level: str = "INFO") -> None:
     # Quiet noisy third-party loggers.
     logging.getLogger("httpx").setLevel(logging.WARNING)
     logging.getLogger("apscheduler").setLevel(logging.WARNING)
-    logging.getLogger("telethon").setLevel(logging.WARNING)
 
 
 def get_logger(name: str) -> logging.Logger:

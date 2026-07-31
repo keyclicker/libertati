@@ -7,7 +7,6 @@ requires-python = ">=3.12"
 license = { text = "MIT" }
 dependencies = [
     "aiogram>=3.13,<4",
-    "telethon>=1.36,<2",
     "openai>=1.51,<2",
     "aiosqlite>=0.20",
     "apscheduler>=3.10,<4",
@@ -21,7 +20,6 @@ dependencies = [
 [project.scripts]
 libertati = "libertati.main:run"
 libertati-trigger = "libertati.trigger:main"
-libertati-login = "libertati.login:main"
 
 [dependency-groups]
 dev = [

@@ -48,7 +48,7 @@ async def _run(routine: str) -> None:
         elif routine == "dream":
             await jobs.dream_job(app.agent, app.memory)
         elif routine == "browse":
-            await jobs.browse_job(app.agent, app.client, app.history, settings)
+            await jobs.browse_job(app.agent, app.client, app.reader, app.history, settings)
         elif routine == "news":
             await jobs.news_refresh_job(app.news, app.memory)
     finally:

@@ -39,5 +39,4 @@ def test_browse_channels_parsing():
 def test_browse_defaults():
     s = _settings()
     assert s.browse_enabled is False
-    assert s.browse_public_only is True
     assert s.browse_times_per_day == 3

@@ -11,7 +11,8 @@ from ..news.reader import NewsReader, format_digest
 from ..observability import NULL_EVENTS, EventLogger
 from ..storage.history import HistoryStore
 from ..storage.memory import MemoryStore
-from ..telegram.base import IncomingMessage, TelegramClient
+from ..telegram.base import IncomingMessage
+from ..telegram.webpreview import WebPreviewReader
 
 log = get_logger("llm.tools")
 
@@ -101,14 +102,13 @@ TOOL_SCHEMAS: list[dict[str, Any]] = [
         "function": {
             "name": "read_telegram",
             "description": (
-                "Read the most recent messages of a Telegram channel or chat (by @username or "
-                "numeric id). Only works when running as a user account; may be limited to "
-                "public @channels."
+                "Read the most recent posts of a public Telegram channel by @username "
+                "(via the t.me web preview). Private chats/groups are not readable."
             ),
             "parameters": {
                 "type": "object",
                 "properties": {
-                    "source": {"type": "string", "description": "@username or numeric chat id"},
+                    "source": {"type": "string", "description": "public channel @username"},
                     "limit": {"type": "integer", "default": 15},
                 },
                 "required": ["source"],
@@ -126,15 +126,13 @@ class ToolBox:
         history: HistoryStore,
         memory: MemoryStore,
         news: NewsReader,
-        reader: TelegramClient | None = None,
-        public_only: bool = True,
+        reader: WebPreviewReader | None = None,
         events: EventLogger | None = None,
     ) -> None:
         self.history = history
         self.memory = memory
         self.news = news
         self.reader = reader
-        self.public_only = public_only
         self.events = events or NULL_EVENTS
 
     @property
@@ -207,15 +205,11 @@ class ToolBox:
         return json.dumps({"digest": format_digest(items)}, ensure_ascii=False)
 
     async def _tool_read_telegram(self, args: dict[str, Any]) -> str:
-        if self.reader is None or not self.reader.supports_reading:
-            return json.dumps(
-                {"error": "reading Telegram is only available in account mode"}
-            )
+        if self.reader is None:
+            return json.dumps({"error": "reading Telegram channels is not available"})
         source = str(args["source"]).strip()
-        if self.public_only and not source.startswith("@"):
-            return json.dumps(
-                {"error": "only public @channels may be read (browse_public_only is on)"}
-            )
+        if not source.startswith("@"):
+            return json.dumps({"error": "only public @channels can be read"})
         messages = await self.reader.read_source(source, limit=int(args.get("limit", 15)))
         return json.dumps(
             {"source": source, "transcript": format_transcript(messages)},

@@ -3,12 +3,10 @@
 from __future__ import annotations
 
 from pathlib import Path
-from typing import Annotated, Literal
+from typing import Annotated
 
 from pydantic import Field, field_validator
 from pydantic_settings import BaseSettings, NoDecode, SettingsConfigDict
-
-TelegramMode = Literal["bot", "account"]
 
 DEFAULT_NEWS_FEEDS = [
     "https://feeds.bbci.co.uk/news/world/rss.xml",
@@ -28,11 +26,7 @@ class Settings(BaseSettings):
     )
 
     # --- Telegram -----------------------------------------------------------
-    telegram_mode: TelegramMode = "bot"
     bot_token: str = ""
-    tg_api_id: int = 0
-    tg_api_hash: str = ""
-    tg_session: str = "libertati"  # session name (account mode)
 
     # --- OpenAI -------------------------------------------------------------
     openai_api_key: str = ""
@@ -73,10 +67,9 @@ class Settings(BaseSettings):
     # Chats the bot is allowed to talk in (ids and/or @usernames). Empty = everywhere.
     allowed_chats: Annotated[list[str], NoDecode] = Field(default_factory=list)
 
-    # --- Browsing (reading other chats/channels; account mode only) ---------
+    # --- Browsing (reading public channels via the t.me/s/ web preview) -----
     browse_enabled: bool = False
     browse_channels: Annotated[list[str], NoDecode] = Field(default_factory=list)
-    browse_public_only: bool = True
     browse_times_per_day: int = 3
     browse_read_limit: int = 15
 
@@ -110,17 +103,11 @@ class Settings(BaseSettings):
         return bool(username and username.lstrip("@").lower() in allowed)
 
     def validate_runtime(self) -> None:
-        """Assert the settings required for the chosen mode are present."""
+        """Assert the required settings are present."""
         if not self.openai_api_key:
             raise ValueError("LIBERTATI_OPENAI_API_KEY is required")
-        if self.telegram_mode == "bot":
-            if not self.bot_token:
-                raise ValueError("LIBERTATI_BOT_TOKEN is required in bot mode")
-        elif self.telegram_mode == "account":
-            if not (self.tg_api_id and self.tg_api_hash):
-                raise ValueError(
-                    "LIBERTATI_TG_API_ID and LIBERTATI_TG_API_HASH are required in account mode"
-                )
+        if not self.bot_token:
+            raise ValueError("LIBERTATI_BOT_TOKEN is required")
 
 
 def load_settings() -> Settings:

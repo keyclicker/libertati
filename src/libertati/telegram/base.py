@@ -1,8 +1,7 @@
-"""Backend-agnostic Telegram interface.
+"""Telegram client interface.
 
-The rest of the application depends only on the types defined here, so it does
-not care whether messages arrive over the HTTP Bot API (aiogram) or MTProto
-(Telethon).
+The rest of the application depends only on the types defined here, not on the
+concrete aiogram adapter, so lightweight test doubles stay easy.
 """
 
 from __future__ import annotations
@@ -36,19 +35,8 @@ class OutgoingMessage:
     reply_to_id: int | None = None
 
 
-@dataclass(slots=True)
-class Source:
-    """A chat/channel the account can read from."""
-
-    id: int
-    title: str | None = None
-    username: str | None = None         # public @username, if any
-    kind: str = "chat"                  # "channel" | "group" | "user"
-    is_public: bool = False
-
-
 class TelegramClient(ABC):
-    """Common surface implemented by both backends."""
+    """Common surface implemented by Telegram adapters."""
 
     def __init__(self) -> None:
         self._handler: MessageHandler | None = None
@@ -85,16 +73,4 @@ class TelegramClient(ABC):
     @property
     @abstractmethod
     def self_username(self) -> str | None:
-        """The bot/account username, once connected."""
-
-    # -- reading other chats/channels (account mode only) -------------------
-    # Concrete no-op defaults so bot-mode adapters inherit "unsupported".
-    @property
-    def supports_reading(self) -> bool:
-        return False
-
-    async def list_readable_sources(self, limit: int = 100) -> list[Source]:
-        return []
-
-    async def read_source(self, source: int | str, limit: int = 20) -> list[IncomingMessage]:
-        return []
+        """The bot username, once connected."""
