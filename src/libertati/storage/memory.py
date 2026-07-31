@@ -4,6 +4,7 @@ Layout under ``memory_dir``::
 
     user/<handle>.md    per-user facts, tone, running summary
     group/<slug>.md     per-group dynamics, in-jokes, topics
+    SOUL.md             the persona itself (seeded on first run, evolvable in dreams)
     self.md             the bot's evolving self-concept / persona journal
     world.md            running digest of news & current events read
     social.md           relationship graph, who-knows-whom, open threads

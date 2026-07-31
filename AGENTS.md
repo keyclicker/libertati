@@ -17,4 +17,5 @@ Agentic Telegram bot ("Ana Tati"). Python 3.12, `uv`, async.
 - Config via `LIBERTATI_`-prefixed env vars (`config.py`); no hardcoded secrets.
 - New collaborators get an optional `events`/deps param defaulting to a no-op — never break call sites.
 - Keep it green: ruff + ty + pytest must pass before committing.
-- Persona/prompts live in `llm/prompts.py`.
+- Prompts live in `llm/prompts.py`; the persona itself lives in the `SOUL.md`
+  memory file (seeded from `prompts.default_soul`, evolvable during dreams).

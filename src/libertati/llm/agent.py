@@ -101,6 +101,14 @@ class Agent:
         return (message.content or "").strip()
 
     # -- context helpers -----------------------------------------------------
+    def _system_prompt(self) -> str:
+        """The system prompt, with the persona loaded from (and seeded to) SOUL.md."""
+        soul = self.memory.read("SOUL.md").strip()
+        if not soul:
+            soul = prompts.default_soul(self.settings)
+            self.memory.overwrite("SOUL.md", soul)
+        return prompts.system_prompt(self.settings, soul)
+
     def _memory_context(self, incoming: IncomingMessage | None = None) -> str:
         """Build the memory snapshot for the prompt.
 
@@ -164,7 +172,7 @@ class Agent:
         convo = await self._conversation(incoming)
         memory_ctx = self._memory_context(incoming)
         messages: list[dict[str, Any]] = [
-            {"role": "system", "content": prompts.system_prompt(self.settings)},
+            {"role": "system", "content": self._system_prompt()},
             {"role": "system", "content": memory_ctx},
             *self._stored_to_messages(convo),
             {"role": "system", "content": prompts.response_instruction(self.settings)},
@@ -183,7 +191,7 @@ class Agent:
     async def heartbeat(self) -> HeartbeatAction | None:
         chats = await self.history.active_chats(limit=10)
         messages: list[dict[str, Any]] = [
-            {"role": "system", "content": prompts.system_prompt(self.settings)},
+            {"role": "system", "content": self._system_prompt()},
             {"role": "system", "content": self._memory_context()},
             {
                 "role": "system",
@@ -211,7 +219,7 @@ class Agent:
 
     async def dream(self) -> str:
         messages: list[dict[str, Any]] = [
-            {"role": "system", "content": prompts.system_prompt(self.settings)},
+            {"role": "system", "content": self._system_prompt()},
             {"role": "system", "content": self._memory_context()},
             {"role": "user", "content": prompts.dream_instruction(self.settings)},
         ]
@@ -229,7 +237,7 @@ class Agent:
         The model may save something to reading.md, then returns a chat remark or 'PASS'.
         """
         messages: list[dict[str, Any]] = [
-            {"role": "system", "content": prompts.system_prompt(self.settings)},
+            {"role": "system", "content": self._system_prompt()},
             {"role": "system", "content": self._memory_context()},
             {
                 "role": "user",

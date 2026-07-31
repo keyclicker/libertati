@@ -197,3 +197,21 @@ async def test_tool_loop_cap_emits_event(settings, history, memory, tool_call, t
     ev.close()
     rows = [json.loads(x) for x in (tmp_path / "e.jsonl").read_text().splitlines()]
     assert any(r["type"] == "tool_loop_cap" for r in rows)
+
+
+async def test_soul_seeded_on_first_use(settings, history, memory):
+    agent, llm = build_agent(settings, history, memory, [assistant("ок")])
+    await agent.respond(make_message("привіт", message_id=1))
+    soul = memory.read("SOUL.md")
+    assert "лібертаріанська" in soul  # default persona written to SOUL.md
+    system = llm.calls[-1][0]["content"]
+    assert "лібертаріанська" in system
+
+
+async def test_soul_overrides_default_persona(settings, history, memory):
+    memory.overwrite("SOUL.md", "Тепер вона спокійна стоїчна філософиня.")
+    agent, llm = build_agent(settings, history, memory, [assistant("ок")])
+    await agent.respond(make_message("привіт", message_id=1))
+    system = llm.calls[-1][0]["content"]
+    assert "стоїчна філософиня" in system
+    assert "лібертаріанська" not in system
