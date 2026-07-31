@@ -26,7 +26,7 @@ dev = [
     "pytest>=8.3",
     "pytest-asyncio>=0.24",
     "ruff>=0.6",
-    "mypy>=1.11",
+    "ty>=0.0.65",
 ]
 
 [build-system]
@@ -44,15 +44,6 @@ src = ["src", "tests"]
 [tool.ruff.lint]
 select = ["E", "F", "I", "UP", "B", "W", "ASYNC"]
 ignore = ["B008"]
-
-[tool.mypy]
-python_version = "3.12"
-packages = ["libertati"]
-mypy_path = "src"
-ignore_missing_imports = true
-warn_unused_ignores = false
-disallow_untyped_defs = false
-check_untyped_defs = true
 
 [tool.pytest.ini_options]
 asyncio_mode = "auto"

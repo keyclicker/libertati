@@ -62,7 +62,7 @@ class BotApiClient(TelegramClient):
         await self._dp.start_polling(self._bot, handle_signals=False)
 
     async def send_message(
-        self, chat_id: int, text: str, reply_to_id: int | None = None
+        self, chat_id: int | str, text: str, reply_to_id: int | None = None
     ) -> IncomingMessage | None:
         sent = await self._bot.send_message(
             chat_id=chat_id, text=text, reply_to_message_id=reply_to_id

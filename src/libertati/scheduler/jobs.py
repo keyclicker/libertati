@@ -37,7 +37,7 @@ async def heartbeat_job(agent: Agent, client: TelegramClient, history: HistorySt
         log.info("heartbeat: could not resolve target %s", action.target)
         return
     try:
-        sent = await client.send_message(target, action.text)  # type: ignore[arg-type]
+        sent = await client.send_message(target, action.text)
     except Exception as exc:  # noqa: BLE001
         log.warning("heartbeat send failed: %s", exc)
         return
@@ -104,7 +104,7 @@ async def browse_job(
         log.info("browse: no chat to discuss in")
         return
     try:
-        sent = await client.send_message(target, remark)  # type: ignore[arg-type]
+        sent = await client.send_message(target, remark)
     except Exception as exc:  # noqa: BLE001
         log.warning("browse send failed: %s", exc)
         return

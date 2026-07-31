@@ -5,7 +5,7 @@ How libertati is built, published, and run on a server.
 ## Pipeline at a glance
 
 ```
-push/PR ──▶ CI (ci.yml)            ruff + mypy + pytest on every branch & PR
+push/PR ──▶ CI (ci.yml)            ruff + ty + pytest on every branch & PR
 push main ─▶ Docker (docker.yml)   build image ──▶ push to GHCR
 push v* tag ┘                                        │
                                                      ▼
@@ -15,7 +15,7 @@ server ── docker compose pull + up ─────────────�
 ```
 
 - **`.github/workflows/ci.yml`** runs on every push and PR: `uv sync --frozen`, then
-  `ruff check`, `mypy src`, `pytest`. Keep it green — it's the gate before anything ships.
+  `ruff check`, `ty check src`, `pytest`. Keep it green — it's the gate before anything ships.
 - **`.github/workflows/docker.yml`** runs on push to `main` and on `v*` tags. It builds the
   image and pushes it to the GitHub Container Registry (GHCR) using the built-in `GITHUB_TOKEN`
   (no secrets to configure). Image tags produced:

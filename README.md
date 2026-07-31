@@ -164,7 +164,7 @@ to also see the per-iteration tool decisions on stdout.
 
 ```bash
 uv run ruff check .     # lint
-uv run mypy src         # type check
+uv run ty check src     # type check
 uv run pytest           # tests (no network / no real API calls)
 ```
 
@@ -178,7 +178,7 @@ docker compose up --build
 
 ## CI/CD
 
-- **`.github/workflows/ci.yml`** — runs ruff, mypy and pytest on every push/PR.
+- **`.github/workflows/ci.yml`** — runs ruff, ty and pytest on every push/PR.
 - **`.github/workflows/docker.yml`** — on push to `main` and on `v*` tags, builds the image and
   pushes it to `ghcr.io/<owner>/libertati` using the built-in `GITHUB_TOKEN`.
 

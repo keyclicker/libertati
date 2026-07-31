@@ -62,9 +62,9 @@ class TelegramClient(ABC):
 
     @abstractmethod
     async def send_message(
-        self, chat_id: int, text: str, reply_to_id: int | None = None
+        self, chat_id: int | str, text: str, reply_to_id: int | None = None
     ) -> IncomingMessage | None:
-        """Send a message; return it as an IncomingMessage (from_self=True)."""
+        """Send a message (id or @channelusername); returns it with from_self=True."""
 
     @abstractmethod
     async def stop(self) -> None:
