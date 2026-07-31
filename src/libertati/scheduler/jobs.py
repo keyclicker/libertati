@@ -67,7 +67,7 @@ def _pick_browse_source(settings: Settings) -> tuple[str, str] | None:
     if not settings.browse_channels:
         return None
     channel = random.choice(settings.browse_channels)
-    return channel, f"канал {channel}"
+    return channel, f"channel {channel}"
 
 
 async def _pick_discuss_target(history: HistoryStore, settings: Settings) -> int | str | None:

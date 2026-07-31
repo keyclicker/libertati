@@ -139,7 +139,7 @@ async def test_memory_context_clips_large_files(settings, history, memory):
     ctx = agent._memory_context()
     # each file is clipped to the per-file budget (+ ellipsis + heading)
     assert len(ctx) < settings.memory_context_file_chars + 200
-    assert ctx.startswith("## Памʼять")
+    assert ctx.startswith("## Memory")
     assert "line 1999" in ctx  # tail (most recent) is what survives
     assert "line 0" not in ctx
 

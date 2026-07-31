@@ -95,7 +95,7 @@ class Agent:
             acc.context["iterations"] = self.settings.openai_max_tool_iterations
         self.events.emit("tool_loop_cap", limit=self.settings.openai_max_tool_iterations)
         messages.append(
-            {"role": "user", "content": "Заверши коротко, без інструментів."}
+            {"role": "user", "content": "Wrap up briefly, without tools."}
         )
         message = await self.llm.chat(messages, tools=None)
         return (message.content or "").strip()
@@ -126,7 +126,7 @@ class Agent:
                 files[f"group/{incoming.chat_title}"] = self.memory.read_group(
                     incoming.chat_title
                 )
-        parts = ["## Памʼять (нотатки)"]
+        parts = ["## Memory (notes)"]
         for name, content in files.items():
             if content.strip():
                 parts.append(f"### {name}\n{_clip(content, cap)}")
@@ -195,7 +195,7 @@ class Agent:
             {"role": "system", "content": self._memory_context()},
             {
                 "role": "system",
-                "content": "Активні чати: " + json.dumps(chats, ensure_ascii=False),
+                "content": "Active chats: " + json.dumps(chats, ensure_ascii=False),
             },
             {"role": "user", "content": prompts.heartbeat_instruction(self.settings)},
         ]
