@@ -33,11 +33,11 @@ typing_delay_enabled = true
 typing_delay_max_seconds = 5.0
 # Proactive messaging: random times spread over the day (09-22).
 heartbeat_enabled = true
-heartbeat_times_per_day = 2
+heartbeat_times_per_day = 50
 # Reflection/memory updates: random early-morning times (03-07).
 dream_enabled = true
-dream_times_per_day = 1
-news_refresh_hours = 6
+dream_times_per_day = 40
+news_refresh_hours = 1
 # news_feeds = ["https://feeds.bbci.co.uk/news/world/rss.xml", "https://hnrss.org/frontpage"]
 
 # Restrict which chats the bot proactively talks in (ids and/or @usernames).
@@ -51,7 +51,7 @@ news_refresh_hours = 6
 browse_enabled = true
 # Required for browsing: which public channels to read.
 browse_channels = ["@durov"]
-browse_times_per_day = 3
+browse_times_per_day = 20
 browse_read_limit = 15
 
 # ---- Persona ---------------------------------------------------------------
