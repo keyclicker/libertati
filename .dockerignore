@@ -11,3 +11,5 @@ dist
 Dockerfile
 compose.yaml
 .dockerignore
+tests
+.github
