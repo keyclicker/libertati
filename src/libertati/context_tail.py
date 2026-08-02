@@ -2,12 +2,12 @@
 
 ``libertati-ctx`` tails the ``context`` table like ``tail -f`` for the
 agent's brain: external events, hidden reasoning, tool calls/results and
-private monologue, each styled by kind, with a rough per-item token
+private final output, each styled by kind, with a rough per-item token
 count (o200k_base). Default mode streams new items to stdout; ``--live``
 opens a scrollable full-screen viewer whose status line adds the
-approximate token total of the agent's current window. Requires the
-``rich``, ``textual`` and ``tiktoken`` dev dependencies; run via
-``uv run libertati-ctx``.
+latest authoritative API input/cache usage and a separate approximate
+next-context total. Requires the ``rich``, ``textual`` and ``tiktoken``
+dev dependencies; run via ``uv run libertati-ctx``.
 """
 
 import argparse
@@ -15,6 +15,7 @@ import json
 import sqlite3
 import time
 from collections import deque
+from dataclasses import dataclass
 from datetime import UTC, datetime
 from functools import lru_cache
 from pathlib import Path
@@ -34,7 +35,7 @@ from libertati.config import Settings
 STYLES = {
     "event": ("cyan", "EVENT"),
     "reasoning": ("bright_black", "REASONING"),
-    "message": ("yellow", "MONOLOGUE"),
+    "message": ("yellow", "FINAL OUTPUT"),
     "function_call": ("magenta", "TOOL CALL"),
     "function_call_output": ("blue", "TOOL RESULT"),
     "web_search_call": ("green", "WEB SEARCH"),
@@ -49,12 +50,25 @@ POLL_SECONDS = 0.5
 Row = tuple[int, str, str]
 
 
+@dataclass(frozen=True)
+class UsageSnapshot:
+    """Authoritative counters for the latest completed API request."""
+
+    input_tokens: int
+    cached_tokens: int
+    cache_write_tokens: int
+    output_tokens: int
+    reasoning_tokens: int
+    input_context_id: int
+
+
 @lru_cache(maxsize=1)
 def _encoding() -> tiktoken.Encoding:
     """Load the o200k_base encoding once (cached on disk after first use)."""
     return tiktoken.get_encoding("o200k_base")
 
 
+@lru_cache(maxsize=2048)
 def token_count(raw: str) -> int:
     """Rough token count of a raw context item (o200k_base on its JSON).
 
@@ -83,7 +97,9 @@ def body_text(kind: str, item: dict[str, Any]) -> str:
     if kind == "message":
         parts = item.get("content", [])
         return "\n".join(
-            p.get("text", "") for p in parts if p.get("type") == "output_text"
+            p.get("text", "") or p.get("refusal", "")
+            for p in parts
+            if p.get("type") in {"output_text", "refusal"}
         )
     if kind == "function_call":
         args = item.get("arguments") or "{}"
@@ -99,7 +115,7 @@ def body_text(kind: str, item: dict[str, Any]) -> str:
     return json.dumps(item, ensure_ascii=False)
 
 
-def build_block(row: Row, full: bool) -> Text:
+def build_block(row: Row, full: bool, show_empty_final: bool = False) -> Text | None:
     """Render one context row as a styled two-part text block."""
     row_id, created_at, raw = row
     try:
@@ -109,6 +125,8 @@ def build_block(row: Row, full: bool) -> Text:
     kind = classify(item)
     color, label = STYLES[kind]
     body = body_text(kind, item)
+    if kind == "message" and not body and not show_empty_final:
+        return None
     if not full and len(body) > TRUNCATE_AT:
         body = body[:TRUNCATE_AT] + f" […{len(body) - TRUNCATE_AT} chars]"
     block = Text()
@@ -130,21 +148,98 @@ def fetch_after(conn: sqlite3.Connection, last_id: int) -> list[Row]:
 
 
 def fetch_before(
-    conn: sqlite3.Connection, first_id: int, limit: int | None = None
+    conn: sqlite3.Connection,
+    first_id: int,
+    limit: int | None = None,
+    exclude_types: tuple[str, ...] = (),
 ) -> list[Row]:
     """Return context rows before ``first_id``, oldest first."""
+    exclusion = ""
+    params: list[object] = [first_id]
+    if exclude_types:
+        placeholders = ", ".join("?" for _ in exclude_types)
+        exclusion = (
+            f" AND COALESCE(json_extract(item, '$.type'), '') NOT IN ({placeholders})"
+        )
+        params.extend(exclude_types)
     if limit is None:
         cursor = conn.execute(
-            "SELECT id, created_at, item FROM context WHERE id < ? ORDER BY id",
-            (first_id,),
+            "SELECT id, created_at, item FROM context WHERE id < ?"
+            + exclusion
+            + " ORDER BY id",
+            params,
         )
         return cursor.fetchall()
+    params.append(limit)
     cursor = conn.execute(
-        "SELECT id, created_at, item FROM context "
-        "WHERE id < ? ORDER BY id DESC LIMIT ?",
-        (first_id, limit),
+        "SELECT id, created_at, item FROM context WHERE id < ?"
+        + exclusion
+        + " ORDER BY id DESC LIMIT ?",
+        params,
     )
     return list(reversed(cursor.fetchall()))
+
+
+def fetch_latest_usage(conn: sqlite3.Connection) -> UsageSnapshot | None:
+    """Return exact usage from the newest API response when available."""
+    try:
+        row = conn.execute(
+            """
+            SELECT input_tokens, cached_tokens, cache_write_tokens,
+                   output_tokens, reasoning_tokens, input_context_id
+            FROM api_usage ORDER BY id DESC LIMIT 1
+            """
+        ).fetchone()
+    except sqlite3.OperationalError:
+        return None
+    return UsageSnapshot(*row) if row else None
+
+
+def fetch_active_turn_start(conn: sqlite3.Connection) -> int | None:
+    """Return context boundary for the currently running turn, if any."""
+    try:
+        row = conn.execute(
+            """
+            SELECT start_context_id FROM agent_turns
+            WHERE status = 'running' ORDER BY id DESC LIMIT 1
+            """
+        ).fetchone()
+    except sqlite3.OperationalError:
+        return None
+    return int(row[0]) if row else None
+
+
+def fetch_effective_window(
+    conn: sqlite3.Connection,
+    limit: int,
+    reasoning_context: str,
+    prune_completed_reasoning: bool,
+    active_turn_start: int | None,
+) -> list[Row]:
+    """Return items expected to render into the next model context."""
+    query = "SELECT id, created_at, item FROM context"
+    params: list[object] = []
+    excluded_types: tuple[str, ...] = ()
+    if prune_completed_reasoning:
+        excluded_types = ("reasoning", "message")
+    elif reasoning_context == "current_turn":
+        excluded_types = ("reasoning",)
+
+    if excluded_types:
+        placeholders = ", ".join("?" for _ in excluded_types)
+        type_expression = "COALESCE(json_extract(item, '$.type'), '')"
+        if active_turn_start is None:
+            query += f" WHERE {type_expression} NOT IN ({placeholders})"
+            params.extend(excluded_types)
+        else:
+            query += f" WHERE NOT (id <= ? AND {type_expression} IN ({placeholders}))"
+            params.append(active_turn_start)
+            params.extend(excluded_types)
+
+    query += " ORDER BY id DESC LIMIT ?"
+    params.append(limit)
+    rows = conn.execute(query, params).fetchall()
+    return list(reversed(rows))
 
 
 def age_text(created_at: str) -> str:
@@ -166,13 +261,28 @@ def build_status(
     last_activity: str | None,
     following: bool = True,
     window_tokens: int | None = None,
+    usage: UsageSnapshot | None = None,
 ) -> Text:
-    """Build the status line shown below the full-screen context log."""
+    """Build usage and projected-context lines below the context log."""
     status = Text()
     status.append(" libertati-ctx ", style="bold reverse")
     status.append(f"  #{total}", style="bold")
+    if usage is not None:
+        status.append(f"  ·  last in {usage.input_tokens / 1000:.1f}k", style="green")
+        status.append(f" ({usage.cached_tokens / 1000:.1f}k cached", style="cyan")
+        status.append(
+            f", {usage.cache_write_tokens / 1000:.1f}k write)",
+            style="yellow",
+        )
+        status.append(
+            f"  ·  reason {usage.reasoning_tokens / 1000:.1f}k",
+            style="bright_black",
+        )
+    else:
+        status.append("  ·  last API usage unavailable", style="yellow")
+    status.append("\n")
     if window_tokens is not None:
-        status.append(f"  ·  ~{window_tokens / 1000:.1f}k tok", style="magenta")
+        status.append(f" next ctx ~{window_tokens / 1000:.1f}k", style="magenta")
     if last_activity is not None:
         status.append(f"  ·  {age_text(last_activity)}", style="cyan")
     status.append(
@@ -187,8 +297,10 @@ def stream(conn: sqlite3.Connection, console: Console, args: Any, last_id: int) 
     """Print items as they appear (default mode); ``--once`` dumps once."""
     while True:
         for row in fetch_after(conn, last_id):
-            console.print(build_block(row, args.full))
-            console.print()
+            block = build_block(row, args.full, args.show_empty_final)
+            if block is not None:
+                console.print(block)
+                console.print()
             last_id = row[0]
         if args.once:
             return
@@ -211,7 +323,7 @@ class ContextApp(App[None]):
 
     #status {
         dock: bottom;
-        height: 1;
+        height: 2;
         padding: 0 1;
         background: $surface;
     }
@@ -233,6 +345,9 @@ class ContextApp(App[None]):
         last_id: int,
         page_size: int = 20,
         window_items: int = 300,
+        show_empty_final: bool = False,
+        prune_completed_reasoning: bool = False,
+        reasoning_context: str = "auto",
     ) -> None:
         """Create a viewer over an open read-only database connection."""
         super().__init__()
@@ -240,15 +355,40 @@ class ContextApp(App[None]):
         self.full = full
         self.last_id = last_id
         self.page_size = max(1, page_size)
+        self.show_empty_final = show_empty_final
+        self.prune_completed_reasoning = prune_completed_reasoning
+        self.reasoning_context = reasoning_context
+        self.window_items = window_items
         self.last_activity: str | None = None
         self.rows: list[Row] = []
         self.has_older = True
         self.paging_ready = False
-        # Rolling token counts of the newest items — approximates what
-        # the agent's in-memory window costs as input right now.
-        tail = fetch_before(conn, 2**63 - 1, window_items)
-        self.window_tokens: deque[int] = deque(
-            (token_count(row[2]) for row in tail), maxlen=window_items
+        self.active_turn_start: int | None = None
+        self.usage: UsageSnapshot | None = None
+        self.window_tokens: deque[int] = deque(maxlen=window_items)
+        self._refresh_metrics(force=True)
+
+    def _refresh_metrics(self, force: bool = False) -> None:
+        """Refresh exact usage and effective next-context estimate."""
+        active_turn_start = fetch_active_turn_start(self.conn)
+        usage = fetch_latest_usage(self.conn)
+        state_changed = (
+            active_turn_start != self.active_turn_start or usage != self.usage
+        )
+        self.active_turn_start = active_turn_start
+        self.usage = usage
+        if not force and not state_changed:
+            return
+        rows = fetch_effective_window(
+            self.conn,
+            self.window_items,
+            self.reasoning_context,
+            self.prune_completed_reasoning,
+            active_turn_start,
+        )
+        self.window_tokens = deque(
+            (token_count(row[2]) for row in rows),
+            maxlen=self.window_items,
         )
 
     def _window_total(self) -> int | None:
@@ -259,7 +399,12 @@ class ContextApp(App[None]):
         """Create the scrollable log and fixed status line."""
         yield RichLog(id="context", min_width=1, wrap=True, auto_scroll=False)
         yield Static(
-            build_status(self.last_id, None, window_tokens=self._window_total()),
+            build_status(
+                self.last_id,
+                None,
+                window_tokens=self._window_total(),
+                usage=self.usage,
+            ),
             id="status",
         )
 
@@ -282,14 +427,16 @@ class ContextApp(App[None]):
         following = log.is_vertical_scroll_end
         new = fetch_after(self.conn, self.last_id)
         for row in new:
-            block = build_block(row, self.full)
+            block = build_block(row, self.full, self.show_empty_final)
+            if block is None:
+                continue
             block.append("\n")
             log.write(block, scroll_end=following, animate=False)
         if new:
             self.rows.extend(new)
-            self.window_tokens.extend(token_count(row[2]) for row in new)
             self.last_id = new[-1][0]
             self.last_activity = new[-1][1]
+        self._refresh_metrics(force=bool(new))
         self._update_status()
 
     def _render_rows(self) -> None:
@@ -297,7 +444,9 @@ class ContextApp(App[None]):
         log = self.query_one("#context", RichLog)
         log.clear()
         for row in self.rows:
-            block = build_block(row, self.full)
+            block = build_block(row, self.full, self.show_empty_final)
+            if block is None:
+                continue
             block.append("\n")
             log.write(block, scroll_end=False, animate=False)
 
@@ -337,6 +486,7 @@ class ContextApp(App[None]):
                 self.last_activity,
                 log.is_vertical_scroll_end,
                 self._window_total(),
+                self.usage,
             )
         )
 
@@ -389,9 +539,21 @@ def run_live(
     last_id: int,
     page_size: int,
     window_items: int,
+    show_empty_final: bool,
+    prune_completed_reasoning: bool,
+    reasoning_context: str,
 ) -> None:
     """Run the interactive full-screen context viewer."""
-    ContextApp(conn, full, last_id, page_size, window_items).run()
+    ContextApp(
+        conn,
+        full,
+        last_id,
+        page_size,
+        window_items,
+        show_empty_final,
+        prune_completed_reasoning,
+        reasoning_context,
+    ).run()
 
 
 def main() -> None:
@@ -424,6 +586,11 @@ def main() -> None:
     parser.add_argument(
         "--full", action="store_true", help="never truncate long bodies"
     )
+    parser.add_argument(
+        "--show-empty-final",
+        action="store_true",
+        help="show empty assistant final-output envelopes",
+    )
     args = parser.parse_args()
 
     # Settings are optional when --db is given (e.g. inspecting a copied
@@ -437,6 +604,16 @@ def main() -> None:
         if settings
         else Settings.model_fields["context_max_items"].default
     )
+    prune_completed_reasoning = (
+        settings.prune_completed_reasoning
+        if settings
+        else Settings.model_fields["prune_completed_reasoning"].default
+    )
+    reasoning_context = (
+        settings.reasoning_context
+        if settings
+        else Settings.model_fields["reasoning_context"].default
+    )
     db_path = args.db or (settings.db_path if settings else None)
     if db_path is None:
         parser.error("no --db given and settings could not be loaded")
@@ -447,7 +624,16 @@ def main() -> None:
     start_id = max(0, row[0] - args.tail)
     try:
         if args.live:
-            run_live(conn, args.full, start_id, args.tail, window_items)
+            run_live(
+                conn,
+                args.full,
+                start_id,
+                args.tail,
+                window_items,
+                args.show_empty_final,
+                prune_completed_reasoning,
+                reasoning_context,
+            )
         else:
             stream(conn, Console(), args, start_id)
     except KeyboardInterrupt:

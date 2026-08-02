@@ -1,17 +1,29 @@
 """Tests for settings validation."""
 
+from pathlib import Path
+from typing import Literal
+
 import pytest
 from pydantic import ValidationError
 
 from libertati.config import Settings
 
 
-def make_settings(max_items: int = 300, trim_items: int = 200) -> Settings:
+def make_settings(
+    max_items: int = 300,
+    trim_items: int = 200,
+    reasoning_context: Literal[
+        "auto", "current_turn", "all_turns", "omit"
+    ] = "current_turn",
+    prune_completed_reasoning: bool = False,
+) -> Settings:
     """Build settings with required secrets and given window sizes."""
     return Settings(
         bot_token="t",
         api_key="k",
         model="m",
+        reasoning_context=reasoning_context,
+        prune_completed_reasoning=prune_completed_reasoning,
         context_max_items=max_items,
         context_trim_items=trim_items,
     )
@@ -21,6 +33,9 @@ def test_context_window_defaults_valid() -> None:
     """The default window sizes pass validation."""
     settings = make_settings()
     assert settings.context_trim_items < settings.context_max_items
+    assert settings.reasoning_context == "current_turn"
+    assert settings.prune_completed_reasoning is False
+    assert settings.prompts_path == Path("prompts.toml")
 
 
 def test_context_trim_must_be_below_max() -> None:
@@ -35,3 +50,24 @@ def test_context_trim_must_be_positive() -> None:
     """A zero or negative trim size is rejected."""
     with pytest.raises(ValidationError):
         make_settings(trim_items=0)
+
+
+def test_pruning_requires_current_turn_reasoning() -> None:
+    """Cross-turn and provider-default reasoning cannot be pruned."""
+    with pytest.raises(ValidationError):
+        make_settings(
+            reasoning_context="all_turns",
+            prune_completed_reasoning=True,
+        )
+    with pytest.raises(ValidationError):
+        make_settings(reasoning_context="auto", prune_completed_reasoning=True)
+    with pytest.raises(ValidationError):
+        make_settings(reasoning_context="omit", prune_completed_reasoning=True)
+
+
+def test_cross_turn_reasoning_allowed_when_pruning_disabled() -> None:
+    """Operators can retain complete output history for all-turns use."""
+    settings = make_settings(
+        reasoning_context="all_turns",
+    )
+    assert settings.reasoning_context == "all_turns"

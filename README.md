@@ -6,7 +6,7 @@ Unlike a classic request/response bot, libertati runs a single persistent
 agent loop. Every incoming message from every chat (plus timers and
 heartbeats) is appended to one shared context timeline, and the model
 decides — deliberately, via a `send_message` tool — whether, where and
-when to reply. Plain text output is private thinking and sends nothing.
+when to reply. Plain assistant output is ignored and sends nothing.
 
 ## How it works
 
@@ -19,7 +19,8 @@ when to reply. Plain text output is private thinking and sends nothing.
 - **Wiring** (`bot.py`): aiogram handlers persist every message and push
   it as an event; background loops deliver due wakeups and periodic
   heartbeat status digests.
-- **Storage** (`db.py`): SQLite (WAL) with full raw Telegram payloads.
+- **Storage** (`db.py`): SQLite (WAL) with full raw Telegram payloads,
+  append-only model context, and exact API token/cache usage.
 - **Mind** (`memory.py`): three markdown files under `data/memory/`,
   editable by hand at any time. `SOUL.md` is the personality, re-read
   and attached to the instructions every turn. `MEMORY.md` is the
@@ -62,3 +63,7 @@ uv run pytest             # tests
 uv run libertati-ctx      # live colored tail of the agent's context
 uv run libertati-ctx --live   # paged full-screen viewer (j/k, g/G, q)
 ```
+
+The full-screen status shows authoritative token/cache counts from the
+latest API call plus a separate rough estimate for the next effective
+context after reasoning and pruning policy are applied.

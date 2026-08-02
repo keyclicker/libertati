@@ -6,9 +6,9 @@ to a single running context, and the model decides — deliberately, via the
 ``send_message`` tool — whether and where to reply. Plain text output is
 treated as private thinking and sends nothing.
 
-The full context history (events, reasoning, tool calls/results, replies)
-is persisted append-only in the database; only a capped tail window is
-kept in memory and sent to the API.
+Full context history (events, reasoning, tool calls/results, final output)
+is persisted append-only in the database. Only a capped, optionally
+pruned tail window is kept in memory and sent to the API.
 """
 
 import asyncio
@@ -73,18 +73,22 @@ class Agent:
         self.max_rounds = settings.max_rounds
         # Overflow threshold and post-trim size of the context window.
         # Trimming in chunks (not one-by-one) keeps the context prefix
-        # byte-stable between trims, so OpenAI prompt caching keeps
-        # hitting until the next overflow.
+        # byte-stable between trims instead of rewriting it on every
+        # append. Cache keys/breakpoints still determine actual hits.
         self.max_context_items = settings.context_max_items
         self.trim_context_items = settings.context_trim_items
         self._context: list[dict[str, Any]] = []
         self._queue: asyncio.Queue[str] = asyncio.Queue()
         self._api_tools = build_tools(settings.web_search)
+        reasoning: dict[str, Any] = {}
+        if settings.reasoning_effort is not None:
+            reasoning["effort"] = settings.reasoning_effort
+        if settings.reasoning_context != "omit":
+            reasoning["context"] = settings.reasoning_context
         self._reasoning: Reasoning | Omit = (
-            cast(Reasoning, {"effort": settings.reasoning_effort})
-            if settings.reasoning_effort is not None
-            else omit
+            cast(Reasoning, reasoning) if reasoning else omit
         )
+        self.prune_completed_reasoning = settings.prune_completed_reasoning
 
     async def load(self) -> None:
         """Restore the context window from the persisted history tail.
@@ -96,7 +100,13 @@ class Agent:
         reasoning items without encrypted content (from before
         ``store=False``) are dropped for the same reason.
         """
-        items = await self.db.load_context(self.trim_context_items)
+        excluded_types = (
+            ("reasoning", "message") if self.prune_completed_reasoning else ()
+        )
+        items = await self.db.load_context(
+            self.trim_context_items,
+            exclude_types=excluded_types,
+        )
         items = [
             item
             for item in items
@@ -190,37 +200,110 @@ class Agent:
         """Run one agentic turn: call the model, execute tools, repeat.
 
         The turn ends when the model produces no tool calls (its text, if
-        any, is logged as internal monologue) or ``max_rounds`` is
+        any, is logged as private final output) or ``max_rounds`` is
         reached. Everything the model produces is remembered. SOUL.md is
         re-read every turn so personality edits apply live.
         """
         instructions = f"{self.base_prompt}\n\n## Soul\n{self.mind.soul()}"
-        for _ in range(self.max_rounds):
-            response = await self.client.responses.create(
-                model=self.model,
-                instructions=instructions,
-                input=cast(ResponseInputParam, self._context),
-                tools=self._api_tools,
-                # Nothing is stored server-side; encrypted reasoning must
-                # ride along in the context for multi-round tool turns.
-                store=False,
-                include=["reasoning.encrypted_content"],
-                reasoning=self._reasoning,
-            )
-            for item in response.output:
-                await self._remember(item.model_dump(mode="json", exclude_none=True))
-            calls = [item for item in response.output if item.type == "function_call"]
-            if not calls:
-                if response.output_text:
-                    log.info("agent monologue: %s", response.output_text)
-                return
-            for call in calls:
-                result = await self.tools.run(call.name, call.arguments)
-                await self._remember(
-                    {
-                        "type": "function_call_output",
-                        "call_id": call.call_id,
-                        "output": result,
-                    }
+        turn_start = len(self._context)
+        turn_id = await self.db.start_agent_turn(await self.db.latest_context_id())
+        turn_status = "failed"
+        try:
+            for _ in range(self.max_rounds):
+                input_context_id = await self.db.latest_context_id()
+                response = await self.client.responses.create(
+                    model=self.model,
+                    instructions=instructions,
+                    input=cast(ResponseInputParam, self._context),
+                    tools=self._api_tools,
+                    # Nothing is stored server-side; encrypted reasoning must
+                    # ride along in the context for multi-round tool turns.
+                    store=False,
+                    include=["reasoning.encrypted_content"],
+                    reasoning=self._reasoning,
                 )
-        log.warning("agent hit max_rounds without settling")
+                await self._record_usage(response, turn_id, input_context_id)
+                for item in response.output:
+                    await self._remember(
+                        item.model_dump(mode="json", exclude_none=True)
+                    )
+                calls = [
+                    item for item in response.output if item.type == "function_call"
+                ]
+                if not calls:
+                    if response.output_text:
+                        log.info("agent final output: %s", response.output_text)
+                    turn_status = "completed"
+                    return
+                for call in calls:
+                    result = await self.tools.run(call.name, call.arguments)
+                    await self._remember(
+                        {
+                            "type": "function_call_output",
+                            "call_id": call.call_id,
+                            "output": result,
+                        }
+                    )
+            turn_status = "max_rounds"
+            log.warning("agent hit max_rounds without settling")
+        finally:
+            try:
+                await self.db.finish_agent_turn(
+                    turn_id,
+                    await self.db.latest_context_id(),
+                    turn_status,
+                )
+            finally:
+                self._finish_turn(turn_start)
+
+    def _finish_turn(self, start: int) -> None:
+        """Prune ephemeral outputs from one settled live-context turn."""
+        if not self.prune_completed_reasoning:
+            return
+        kept = [
+            item
+            for item in self._context[start:]
+            if item.get("type") not in {"reasoning", "message"}
+        ]
+        removed = len(self._context) - start - len(kept)
+        self._context[start:] = kept
+        if removed:
+            log.debug("pruned %d completed-turn reasoning/output items", removed)
+
+    async def _record_usage(
+        self,
+        response: Any,
+        turn_id: int,
+        input_context_id: int,
+    ) -> None:
+        """Persist and log authoritative usage returned by OpenAI."""
+        usage = getattr(response, "usage", None)
+        if usage is None:
+            return
+        input_details = getattr(usage, "input_tokens_details", None)
+        output_details = getattr(usage, "output_tokens_details", None)
+        cached_tokens = getattr(input_details, "cached_tokens", 0) or 0
+        cache_write_tokens = getattr(input_details, "cache_write_tokens", 0) or 0
+        reasoning_tokens = getattr(output_details, "reasoning_tokens", 0) or 0
+        await self.db.append_api_usage(
+            response_id=getattr(response, "id", None),
+            turn_id=turn_id,
+            input_context_id=input_context_id,
+            model=getattr(response, "model", None) or self.model,
+            input_tokens=usage.input_tokens,
+            cached_tokens=cached_tokens,
+            cache_write_tokens=cache_write_tokens,
+            output_tokens=usage.output_tokens,
+            reasoning_tokens=reasoning_tokens,
+            total_tokens=usage.total_tokens,
+        )
+        log.info(
+            "api usage: input=%d cached=%d cache_write=%d "
+            "output=%d reasoning=%d total=%d",
+            usage.input_tokens,
+            cached_tokens,
+            cache_write_tokens,
+            usage.output_tokens,
+            reasoning_tokens,
+            usage.total_tokens,
+        )

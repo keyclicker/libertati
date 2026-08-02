@@ -64,6 +64,30 @@ CREATE TABLE IF NOT EXISTS context (
     created_at TEXT NOT NULL DEFAULT (datetime('now'))
 );
 
+CREATE TABLE IF NOT EXISTS agent_turns (
+    id               INTEGER PRIMARY KEY AUTOINCREMENT,
+    start_context_id INTEGER NOT NULL,
+    end_context_id   INTEGER,
+    status           TEXT NOT NULL DEFAULT 'running',
+    started_at       TEXT NOT NULL DEFAULT (datetime('now')),
+    finished_at      TEXT
+);
+
+CREATE TABLE IF NOT EXISTS api_usage (
+    id                 INTEGER PRIMARY KEY AUTOINCREMENT,
+    response_id        TEXT,
+    turn_id            INTEGER,
+    input_context_id   INTEGER NOT NULL DEFAULT 0,
+    model              TEXT NOT NULL,
+    input_tokens       INTEGER NOT NULL,
+    cached_tokens      INTEGER NOT NULL,
+    cache_write_tokens INTEGER NOT NULL,
+    output_tokens      INTEGER NOT NULL,
+    reasoning_tokens   INTEGER NOT NULL,
+    total_tokens       INTEGER NOT NULL,
+    created_at         TEXT NOT NULL DEFAULT (datetime('now'))
+);
+
 CREATE TABLE IF NOT EXISTS wakeups (
     id         INTEGER PRIMARY KEY AUTOINCREMENT,
     due_at     TEXT NOT NULL,
@@ -103,7 +127,27 @@ class Database:
         await self._conn.execute("PRAGMA journal_mode = WAL")
         await self._conn.execute("PRAGMA foreign_keys = ON")
         await self._conn.executescript(SCHEMA)
+        # ``CREATE TABLE IF NOT EXISTS`` does not add columns to DBs
+        # created before usage snapshots gained context linkage.
+        await self._ensure_column("api_usage", "turn_id", "INTEGER")
+        await self._ensure_column(
+            "api_usage", "input_context_id", "INTEGER NOT NULL DEFAULT 0"
+        )
         await self._conn.commit()
+
+    async def _ensure_column(
+        self,
+        table: str,
+        column: str,
+        definition: str,
+    ) -> None:
+        """Add one trusted schema column when an older DB lacks it."""
+        async with self.conn.execute(f"PRAGMA table_info({table})") as cursor:
+            columns = {row[1] for row in await cursor.fetchall()}
+        if column not in columns:
+            await self.conn.execute(
+                f"ALTER TABLE {table} ADD COLUMN {column} {definition}"
+            )
 
     async def close(self) -> None:
         """Close the connection; safe to call when already closed."""
@@ -168,13 +212,105 @@ class Database:
         )
         await self.conn.commit()
 
-    async def load_context(self, limit: int) -> list[dict]:
-        """Return the newest ``limit`` context items, oldest first."""
+    async def latest_context_id(self) -> int:
+        """Return newest persisted context id, or zero when empty."""
         async with self.conn.execute(
-            "SELECT item FROM context ORDER BY id DESC LIMIT ?", (limit,)
+            "SELECT COALESCE(MAX(id), 0) FROM context"
         ) as cursor:
+            row = await cursor.fetchone()
+        return int(row[0]) if row else 0
+
+    async def start_agent_turn(self, start_context_id: int) -> int:
+        """Open a turn and mark any crash-left turn interrupted."""
+        await self.conn.execute(
+            """
+            UPDATE agent_turns
+            SET status = 'interrupted', finished_at = datetime('now')
+            WHERE status = 'running'
+            """
+        )
+        cursor = await self.conn.execute(
+            "INSERT INTO agent_turns (start_context_id) VALUES (?)",
+            (start_context_id,),
+        )
+        await self.conn.commit()
+        return cursor.lastrowid or 0
+
+    async def finish_agent_turn(
+        self,
+        turn_id: int,
+        end_context_id: int,
+        status: str,
+    ) -> None:
+        """Close a turn with its final context id and outcome."""
+        await self.conn.execute(
+            """
+            UPDATE agent_turns
+            SET end_context_id = ?, status = ?, finished_at = datetime('now')
+            WHERE id = ?
+            """,
+            (end_context_id, status, turn_id),
+        )
+        await self.conn.commit()
+
+    async def load_context(
+        self,
+        limit: int,
+        exclude_types: tuple[str, ...] = (),
+    ) -> list[dict]:
+        """Return newest eligible context items, oldest first."""
+        query = "SELECT item FROM context"
+        params: list[object] = []
+        if exclude_types:
+            placeholders = ", ".join("?" for _ in exclude_types)
+            query += (
+                " WHERE COALESCE(json_extract(item, '$.type'), '')"
+                f" NOT IN ({placeholders})"
+            )
+            params.extend(exclude_types)
+        query += " ORDER BY id DESC LIMIT ?"
+        params.append(limit)
+        async with self.conn.execute(query, params) as cursor:
             rows = list(await cursor.fetchall())
         return [json.loads(row["item"]) for row in reversed(rows)]
+
+    async def append_api_usage(
+        self,
+        *,
+        response_id: str | None,
+        turn_id: int,
+        input_context_id: int,
+        model: str,
+        input_tokens: int,
+        cached_tokens: int,
+        cache_write_tokens: int,
+        output_tokens: int,
+        reasoning_tokens: int,
+        total_tokens: int,
+    ) -> None:
+        """Persist exact token and prompt-cache usage for one API call."""
+        await self.conn.execute(
+            """
+            INSERT INTO api_usage (
+                response_id, turn_id, input_context_id, model,
+                input_tokens, cached_tokens, cache_write_tokens,
+                output_tokens, reasoning_tokens, total_tokens
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                response_id,
+                turn_id,
+                input_context_id,
+                model,
+                input_tokens,
+                cached_tokens,
+                cache_write_tokens,
+                output_tokens,
+                reasoning_tokens,
+                total_tokens,
+            ),
+        )
+        await self.conn.commit()
 
     async def add_wakeup(self, due_at: str, note: str) -> int:
         """Store a scheduled wakeup (``due_at`` as UTC stamp); return its id."""

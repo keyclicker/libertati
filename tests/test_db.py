@@ -1,5 +1,6 @@
 """Tests for the SQLite persistence layer against a temporary database."""
 
+import sqlite3
 from collections.abc import AsyncIterator
 from pathlib import Path
 from typing import Any
@@ -171,3 +172,96 @@ async def test_context_roundtrip(db: Database) -> None:
         await db.append_context({"role": "user", "content": f"event {i}"})
     tail = await db.load_context(3)
     assert [item["content"] for item in tail] == ["event 2", "event 3", "event 4"]
+
+
+async def test_context_load_excludes_ephemeral_types_before_limit(
+    db: Database,
+) -> None:
+    """Filtered restore returns requested count of retained item types."""
+    await db.append_context({"role": "user", "content": "event 1"})
+    await db.append_context({"type": "reasoning", "encrypted_content": "x"})
+    await db.append_context({"type": "message", "role": "assistant", "content": []})
+    await db.append_context({"role": "user", "content": "event 2"})
+
+    items = await db.load_context(2, exclude_types=("reasoning", "message"))
+
+    assert [item["content"] for item in items] == ["event 1", "event 2"]
+
+
+async def test_api_usage_roundtrip(db: Database) -> None:
+    """Exact response usage is retained for later cost analysis."""
+    turn_id = await db.start_agent_turn(await db.latest_context_id())
+    await db.append_api_usage(
+        response_id="resp_1",
+        turn_id=turn_id,
+        input_context_id=42,
+        model="gpt-test",
+        input_tokens=100,
+        cached_tokens=80,
+        cache_write_tokens=20,
+        output_tokens=30,
+        reasoning_tokens=25,
+        total_tokens=130,
+    )
+
+    row = await (await db.conn.execute("SELECT * FROM api_usage")).fetchone()
+    assert row is not None
+    assert row["response_id"] == "resp_1"
+    assert row["turn_id"] == turn_id
+    assert row["input_context_id"] == 42
+    assert row["model"] == "gpt-test"
+    assert row["cached_tokens"] == 80
+    assert row["cache_write_tokens"] == 20
+    assert row["reasoning_tokens"] == 25
+
+
+async def test_agent_turn_lifecycle(db: Database) -> None:
+    """Turn boundaries and outcomes persist for viewer context filtering."""
+    await db.append_context({"role": "user", "content": "event"})
+    start_context_id = await db.latest_context_id()
+    turn_id = await db.start_agent_turn(start_context_id)
+    await db.append_context({"type": "reasoning", "encrypted_content": "x"})
+    end_context_id = await db.latest_context_id()
+    await db.finish_agent_turn(turn_id, end_context_id, "completed")
+
+    row = await (
+        await db.conn.execute("SELECT * FROM agent_turns WHERE id = ?", (turn_id,))
+    ).fetchone()
+    assert row is not None
+    assert row["start_context_id"] == start_context_id
+    assert row["end_context_id"] == end_context_id
+    assert row["status"] == "completed"
+    assert row["finished_at"] is not None
+
+
+async def test_usage_schema_migrates_existing_table(tmp_path: Path) -> None:
+    """Connecting adds context linkage to pre-linkage usage tables."""
+    path = tmp_path / "old.db"
+    conn = sqlite3.connect(path)
+    conn.execute(
+        """CREATE TABLE api_usage (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            response_id TEXT,
+            model TEXT NOT NULL,
+            input_tokens INTEGER NOT NULL,
+            cached_tokens INTEGER NOT NULL,
+            cache_write_tokens INTEGER NOT NULL,
+            output_tokens INTEGER NOT NULL,
+            reasoning_tokens INTEGER NOT NULL,
+            total_tokens INTEGER NOT NULL,
+            created_at TEXT NOT NULL DEFAULT (datetime('now'))
+        )"""
+    )
+    conn.close()
+
+    database = Database(path)
+    await database.connect()
+    columns = {
+        row[1]
+        for row in await (
+            await database.conn.execute("PRAGMA table_info(api_usage)")
+        ).fetchall()
+    }
+    await database.close()
+
+    assert {"turn_id", "input_context_id"} <= columns

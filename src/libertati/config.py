@@ -1,6 +1,7 @@
 """Application settings loaded from the environment and config files."""
 
 from pathlib import Path
+from typing import Literal
 
 from pydantic import model_validator
 from pydantic_settings import (
@@ -35,6 +36,15 @@ class Settings(BaseSettings):
     # For reasoning models: none/minimal/low/medium/high/xhigh/max
     # (model-dependent); None sends no preference.
     reasoning_effort: str | None = None
+    # Which prior reasoning OpenAI may render into a new sample. "omit"
+    # sends no context parameter for providers that do not support it.
+    reasoning_context: Literal["auto", "current_turn", "all_turns", "omit"] = (
+        "current_turn"
+    )
+    # Remove reasoning and assistant output envelopes from the live
+    # window after each turn. Full history remains in SQLite; enabling
+    # this can reduce prompt-cache reuse for the completed-turn suffix.
+    prune_completed_reasoning: bool = False
     # User-editable agent and memory prompts.
     prompts_path: Path = Path("prompts.toml")
     # Harden the persona: never break character, never admit to being a
@@ -58,7 +68,7 @@ class Settings(BaseSettings):
     max_rounds: int = 8
     # Context window: cut back to context_trim_items once it grows past
     # context_max_items. Trimming in chunks keeps the prompt prefix
-    # byte-stable between trims, so OpenAI prompt caching keeps hitting.
+    # byte-stable between trims instead of rewriting it on every append.
     context_max_items: int = 300
     context_trim_items: int = 200
     # Timezone the agent lives in (event timestamps, wakeup scheduling).
@@ -71,10 +81,14 @@ class Settings(BaseSettings):
 
     @model_validator(mode="after")
     def _validate_context_window(self) -> "Settings":
-        """Reject window sizes where trimming could never fire."""
+        """Reject inconsistent context-management settings."""
         if not 0 < self.context_trim_items < self.context_max_items:
             raise ValueError(
                 "context_trim_items must be positive and smaller than context_max_items"
+            )
+        if self.prune_completed_reasoning and self.reasoning_context != "current_turn":
+            raise ValueError(
+                "prune_completed_reasoning requires reasoning_context='current_turn'"
             )
         return self
 

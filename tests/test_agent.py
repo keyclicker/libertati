@@ -1,5 +1,6 @@
 """Tests for the agent's context-window trimming logic."""
 
+from types import SimpleNamespace
 from typing import Any, cast
 
 from libertati.agent import Agent
@@ -82,19 +83,73 @@ def test_trim_dangling_does_not_mutate_input() -> None:
     assert items == [EVENT, CALL]
 
 
+def test_finish_turn_prunes_only_new_ephemeral_outputs() -> None:
+    """Settling removes new reasoning/messages but keeps durable items."""
+    old_message = dict(MESSAGE)
+    agent = Agent.__new__(Agent)
+    agent.prune_completed_reasoning = True
+    agent._context = [EVENT, old_message, REASONING, CALL, CALL_OUTPUT, MESSAGE]
+
+    agent._finish_turn(2)
+
+    assert agent._context == [EVENT, old_message, CALL, CALL_OUTPUT]
+
+
+def test_finish_turn_can_retain_complete_outputs() -> None:
+    """Disabling pruning preserves reasoning and assistant output."""
+    agent = Agent.__new__(Agent)
+    agent.prune_completed_reasoning = False
+    agent._context = [EVENT, REASONING, MESSAGE]
+
+    agent._finish_turn(1)
+
+    assert agent._context == [EVENT, REASONING, MESSAGE]
+
+
 class FakeContextDB:
     """Persists nothing; satisfies _remember's write-through call."""
 
+    def __init__(self) -> None:
+        """Collect context and usage writes."""
+        self.items: list[dict[str, Any]] = []
+        self.usage: list[dict[str, Any]] = []
+        self.turns: list[dict[str, Any]] = []
+
     async def append_context(self, item: dict[str, Any]) -> None:
-        """Discard the item."""
+        """Collect one full-history item."""
+        self.items.append(item)
+
+    async def append_api_usage(self, **usage: Any) -> None:
+        """Collect one usage record."""
+        self.usage.append(usage)
+
+    async def latest_context_id(self) -> int:
+        """Use collected history length as a stable fake id."""
+        return len(self.items)
+
+    async def start_agent_turn(self, start_context_id: int) -> int:
+        """Collect a running turn and return its fake id."""
+        self.turns.append({"start_context_id": start_context_id, "status": "running"})
+        return len(self.turns)
+
+    async def finish_agent_turn(
+        self,
+        turn_id: int,
+        end_context_id: int,
+        status: str,
+    ) -> None:
+        """Close one collected fake turn."""
+        self.turns[turn_id - 1].update(
+            end_context_id=end_context_id,
+            status=status,
+        )
 
 
 async def test_remember_trims_in_chunks() -> None:
     """Overflow cuts the window back to TRIM_CONTEXT_ITEMS in one go.
 
-    Chunked trimming keeps the context prefix stable between trims so
-    prompt caching stays effective; one-by-one trimming would shift the
-    prefix on every append.
+    Chunked trimming keeps the context prefix stable between trims;
+    one-by-one trimming would shift the prefix on every append.
     """
     agent = Agent.__new__(Agent)
     agent.db = cast(Database, FakeContextDB())
@@ -107,3 +162,95 @@ async def test_remember_trims_in_chunks() -> None:
     await agent._remember(dict(EVENT))
     assert len(agent._context) == TRIM_CONTEXT_ITEMS + 1
     assert agent._context[0] is head
+
+
+class FakeOutputItem:
+    """Minimal Responses API output item used by the turn test."""
+
+    def __init__(self, item: dict[str, Any]) -> None:
+        """Expose its type and serialized payload."""
+        self.type = item["type"]
+        self.item = item
+
+    def model_dump(self, **_: Any) -> dict[str, Any]:
+        """Return the canned API payload."""
+        return dict(self.item)
+
+
+async def test_turn_persists_then_prunes_ephemeral_outputs() -> None:
+    """Completed output remains in SQLite but leaves the live window."""
+    response = SimpleNamespace(
+        id="resp_1",
+        model="gpt-test",
+        output=[FakeOutputItem(REASONING), FakeOutputItem(MESSAGE)],
+        output_text="",
+        usage=None,
+    )
+    calls: list[dict[str, Any]] = []
+
+    async def create(**kwargs: Any) -> Any:
+        calls.append(kwargs)
+        return response
+
+    db = FakeContextDB()
+    agent = Agent.__new__(Agent)
+    agent.client = cast(Any, SimpleNamespace(responses=SimpleNamespace(create=create)))
+    agent.model = "gpt-test"
+    agent.mind = cast(Any, SimpleNamespace(soul=lambda: "soul"))
+    agent.base_prompt = "base"
+    agent.max_rounds = 1
+    agent.max_context_items = MAX_CONTEXT_ITEMS
+    agent.trim_context_items = TRIM_CONTEXT_ITEMS
+    agent._context = [EVENT]
+    agent._api_tools = []
+    agent._reasoning = {"effort": "low", "context": "current_turn"}
+    agent.prune_completed_reasoning = True
+    agent.db = cast(Database, db)
+
+    await agent._turn()
+
+    assert calls[0]["reasoning"]["context"] == "current_turn"
+    assert db.items == [REASONING, MESSAGE]
+    assert agent._context == [EVENT]
+    assert db.turns == [
+        {"start_context_id": 0, "end_context_id": 2, "status": "completed"}
+    ]
+
+
+async def test_record_usage_maps_all_authoritative_counts() -> None:
+    """Response usage fields map into persistent records unchanged."""
+    db = FakeContextDB()
+    agent = Agent.__new__(Agent)
+    agent.db = cast(Database, db)
+    agent.model = "fallback-model"
+    response = SimpleNamespace(
+        id="resp_1",
+        model="actual-model",
+        usage=SimpleNamespace(
+            input_tokens=100,
+            input_tokens_details=SimpleNamespace(
+                cached_tokens=80,
+                cache_write_tokens=20,
+            ),
+            output_tokens=30,
+            output_tokens_details=SimpleNamespace(reasoning_tokens=25),
+            total_tokens=130,
+        ),
+    )
+
+    await agent._record_usage(response, turn_id=7, input_context_id=42)
+
+    assert db.usage == [
+        {
+            "response_id": "resp_1",
+            "turn_id": 7,
+            "input_context_id": 42,
+            "model": "actual-model",
+            "input_tokens": 100,
+            "cached_tokens": 80,
+            "cache_write_tokens": 20,
+            "output_tokens": 30,
+            "reasoning_tokens": 25,
+            "total_tokens": 130,
+        }
+    ]

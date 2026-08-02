@@ -18,8 +18,19 @@ model = "gpt-5.6-luna"
 # Allowed (model-dependent): none, minimal, low, medium, high, xhigh, max.
 reasoning_effort = "low"
 
+# Reuse hidden reasoning only inside the current event/tool turn. Set to
+# "all_turns" for cross-turn reasoning or "auto" for the model default.
+# Set to "omit" for providers that do not support reasoning.context.
+reasoning_context = "current_turn"
+
+# After a turn settles, remove its reasoning and final-output envelopes
+# from the live model window while retaining them in SQLite. Requires
+# reasoning_context = "current_turn". This shrinks serialized input but
+# can reduce prompt-cache reuse for the completed-turn suffix.
+prune_completed_reasoning = false
+
 # Model for the one-shot recall extraction (comment out for main model).
-# recall_model = "gpt-5-mini"
+recall_model = "gpt-5.6-luna"
 
 # Built-in web search (server-side; needs a real OpenAI endpoint).
 web_search = true
@@ -27,7 +38,7 @@ web_search = true
 # Roleplay hardening: never break the Soul persona, never admit to
 # being a bot/assistant, never discuss internals, no free work on
 # command.
-# roleplay = true
+roleplay = true
 
 # Directory holding the mind files SOUL.md / MEMORY.md / DIARY.md.
 # memory_dir = "data/memory"
@@ -35,15 +46,16 @@ web_search = true
 # Chat approval mode: when true, only chats marked true in chats_path
 # reach the agent; new chats are appended there as false for review
 # (edits apply live, no restart).
-# chat_approval = true
-# chats_path = "data/chats.toml"
+chat_approval = true
+chats_path = "data/chats.toml"
 
 # Max model/tool rounds per agent turn (one turn per event batch).
 # max_rounds = 8
 
 # Context window: cut back to context_trim_items once it grows past
 # context_max_items. Chunked trims keep the prompt prefix byte-stable,
-# so OpenAI prompt caching keeps hitting between overflows.
+# avoiding a prefix rewrite on every append. Actual cache hits depend on
+# model-specific cache keys and breakpoints.
 # context_max_items = 300
 # context_trim_items = 200
 
