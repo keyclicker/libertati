@@ -207,6 +207,14 @@ class Database:
         )
         await self.conn.commit()
 
+    async def cancel_wakeup(self, wakeup_id: int) -> bool:
+        """Mark a pending wakeup as done; return whether one was cancelled."""
+        cursor = await self.conn.execute(
+            "UPDATE wakeups SET done = 1 WHERE id = ? AND done = 0", (wakeup_id,)
+        )
+        await self.conn.commit()
+        return cursor.rowcount > 0
+
     async def unanswered_chats(self) -> list[dict]:
         """Chats whose latest message is incoming (i.e. awaiting the agent).
 
@@ -227,22 +235,84 @@ class Database:
         async with self.conn.execute(query) as cursor:
             return [dict(row) for row in await cursor.fetchall()]
 
-    async def recent_messages(self, chat_id: int, limit: int) -> list[dict]:
+    #: Message columns returned to the LLM as chat context.
+    _MESSAGE_ROW = """
+        SELECT m.message_id, m.date, m.outgoing, u.username, u.first_name,
+               m.text, m.caption, m.content_type
+        FROM messages m LEFT JOIN users u ON u.id = m.from_user_id
+    """
+
+    async def recent_messages(
+        self, chat_id: int, limit: int, before_message_id: int | None = None
+    ) -> list[dict]:
         """Return the latest ``limit`` messages of a chat, oldest first.
 
-        Each row is a small dict (date, sender, text/caption, content type,
-        outgoing flag) suitable for feeding to the LLM as context.
+        Each row is a small dict (id, date, sender, text/caption, content
+        type, outgoing flag) suitable for feeding to the LLM as context.
+        ``before_message_id`` pages into the past: only messages older
+        than it are returned.
         """
-        query = """
-            SELECT m.date, m.outgoing, u.username, u.first_name, m.text,
-                   m.caption, m.content_type
-            FROM messages m LEFT JOIN users u ON u.id = m.from_user_id
-            WHERE m.chat_id = ?
+        query = (
+            self._MESSAGE_ROW
+            + """
+            WHERE m.chat_id = ? AND (? IS NULL OR m.message_id < ?)
             ORDER BY m.date DESC LIMIT ?
         """
-        async with self.conn.execute(query, (chat_id, limit)) as cursor:
+        )
+        params = (chat_id, before_message_id, before_message_id, limit)
+        async with self.conn.execute(query, params) as cursor:
             rows = list(await cursor.fetchall())
         return [dict(row) for row in reversed(rows)]
+
+    async def search_messages(
+        self, chat_id: int, needle: str, limit: int
+    ) -> list[dict]:
+        """Return a chat's messages containing ``needle``, newest first.
+
+        Case-insensitive substring match over text and caption; rows have
+        the same shape as :meth:`recent_messages`.
+        """
+        escaped = needle.replace("\\", "\\\\").replace("%", "\\%").replace("_", "\\_")
+        query = (
+            self._MESSAGE_ROW
+            + r"""
+            WHERE m.chat_id = ? AND (m.text LIKE ? ESCAPE '\'
+                                     OR m.caption LIKE ? ESCAPE '\')
+            ORDER BY m.date DESC LIMIT ?
+        """
+        )
+        pattern = f"%{escaped}%"
+        params = (chat_id, pattern, pattern, limit)
+        async with self.conn.execute(query, params) as cursor:
+            return [dict(row) for row in await cursor.fetchall()]
+
+    async def list_chats(self) -> list[dict]:
+        """Return every known chat with a display name and activity stats.
+
+        For private chats (no title) the name falls back to the peer's
+        first name or username — a private chat's id equals the user's id.
+        """
+        query = """
+            SELECT c.id AS chat_id, c.type,
+                   COALESCE(c.title, u.first_name, c.username, u.username) AS name,
+                   COUNT(m.message_id) AS messages,
+                   MAX(m.date) AS last_date
+            FROM chats c
+            LEFT JOIN users u ON u.id = c.id
+            LEFT JOIN messages m ON m.chat_id = c.id
+            GROUP BY c.id
+            ORDER BY last_date DESC
+        """
+        async with self.conn.execute(query) as cursor:
+            return [dict(row) for row in await cursor.fetchall()]
+
+    async def delete_message(self, chat_id: int, message_id: int) -> None:
+        """Remove a message row (mirrors a deletion done on Telegram)."""
+        await self.conn.execute(
+            "DELETE FROM messages WHERE chat_id = ? AND message_id = ?",
+            (chat_id, message_id),
+        )
+        await self.conn.commit()
 
     async def save_message(self, message: Message, *, outgoing: bool = False) -> None:
         """Persist a message together with its chat and sender.

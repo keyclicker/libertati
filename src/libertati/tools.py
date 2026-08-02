@@ -15,12 +15,15 @@ import asyncio
 import json
 import logging
 import random
+from collections.abc import Awaitable, Callable
 from datetime import UTC, datetime
 from typing import Any
 from zoneinfo import ZoneInfo
 
 from aiogram import Bot
-from aiogram.types import ReplyParameters
+from aiogram.enums import ParseMode
+from aiogram.exceptions import TelegramBadRequest
+from aiogram.types import Message, ReactionTypeEmoji, ReplyParameters
 from aiogram.utils.chat_action import ChatActionSender
 from openai import AsyncOpenAI
 from openai.types.responses import ToolParam
@@ -64,7 +67,10 @@ SUMMARY_PROMPT = (
     "specifics can be fetched later with targeted recall."
 )
 
-TOOLS: list[ToolParam] = [
+# ==========================================================
+#                        Messaging
+# ==========================================================
+MESSAGING_TOOLS: list[ToolParam] = [
     {
         "type": "function",
         "name": "send_message",
@@ -81,7 +87,12 @@ TOOLS: list[ToolParam] = [
                 },
                 "text": {
                     "type": "string",
-                    "description": "Message text to send.",
+                    "description": (
+                        "Message text. Telegram markdown only: *bold*, "
+                        "_italic_, `code`, ```blocks```. Headers, tables "
+                        "and list markup don't render — plain text and "
+                        "bare URLs instead."
+                    ),
                 },
                 "reply_to_message_id": {
                     "type": ["integer", "null"],
@@ -101,6 +112,96 @@ TOOLS: list[ToolParam] = [
         },
         "strict": True,
     },
+    {
+        "type": "function",
+        "name": "react",
+        "description": (
+            "Put an emoji reaction on a message — the lightest way to "
+            "acknowledge something without texting back."
+        ),
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "chat_id": {
+                    "type": "integer",
+                    "description": "Chat the message is in.",
+                },
+                "message_id": {
+                    "type": "integer",
+                    "description": "Message to react to.",
+                },
+                "emoji": {
+                    "type": ["string", "null"],
+                    "description": (
+                        "One emoji from Telegram's reaction set, e.g. "
+                        "👍 ❤ 🔥 🎉 😁 😢 🤔 👏 💯 🙏; null removes "
+                        "your reaction."
+                    ),
+                },
+            },
+            "required": ["chat_id", "message_id", "emoji"],
+            "additionalProperties": False,
+        },
+        "strict": True,
+    },
+    {
+        "type": "function",
+        "name": "edit_message",
+        "description": (
+            "Rewrite the text of a message you sent — fix a typo, correct "
+            "a fact. Works only on your own recent messages."
+        ),
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "chat_id": {
+                    "type": "integer",
+                    "description": "Chat the message is in.",
+                },
+                "message_id": {
+                    "type": "integer",
+                    "description": "Id of your message to edit.",
+                },
+                "text": {
+                    "type": "string",
+                    "description": "New message text (same markdown rules).",
+                },
+            },
+            "required": ["chat_id", "message_id", "text"],
+            "additionalProperties": False,
+        },
+        "strict": True,
+    },
+    {
+        "type": "function",
+        "name": "delete_message",
+        "description": (
+            "Delete a message you sent — retract something that shouldn't "
+            "stay. Works only on your own recent messages."
+        ),
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "chat_id": {
+                    "type": "integer",
+                    "description": "Chat the message is in.",
+                },
+                "message_id": {
+                    "type": "integer",
+                    "description": "Id of your message to delete.",
+                },
+            },
+            "required": ["chat_id", "message_id"],
+            "additionalProperties": False,
+        },
+        "strict": True,
+    },
+]
+
+# ==========================================================
+#                        Scheduling
+# ==========================================================
+SCHEDULING_TOOLS: list[ToolParam] = [
     {
         "type": "function",
         "name": "schedule_wakeup",
@@ -130,10 +231,68 @@ TOOLS: list[ToolParam] = [
     },
     {
         "type": "function",
+        "name": "list_wakeups",
+        "description": (
+            "List your pending wakeups: id, due time and note. Use to "
+            "check what you've already planned before scheduling more."
+        ),
+        "parameters": {
+            "type": "object",
+            "properties": {},
+            "required": [],
+            "additionalProperties": False,
+        },
+        "strict": True,
+    },
+    {
+        "type": "function",
+        "name": "cancel_wakeup",
+        "description": (
+            "Cancel a pending wakeup by id when the plan behind it is no "
+            "longer relevant."
+        ),
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "wakeup_id": {
+                    "type": "integer",
+                    "description": "Id of the wakeup to cancel (see list_wakeups).",
+                },
+            },
+            "required": ["wakeup_id"],
+            "additionalProperties": False,
+        },
+        "strict": True,
+    },
+]
+
+# ==========================================================
+#                     Chats & History
+# ==========================================================
+HISTORY_TOOLS: list[ToolParam] = [
+    {
+        "type": "function",
+        "name": "list_chats",
+        "description": (
+            "List every chat you know: id, type, name, message count and "
+            "time of the last message. Use to see who you can talk to, "
+            "e.g. before reaching out to someone."
+        ),
+        "parameters": {
+            "type": "object",
+            "properties": {},
+            "required": [],
+            "additionalProperties": False,
+        },
+        "strict": True,
+    },
+    {
+        "type": "function",
         "name": "get_recent_messages",
         "description": (
-            "Fetch the most recent messages stored for a chat, newest "
-            "last. Use to recall context beyond what you remember."
+            "Fetch messages stored for a chat, newest last. Use to recall "
+            "context beyond what you remember; page further into the past "
+            "with before_message_id."
         ),
         "parameters": {
             "type": "object",
@@ -146,12 +305,55 @@ TOOLS: list[ToolParam] = [
                     "type": ["integer", "null"],
                     "description": "How many messages to fetch (max 50); null = 20.",
                 },
+                "before_message_id": {
+                    "type": ["integer", "null"],
+                    "description": (
+                        "Only messages older than this id; null starts at "
+                        "the newest. To page back, pass the smallest "
+                        "message_id of the previous batch."
+                    ),
+                },
             },
-            "required": ["chat_id", "limit"],
+            "required": ["chat_id", "limit", "before_message_id"],
             "additionalProperties": False,
         },
         "strict": True,
     },
+    {
+        "type": "function",
+        "name": "search_messages",
+        "description": (
+            "Search one chat's whole history for messages containing a "
+            "text fragment (case-insensitive), newest first. Use to find "
+            "what was said long ago without paging through everything."
+        ),
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "chat_id": {
+                    "type": "integer",
+                    "description": "Chat id to search in.",
+                },
+                "query": {
+                    "type": "string",
+                    "description": "Text fragment to look for.",
+                },
+                "limit": {
+                    "type": ["integer", "null"],
+                    "description": "How many matches to return (max 50); null = 20.",
+                },
+            },
+            "required": ["chat_id", "query", "limit"],
+            "additionalProperties": False,
+        },
+        "strict": True,
+    },
+]
+
+# ==========================================================
+#                          Memory
+# ==========================================================
+MEMORY_TOOLS: list[ToolParam] = [
     {
         "type": "function",
         "name": "remember",
@@ -213,6 +415,14 @@ TOOLS: list[ToolParam] = [
     },
 ]
 
+#: All function tools, in the order the model sees them.
+TOOLS: list[ToolParam] = [
+    *MESSAGING_TOOLS,
+    *SCHEDULING_TOOLS,
+    *HISTORY_TOOLS,
+    *MEMORY_TOOLS,
+]
+
 
 def build_tools(web_search: bool) -> list[ToolParam]:
     """Return the tool list for the API, optionally with built-in web search.
@@ -251,9 +461,20 @@ class Toolbox:
         self.mind = mind
         self.typing_chars_per_second = typing_chars_per_second
         self._handlers = {
+            # messaging
             "send_message": self._send_message,
-            "get_recent_messages": self._get_recent_messages,
+            "react": self._react,
+            "edit_message": self._edit_message,
+            "delete_message": self._delete_message,
+            # scheduling
             "schedule_wakeup": self._schedule_wakeup,
+            "list_wakeups": self._list_wakeups,
+            "cancel_wakeup": self._cancel_wakeup,
+            # chats & history
+            "list_chats": self._list_chats,
+            "get_recent_messages": self._get_recent_messages,
+            "search_messages": self._search_messages,
+            # memory
             "remember": self._remember,
             "recall": self._recall,
             "summarize_memory": self._summarize_memory,
@@ -280,29 +501,88 @@ class Toolbox:
             log.exception("tool %s failed", name)
             return f"error: {exc}"
 
+    # ==========================================================
+    #                        Messaging
+    # ==========================================================
+
     async def _send_message(self, args: dict[str, Any]) -> str:
         """Send a message (optionally as a reply) and persist it as outgoing.
 
         Shows the Telegram "typing…" indicator for a length-proportional
-        moment first, so replies land at a human pace.
+        moment first, so replies land at a human pace. Text is sent as
+        Telegram markdown; when Telegram rejects the markup (model
+        output with stray ``*``/``_`` is easy to unbalance), the message
+        is resent as plain text rather than lost.
         """
         reply_to = args.get("reply_to_message_id")
         delay = typing_delay(args["text"], self.typing_chars_per_second)
         if delay > 0:
             async with ChatActionSender.typing(chat_id=args["chat_id"], bot=self.bot):
                 await asyncio.sleep(delay)
-        sent = await self.bot.send_message(
-            args["chat_id"],
-            args["text"],
-            reply_parameters=(
-                ReplyParameters(message_id=reply_to) if reply_to is not None else None
-            ),
+        reply_parameters = (
+            ReplyParameters(message_id=reply_to) if reply_to is not None else None
+        )
+        sent = await self._markdown_send(
+            lambda parse_mode: self.bot.send_message(
+                args["chat_id"],
+                args["text"],
+                parse_mode=parse_mode,
+                reply_parameters=reply_parameters,
+            )
         )
         await self.db.save_message(sent, outgoing=True)
         return (
             f"sent message {sent.message_id} to chat {sent.chat.id}"
             f" at {clock.format_now(self.tz)}"
         )
+
+    @staticmethod
+    async def _markdown_send(send: Callable[[str | None], Awaitable[Any]]) -> Any:
+        """Call ``send`` with markdown; resend plain when Telegram rejects it.
+
+        Model output with stray ``*``/``_`` is easy to unbalance; the
+        message then degrades to plain text rather than getting lost.
+        """
+        try:
+            return await send(ParseMode.MARKDOWN)
+        except TelegramBadRequest:
+            return await send(None)
+
+    async def _react(self, args: dict[str, Any]) -> str:
+        """Set or remove an emoji reaction on a message."""
+        emoji = args["emoji"]
+        reaction = [ReactionTypeEmoji(emoji=emoji)] if emoji else []
+        await self.bot.set_message_reaction(
+            args["chat_id"], args["message_id"], reaction=reaction
+        )
+        target = f"message {args['message_id']} in chat {args['chat_id']}"
+        if emoji:
+            return f"reacted {emoji} to {target}"
+        return f"reaction removed from {target}"
+
+    async def _edit_message(self, args: dict[str, Any]) -> str:
+        """Rewrite one of the bot's own messages and persist the new text."""
+        edited = await self._markdown_send(
+            lambda parse_mode: self.bot.edit_message_text(
+                text=args["text"],
+                chat_id=args["chat_id"],
+                message_id=args["message_id"],
+                parse_mode=parse_mode,
+            )
+        )
+        if isinstance(edited, Message):
+            await self.db.save_message(edited, outgoing=True)
+        return f"edited message {args['message_id']} in chat {args['chat_id']}"
+
+    async def _delete_message(self, args: dict[str, Any]) -> str:
+        """Delete one of the bot's own messages on Telegram and in the DB."""
+        await self.bot.delete_message(args["chat_id"], args["message_id"])
+        await self.db.delete_message(args["chat_id"], args["message_id"])
+        return f"deleted message {args['message_id']} in chat {args['chat_id']}"
+
+    # ==========================================================
+    #                        Scheduling
+    # ==========================================================
 
     async def _schedule_wakeup(self, args: dict[str, Any]) -> str:
         """Store a future wakeup for the agent itself."""
@@ -318,11 +598,59 @@ class Toolbox:
         wakeup_id = await self.db.add_wakeup(clock.utc_stamp(due), args["note"])
         return f"wakeup #{wakeup_id} scheduled for {clock.format_local(due, self.tz)}"
 
+    async def _list_wakeups(self, args: dict[str, Any]) -> str:
+        """Return pending wakeups (id, local due time, note) as JSON."""
+        rows = await self.db.pending_wakeups()
+        if not rows:
+            return "no pending wakeups"
+        wakeups = [
+            {
+                "id": row["id"],
+                "due": clock.format_local(
+                    clock.parse_utc_stamp(row["due_at"]), self.tz
+                ),
+                "note": row["note"],
+            }
+            for row in rows
+        ]
+        return json.dumps(wakeups, ensure_ascii=False)
+
+    async def _cancel_wakeup(self, args: dict[str, Any]) -> str:
+        """Cancel one pending wakeup by id."""
+        if await self.db.cancel_wakeup(args["wakeup_id"]):
+            return f"wakeup #{args['wakeup_id']} cancelled"
+        return f"error: no pending wakeup #{args['wakeup_id']}"
+
+    # ==========================================================
+    #                     Chats & History
+    # ==========================================================
+
+    async def _list_chats(self, args: dict[str, Any]) -> str:
+        """Return all known chats with names and activity stats as JSON."""
+        chats = await self.db.list_chats()
+        if not chats:
+            return "no chats yet"
+        return json.dumps(chats, ensure_ascii=False)
+
     async def _get_recent_messages(self, args: dict[str, Any]) -> str:
-        """Return recent messages of the given chat as JSON."""
+        """Return a page of a chat's messages as JSON, oldest first."""
         limit = max(1, min(args.get("limit") or 20, 50))
-        rows = await self.db.recent_messages(args["chat_id"], limit)
+        rows = await self.db.recent_messages(
+            args["chat_id"], limit, args.get("before_message_id")
+        )
         return json.dumps(rows, ensure_ascii=False)
+
+    async def _search_messages(self, args: dict[str, Any]) -> str:
+        """Return a chat's messages matching a substring as JSON."""
+        limit = max(1, min(args.get("limit") or 20, 50))
+        rows = await self.db.search_messages(args["chat_id"], args["query"], limit)
+        if not rows:
+            return "no matches"
+        return json.dumps(rows, ensure_ascii=False)
+
+    # ==========================================================
+    #                          Memory
+    # ==========================================================
 
     async def _remember(self, args: dict[str, Any]) -> str:
         """Append one stamped fact to the long-term memory file."""

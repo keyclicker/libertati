@@ -55,6 +55,45 @@ async def test_resave_updates_in_place(db: Database) -> None:
     assert [row["text"] for row in rows] == ["fixed"]
 
 
+async def test_delete_message(db: Database) -> None:
+    """Deleting removes exactly the one row."""
+    await db.save_message(make_message(1, "keep", date=STAMP))
+    await db.save_message(make_message(2, "drop", date=STAMP + 60))
+    await db.delete_message(100, 2)
+    rows = await db.recent_messages(100, 10)
+    assert [row["text"] for row in rows] == ["keep"]
+
+
+async def test_recent_messages_pagination(db: Database) -> None:
+    """before_message_id pages into the past, excluding the cursor itself."""
+    for i in range(1, 6):
+        await db.save_message(make_message(i, f"msg {i}", date=STAMP + i))
+    page = await db.recent_messages(100, 2, before_message_id=4)
+    assert [row["message_id"] for row in page] == [2, 3]
+
+
+async def test_search_messages(db: Database) -> None:
+    """Substring search is case-insensitive, newest first, wildcards literal."""
+    await db.save_message(make_message(1, "my Cat is grumpy", date=STAMP))
+    await db.save_message(make_message(2, "no pets here", date=STAMP + 60))
+    await db.save_message(make_message(3, "cat again", date=STAMP + 120))
+    rows = await db.search_messages(100, "cat", 10)
+    assert [row["message_id"] for row in rows] == [3, 1]
+    assert await db.search_messages(100, "100%", 10) == []
+
+
+async def test_list_chats(db: Database) -> None:
+    """Chats list with a display name (peer's name for private chats)."""
+    peer = {"id": 100, "is_bot": False, "first_name": "Alice"}
+    await db.save_message(make_message(1, "hi", date=STAMP, **{"from": peer}))
+    (chat,) = await db.list_chats()
+    assert chat["chat_id"] == 100
+    assert chat["type"] == "private"
+    assert chat["name"] == "Alice"
+    assert chat["messages"] == 1
+    assert chat["last_date"] is not None
+
+
 async def test_unanswered_chats(db: Database) -> None:
     """A chat is unanswered until the latest message is outgoing."""
     await db.save_message(make_message(1, "hi", date=STAMP))
@@ -74,6 +113,15 @@ async def test_wakeup_lifecycle(db: Database) -> None:
     await db.complete_wakeup(wakeup_id)
     assert await db.due_wakeups("2026-08-02 10:00:00") == []
     assert await db.pending_wakeups() == []
+
+
+async def test_cancel_wakeup(db: Database) -> None:
+    """Cancelling removes a pending wakeup; done/unknown ids report False."""
+    wakeup_id = await db.add_wakeup("2026-08-02 10:00:00", "ping")
+    assert await db.cancel_wakeup(wakeup_id) is True
+    assert await db.pending_wakeups() == []
+    assert await db.cancel_wakeup(wakeup_id) is False
+    assert await db.cancel_wakeup(999) is False
 
 
 async def test_context_roundtrip(db: Database) -> None:

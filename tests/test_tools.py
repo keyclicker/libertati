@@ -8,6 +8,8 @@ from zoneinfo import ZoneInfo
 
 import pytest
 from aiogram import Bot
+from aiogram.enums import ParseMode
+from aiogram.exceptions import TelegramBadRequest
 from openai import AsyncOpenAI
 
 from libertati.db import Database
@@ -31,18 +33,50 @@ class FakeDB:
 
     def __init__(self) -> None:
         """Start with empty call records."""
-        self.recent_calls: list[tuple[int, int]] = []
+        self.recent_calls: list[tuple[int, int, int | None]] = []
+        self.search_calls: list[tuple[int, str, int]] = []
         self.wakeups: list[tuple[str, str]] = []
+        self.pending: list[dict] = []
+        self.chats: list[dict] = []
+        self.deleted: list[tuple[int, int]] = []
 
-    async def recent_messages(self, chat_id: int, limit: int) -> list[dict]:
+    async def recent_messages(
+        self, chat_id: int, limit: int, before_message_id: int | None = None
+    ) -> list[dict]:
         """Record the query and return no rows."""
-        self.recent_calls.append((chat_id, limit))
+        self.recent_calls.append((chat_id, limit, before_message_id))
         return []
+
+    async def search_messages(
+        self, chat_id: int, needle: str, limit: int
+    ) -> list[dict]:
+        """Record the query and return no rows."""
+        self.search_calls.append((chat_id, needle, limit))
+        return []
+
+    async def list_chats(self) -> list[dict]:
+        """Return the canned chat list."""
+        return self.chats
+
+    async def save_message(self, message: Any, outgoing: bool = False) -> None:
+        """Accept saved messages silently."""
+
+    async def delete_message(self, chat_id: int, message_id: int) -> None:
+        """Record the deletion."""
+        self.deleted.append((chat_id, message_id))
 
     async def add_wakeup(self, due_at: str, note: str) -> int:
         """Record the wakeup and return a fixed id."""
         self.wakeups.append((due_at, note))
         return 7
+
+    async def pending_wakeups(self) -> list[dict]:
+        """Return the canned pending-wakeup rows."""
+        return self.pending
+
+    async def cancel_wakeup(self, wakeup_id: int) -> bool:
+        """Pretend only wakeup #7 exists."""
+        return wakeup_id == 7
 
 
 class ExplodingBot:
@@ -59,6 +93,60 @@ class ExplodingBot:
     async def send_message(self, *args: Any, **kwargs: Any) -> Any:
         """Raise unconditionally."""
         raise RuntimeError("boom")
+
+
+class MarkdownRejectingBot:
+    """A bot that rejects markdown parse mode but accepts plain text."""
+
+    id = 1
+
+    def __init__(self) -> None:
+        """Start with no sends recorded."""
+        self.parse_modes: list[Any] = []
+
+    async def send_chat_action(self, *args: Any, **kwargs: Any) -> bool:
+        """Accept typing indicators silently."""
+        return True
+
+    async def send_message(
+        self, chat_id: int, text: str, *, parse_mode: Any = None, **kwargs: Any
+    ) -> Any:
+        """Reject any parse mode as Telegram does for unbalanced markup."""
+        self.parse_modes.append(parse_mode)
+        if parse_mode is not None:
+            raise TelegramBadRequest(
+                method=cast(Any, None), message="can't parse entities"
+            )
+        return SimpleNamespace(message_id=5, chat=SimpleNamespace(id=chat_id))
+
+
+class RecordingBot:
+    """A bot that records message actions and succeeds."""
+
+    id = 1
+
+    def __init__(self) -> None:
+        """Start with no calls recorded."""
+        self.reactions: list[tuple[int, int, list]] = []
+        self.edits: list[dict[str, Any]] = []
+        self.deletes: list[tuple[int, int]] = []
+
+    async def set_message_reaction(
+        self, chat_id: int, message_id: int, reaction: list | None = None
+    ) -> bool:
+        """Record the reaction change."""
+        self.reactions.append((chat_id, message_id, reaction or []))
+        return True
+
+    async def edit_message_text(self, **kwargs: Any) -> Any:
+        """Record the edit; return a non-Message like inline edits do."""
+        self.edits.append(kwargs)
+        return True
+
+    async def delete_message(self, chat_id: int, message_id: int) -> bool:
+        """Record the deletion."""
+        self.deletes.append((chat_id, message_id))
+        return True
 
 
 class FakeClient:
@@ -122,6 +210,54 @@ async def test_handler_exception_is_wrapped(
     assert result == "error: boom"
 
 
+async def test_send_message_falls_back_to_plain_text(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Markdown rejected by Telegram is resent as plain text, not lost."""
+    monkeypatch.setattr("libertati.tools.typing_delay", lambda text, cps: 0.0)
+    bot = MarkdownRejectingBot()
+    args = json.dumps({"chat_id": 1, "text": "a_b", "reply_to_message_id": None})
+    result = await make_toolbox(bot=bot).run("send_message", args)
+    assert result.startswith("sent message 5 to chat 1")
+    assert bot.parse_modes == [ParseMode.MARKDOWN, None]
+
+
+async def test_react_sets_and_removes() -> None:
+    """An emoji sets a reaction; null clears it."""
+    bot = RecordingBot()
+    toolbox = make_toolbox(bot=bot)
+    args = {"chat_id": 1, "message_id": 2, "emoji": "👍"}
+    result = await toolbox.run("react", json.dumps(args))
+    assert result == "reacted 👍 to message 2 in chat 1"
+    result = await toolbox.run("react", json.dumps({**args, "emoji": None}))
+    assert result == "reaction removed from message 2 in chat 1"
+    (set_call, clear_call) = bot.reactions
+    assert set_call[2][0].emoji == "👍"
+    assert clear_call[2] == []
+
+
+async def test_edit_message() -> None:
+    """Edits go out with markdown and are confirmed."""
+    bot = RecordingBot()
+    args = {"chat_id": 1, "message_id": 2, "text": "fixed"}
+    result = await make_toolbox(bot=bot).run("edit_message", json.dumps(args))
+    assert result == "edited message 2 in chat 1"
+    (edit,) = bot.edits
+    assert edit["text"] == "fixed"
+    assert edit["parse_mode"] == ParseMode.MARKDOWN
+
+
+async def test_delete_message() -> None:
+    """Deletion hits Telegram and removes the stored row."""
+    bot = RecordingBot()
+    db = FakeDB()
+    args = {"chat_id": 1, "message_id": 2}
+    result = await make_toolbox(db=db, bot=bot).run("delete_message", json.dumps(args))
+    assert result == "deleted message 2 in chat 1"
+    assert bot.deletes == [(1, 2)]
+    assert db.deleted == [(1, 2)]
+
+
 def test_typing_delay_bounds() -> None:
     """Typing time grows with length within the min/max bounds."""
     assert typing_delay("hi", 15) >= TYPING_MIN_SECONDS * 0.8
@@ -157,15 +293,61 @@ async def test_schedule_wakeup_stores_future() -> None:
     assert db.wakeups == [("2999-01-01 12:00:00", "ping")]
 
 
+async def test_list_wakeups() -> None:
+    """Pending wakeups come back with local due times; empty says so."""
+    db = FakeDB()
+    toolbox = make_toolbox(db=db)
+    assert await toolbox.run("list_wakeups", "{}") == "no pending wakeups"
+    db.pending = [{"id": 7, "due_at": "2026-08-02 10:00:00", "note": "ping"}]
+    result = await toolbox.run("list_wakeups", "{}")
+    assert json.loads(result) == [
+        {"id": 7, "due": "Sun 2026-08-02 10:00", "note": "ping"}
+    ]
+
+
+async def test_cancel_wakeup() -> None:
+    """Cancelling confirms for a pending id and errors for unknown ones."""
+    toolbox = make_toolbox()
+    ok = await toolbox.run("cancel_wakeup", json.dumps({"wakeup_id": 7}))
+    assert ok == "wakeup #7 cancelled"
+    missing = await toolbox.run("cancel_wakeup", json.dumps({"wakeup_id": 8}))
+    assert missing == "error: no pending wakeup #8"
+
+
 async def test_get_recent_messages_clamps_limit() -> None:
     """The limit is clamped to [1, 50]; null falls back to 20."""
     db = FakeDB()
     toolbox = make_toolbox(db=db)
     for limit, expected in ((999, 50), (None, 20), (-5, 1)):
-        await toolbox.run(
-            "get_recent_messages", json.dumps({"chat_id": 1, "limit": limit})
-        )
-        assert db.recent_calls[-1] == (1, expected)
+        args = {"chat_id": 1, "limit": limit, "before_message_id": None}
+        await toolbox.run("get_recent_messages", json.dumps(args))
+        assert db.recent_calls[-1] == (1, expected, None)
+
+
+async def test_get_recent_messages_passes_cursor() -> None:
+    """The pagination cursor reaches the database query."""
+    db = FakeDB()
+    args = {"chat_id": 1, "limit": None, "before_message_id": 42}
+    await make_toolbox(db=db).run("get_recent_messages", json.dumps(args))
+    assert db.recent_calls == [(1, 20, 42)]
+
+
+async def test_search_messages_reports_no_matches() -> None:
+    """An empty result says so instead of returning bare JSON."""
+    db = FakeDB()
+    args = {"chat_id": 1, "query": "cat", "limit": None}
+    result = await make_toolbox(db=db).run("search_messages", json.dumps(args))
+    assert result == "no matches"
+    assert db.search_calls == [(1, "cat", 20)]
+
+
+async def test_list_chats() -> None:
+    """Chats come back as JSON; an empty list says so."""
+    db = FakeDB()
+    assert await make_toolbox(db=db).run("list_chats", "{}") == "no chats yet"
+    db.chats = [{"chat_id": 100, "name": "Alice"}]
+    result = await make_toolbox(db=db).run("list_chats", "{}")
+    assert json.loads(result) == [{"chat_id": 100, "name": "Alice"}]
 
 
 async def test_remember_appends_and_confirms(tmp_path: Path) -> None:
