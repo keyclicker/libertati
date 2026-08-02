@@ -21,13 +21,13 @@ from pathlib import Path
 from typing import Any, ClassVar
 
 import tiktoken
+from pydantic import ValidationError
 from rich.console import Console
 from rich.text import Text
 from textual.app import App, ComposeResult
 from textual.binding import Binding
 from textual.widgets import RichLog, Static
 
-from libertati.agent import MAX_CONTEXT_ITEMS
 from libertati.config import Settings
 
 #: Header style and label per item kind.
@@ -232,6 +232,7 @@ class ContextApp(App[None]):
         full: bool,
         last_id: int,
         page_size: int = 20,
+        window_items: int = 300,
     ) -> None:
         """Create a viewer over an open read-only database connection."""
         super().__init__()
@@ -245,9 +246,9 @@ class ContextApp(App[None]):
         self.paging_ready = False
         # Rolling token counts of the newest items — approximates what
         # the agent's in-memory window costs as input right now.
-        tail = fetch_before(conn, 2**63 - 1, MAX_CONTEXT_ITEMS)
+        tail = fetch_before(conn, 2**63 - 1, window_items)
         self.window_tokens: deque[int] = deque(
-            (token_count(row[2]) for row in tail), maxlen=MAX_CONTEXT_ITEMS
+            (token_count(row[2]) for row in tail), maxlen=window_items
         )
 
     def _window_total(self) -> int | None:
@@ -383,10 +384,14 @@ class ContextApp(App[None]):
 
 
 def run_live(
-    conn: sqlite3.Connection, full: bool, last_id: int, page_size: int
+    conn: sqlite3.Connection,
+    full: bool,
+    last_id: int,
+    page_size: int,
+    window_items: int,
 ) -> None:
     """Run the interactive full-screen context viewer."""
-    ContextApp(conn, full, last_id, page_size).run()
+    ContextApp(conn, full, last_id, page_size, window_items).run()
 
 
 def main() -> None:
@@ -421,7 +426,20 @@ def main() -> None:
     )
     args = parser.parse_args()
 
-    db_path = args.db or Settings().db_path
+    # Settings are optional when --db is given (e.g. inspecting a copied
+    # database on a machine without .env); fall back to field defaults.
+    try:
+        settings: Settings | None = Settings()
+    except ValidationError:
+        settings = None
+    window_items = (
+        settings.context_max_items
+        if settings
+        else Settings.model_fields["context_max_items"].default
+    )
+    db_path = args.db or (settings.db_path if settings else None)
+    if db_path is None:
+        parser.error("no --db given and settings could not be loaded")
     if not db_path.exists():
         parser.error(f"database not found: {db_path}")
     conn = sqlite3.connect(f"file:{db_path}?mode=ro", uri=True)
@@ -429,7 +447,7 @@ def main() -> None:
     start_id = max(0, row[0] - args.tail)
     try:
         if args.live:
-            run_live(conn, args.full, start_id, args.tail)
+            run_live(conn, args.full, start_id, args.tail, window_items)
         else:
             stream(conn, Console(), args, start_id)
     except KeyboardInterrupt:

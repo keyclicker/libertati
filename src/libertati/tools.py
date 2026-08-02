@@ -51,23 +51,21 @@ def typing_delay(text: str, chars_per_second: float) -> float:
 
 
 #: Instructions for the one-shot recall extraction call.
-RECALL_PROMPT = (
-    "You are the long-term memory of a person texting on Telegram. Below "
-    "are their notes — a curated '# Memory' section and fresh dated "
-    "'# Inbox' entries — then a query. Answer the query from the notes "
-    "only: quote or paraphrase the relevant entries (with dates when they "
-    "matter) and say plainly when the notes contain nothing relevant."
-)
+RECALL_PROMPT = """\
+You are the long-term memory of a person texting on Telegram. Below
+are their notes — a curated '# Memory' section and fresh dated
+'# Inbox' entries — then a query. Answer the query from the notes
+only: quote or paraphrase the relevant entries (with dates when they
+matter) and say plainly when the notes contain nothing relevant."""
 
 #: Instructions for the one-shot memory overview call.
-SUMMARY_PROMPT = (
-    "You are the long-term memory of a person texting on Telegram. Below "
-    "are their notes — a curated '# Memory' section and fresh dated "
-    "'# Inbox' entries. Give a short general overview of what is "
-    "remembered: the people and key facts, recurring themes, open plans "
-    "and promises, and the time span covered. A map, not the details — "
-    "specifics can be fetched later with targeted recall."
-)
+SUMMARY_PROMPT = """\
+You are the long-term memory of a person texting on Telegram. Below
+are their notes — a curated '# Memory' section and fresh dated
+'# Inbox' entries. Give a short general overview of what is
+remembered: the people and key facts, recurring themes, open plans
+and promises, and the time span covered. A map, not the details —
+specifics can be fetched later with targeted recall."""
 
 # ==========================================================
 #                        Messaging

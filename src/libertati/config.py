@@ -2,6 +2,7 @@
 
 from pathlib import Path
 
+from pydantic import model_validator
 from pydantic_settings import (
     BaseSettings,
     PydanticBaseSettingsSource,
@@ -36,6 +37,9 @@ class Settings(BaseSettings):
     reasoning_effort: str | None = None
     # Persona/system prompt override; None uses the built-in default.
     system_prompt: str | None = None
+    # Harden the persona: never break character, never admit to being a
+    # bot/assistant, never discuss internals, no free assistant labor.
+    roleplay: bool = False
     # Model for the one-shot recall extraction; None = main model.
     recall_model: str | None = None
     # Enable OpenAI's built-in web search tool (server-side; most
@@ -50,6 +54,13 @@ class Settings(BaseSettings):
     chat_approval: bool = False
     # Chat approval registry (user-editable TOML, re-read live).
     chats_path: Path = Path("data/chats.toml")
+    # Max model/tool rounds per agent turn (one turn per event batch).
+    max_rounds: int = 8
+    # Context window: cut back to context_trim_items once it grows past
+    # context_max_items. Trimming in chunks keeps the prompt prefix
+    # byte-stable between trims, so OpenAI prompt caching keeps hitting.
+    context_max_items: int = 300
+    context_trim_items: int = 200
     # Timezone the agent lives in (event timestamps, wakeup scheduling).
     timezone: str = "UTC"
     # Minutes between heartbeat status events (0 disables, ±20% jitter).
@@ -57,6 +68,15 @@ class Settings(BaseSettings):
     # Simulated typing speed for outgoing messages, chars/second
     # (0 disables the typing emulation).
     typing_chars_per_second: float = 15.0
+
+    @model_validator(mode="after")
+    def _validate_context_window(self) -> "Settings":
+        """Reject window sizes where trimming could never fire."""
+        if not 0 < self.context_trim_items < self.context_max_items:
+            raise ValueError(
+                "context_trim_items must be positive and smaller than context_max_items"
+            )
+        return self
 
     @classmethod
     def settings_customise_sources(

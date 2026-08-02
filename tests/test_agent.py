@@ -2,8 +2,12 @@
 
 from typing import Any, cast
 
-from libertati.agent import MAX_CONTEXT_ITEMS, TRIM_CONTEXT_ITEMS, Agent
+from libertati.agent import Agent
 from libertati.db import Database
+
+#: Window sizes used by the trim test (mirrors the settings defaults).
+MAX_CONTEXT_ITEMS = 300
+TRIM_CONTEXT_ITEMS = 200
 
 EVENT: dict[str, Any] = {"role": "user", "content": "[event] hi"}
 MESSAGE: dict[str, Any] = {
@@ -94,6 +98,8 @@ async def test_remember_trims_in_chunks() -> None:
     """
     agent = Agent.__new__(Agent)
     agent.db = cast(Database, FakeContextDB())
+    agent.max_context_items = MAX_CONTEXT_ITEMS
+    agent.trim_context_items = TRIM_CONTEXT_ITEMS
     agent._context = [EVENT] * MAX_CONTEXT_ITEMS
     await agent._remember(dict(EVENT))
     assert len(agent._context) == TRIM_CONTEXT_ITEMS
