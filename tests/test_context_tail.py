@@ -21,10 +21,7 @@ def make_context_db(rows: int = 30) -> sqlite3.Connection:
     )
     conn.executemany(
         "INSERT INTO context (item) VALUES (?)",
-        [
-            (json.dumps({"role": "user", "content": f"event {i}"}),)
-            for i in range(rows)
-        ],
+        [(json.dumps({"role": "user", "content": f"event {i}"}),) for i in range(rows)],
     )
     return conn
 

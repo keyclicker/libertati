@@ -109,8 +109,7 @@ def fetch_before(
     """Return context rows before ``first_id``, oldest first."""
     if limit is None:
         cursor = conn.execute(
-            "SELECT id, created_at, item FROM context "
-            "WHERE id < ? ORDER BY id",
+            "SELECT id, created_at, item FROM context WHERE id < ? ORDER BY id",
             (first_id,),
         )
         return cursor.fetchall()
@@ -136,9 +135,7 @@ def age_text(created_at: str) -> str:
     return f"{seconds // 3600}h {seconds % 3600 // 60}m ago"
 
 
-def build_status(
-    total: int, last_activity: str | None, following: bool = True
-) -> Text:
+def build_status(total: int, last_activity: str | None, following: bool = True) -> Text:
     """Build the status line shown below the full-screen context log."""
     status = Text()
     status.append(" libertati-ctx ", style="bold reverse")
@@ -216,9 +213,7 @@ class ContextApp(App[None]):
 
     def compose(self) -> ComposeResult:
         """Create the scrollable log and fixed status line."""
-        yield RichLog(
-            id="context", min_width=1, wrap=True, auto_scroll=False
-        )
+        yield RichLog(id="context", min_width=1, wrap=True, auto_scroll=False)
         yield Static(build_status(self.last_id, None), id="status")
 
     def on_mount(self) -> None:
@@ -230,9 +225,7 @@ class ContextApp(App[None]):
 
     def _enable_paging(self) -> None:
         """Finish initial bottom positioning before watching the top edge."""
-        self.query_one("#context", RichLog).scroll_end(
-            animate=False, immediate=True
-        )
+        self.query_one("#context", RichLog).scroll_end(animate=False, immediate=True)
         self.paging_ready = True
         self._update_status()
 
@@ -282,9 +275,7 @@ class ContextApp(App[None]):
         self.rows[:0] = older
         self._render_rows()
         added_height = log.max_scroll_y - old_max_y
-        log.scroll_to(
-            y=old_y + added_height, animate=False, immediate=True
-        )
+        log.scroll_to(y=old_y + added_height, animate=False, immediate=True)
         if len(older) < self.page_size:
             self.has_older = False
         self.call_after_refresh(self._update_status)
@@ -293,9 +284,7 @@ class ContextApp(App[None]):
         """Refresh activity age and follow state."""
         log = self.query_one("#context", RichLog)
         self.query_one("#status", Static).update(
-            build_status(
-                self.last_id, self.last_activity, log.is_vertical_scroll_end
-            )
+            build_status(self.last_id, self.last_activity, log.is_vertical_scroll_end)
         )
 
     def action_context_down(self) -> None:
