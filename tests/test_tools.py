@@ -15,8 +15,6 @@ from openai import AsyncOpenAI
 from libertati.db import Database
 from libertati.memory import Mind
 from libertati.tools import (
-    RECALL_PROMPT,
-    SUMMARY_PROMPT,
     TOOLS,
     TYPING_MAX_SECONDS,
     TYPING_MIN_SECONDS,
@@ -26,6 +24,8 @@ from libertati.tools import (
 )
 
 UTC_TZ = ZoneInfo("UTC")
+RECALL_PROMPT = "test recall prompt"
+SUMMARY_PROMPT = "test summary prompt"
 
 
 class FakeDB:
@@ -227,6 +227,8 @@ def make_toolbox(
         "recall-model",
         cast(Mind, mind),
         15.0,
+        RECALL_PROMPT,
+        SUMMARY_PROMPT,
     )
 
 

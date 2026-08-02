@@ -63,23 +63,6 @@ def typing_delay(text: str, chars_per_second: float) -> float:
     return min(seconds, TYPING_MAX_SECONDS) * random.uniform(0.8, 1.2)
 
 
-#: Instructions for the one-shot recall extraction call.
-RECALL_PROMPT = """\
-You are the long-term memory of a person texting on Telegram. Below
-are their notes — a curated '# Memory' section and fresh dated
-'# Inbox' entries — then a query. Answer the query from the notes
-only: quote or paraphrase the relevant entries (with dates when they
-matter) and say plainly when the notes contain nothing relevant."""
-
-#: Instructions for the one-shot memory overview call.
-SUMMARY_PROMPT = """\
-You are the long-term memory of a person texting on Telegram. Below
-are their notes — a curated '# Memory' section and fresh dated
-'# Inbox' entries. Give a short general overview of what is
-remembered: the people and key facts, recurring themes, open plans
-and promises, and the time span covered. A map, not the details —
-specifics can be fetched later with targeted recall."""
-
 # ==========================================================
 #                        Messaging
 # ==========================================================
@@ -577,6 +560,8 @@ class Toolbox:
         recall_model: str,
         mind: Mind,
         typing_chars_per_second: float,
+        recall_prompt: str,
+        summary_prompt: str,
     ) -> None:
         """Keep resource handles and build the name-to-handler dispatch."""
         self.db = db
@@ -586,6 +571,8 @@ class Toolbox:
         self.recall_model = recall_model
         self.mind = mind
         self.typing_chars_per_second = typing_chars_per_second
+        self.recall_prompt = recall_prompt
+        self.summary_prompt = summary_prompt
         self._handlers = {
             # messaging
             "send_message": self._send_message,
@@ -869,7 +856,7 @@ class Toolbox:
         if not notes:
             return "memory is empty"
         return await self._read_memory(
-            RECALL_PROMPT, f"{notes}\n\nQuery: {args['query']}"
+            self.recall_prompt, f"{notes}\n\nQuery: {args['query']}"
         )
 
     async def _summarize_memory(self, args: dict[str, Any]) -> str:
@@ -877,4 +864,4 @@ class Toolbox:
         notes = self.mind.notes()
         if not notes:
             return "memory is empty"
-        return await self._read_memory(SUMMARY_PROMPT, notes)
+        return await self._read_memory(self.summary_prompt, notes)

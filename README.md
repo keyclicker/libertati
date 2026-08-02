@@ -27,6 +27,8 @@ when to reply. Plain text output is private thinking and sends nothing.
   tool answers questions from it with a one-shot extraction call (it is
   never inlined into the agent's context). `DIARY.md` is reserved for
   the upcoming Dreaming loop.
+- **Prompts** (`prompts.toml`): user-editable agent, roleplay, web-search
+  and memory-helper instructions loaded at startup.
 
 ## Setup
 

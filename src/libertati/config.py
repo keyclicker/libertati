@@ -35,8 +35,8 @@ class Settings(BaseSettings):
     # For reasoning models: none/minimal/low/medium/high/xhigh/max
     # (model-dependent); None sends no preference.
     reasoning_effort: str | None = None
-    # Persona/system prompt override; None uses the built-in default.
-    system_prompt: str | None = None
+    # User-editable agent and memory prompts.
+    prompts_path: Path = Path("prompts.toml")
     # Harden the persona: never break character, never admit to being a
     # bot/assistant, never discuss internals, no free assistant labor.
     roleplay: bool = False

@@ -56,8 +56,5 @@ heartbeat_minutes = 10
 # Simulated typing speed for outgoing messages, chars/second (0 disables).
 # typing_chars_per_second = 15
 
-# Persona/system prompt override (multi-line TOML string). Leave unset
-# to use the built-in default from src/libertati/agent.py.
-# system_prompt = """
-# You are ...
-# """
+# User-editable agent and memory prompts.
+# prompts_path = "prompts.toml"
