@@ -44,9 +44,13 @@ TOOLS: list[ToolParam] = [
                 "reply_to_message_id": {
                     "type": ["integer", "null"],
                     "description": (
-                        "Message id to reply to (ids are shown in events), or "
-                        "null. Use in groups or when answering a specific "
-                        "message after others arrived."
+                        "Message id to quote-reply to, or null. Quote only "
+                        "when it clarifies what you're answering: the message "
+                        "is buried under newer ones, or a group conversation "
+                        "has several threads going. When you're answering the "
+                        "latest message — always in private chats, usually in "
+                        "groups with one active thread — pass null: quoting "
+                        "every message reads robotic."
                     ),
                 },
             },
