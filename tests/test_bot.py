@@ -1,13 +1,21 @@
-"""Tests for event formatting of incoming Telegram messages."""
+"""Tests for event formatting and routing of incoming Telegram messages."""
 
+from pathlib import Path
 from typing import Any
 from zoneinfo import ZoneInfo
 
-from aiogram.types import Message
+from aiogram.types import Message, User
 
-from libertati.bot import EVENT_TEXT_LIMIT, format_event
+from libertati.bot import EVENT_TEXT_LIMIT, format_event, is_addressed, on_message
+from libertati.chats import ChatRegistry
 
 UTC_TZ = ZoneInfo("UTC")
+
+#: The bot's own identity as seen by handlers.
+ME = User(id=999, is_bot=True, first_name="libertati", username="Libertati_bot")
+
+#: Registry with approval mode off — allows everything, touches no file.
+OPEN_REGISTRY = ChatRegistry(Path("unused-chats.toml"), enabled=False)
 
 #: 2026-08-02 12:00:00 UTC as a Telegram unix timestamp.
 STAMP = 1785672000
@@ -68,3 +76,78 @@ def test_format_event_caption_fallback() -> None:
     """Messages without text fall back to the caption."""
     message = make_message(text=None, caption="a photo caption")
     assert "a photo caption" in format_event(message, UTC_TZ)
+
+
+class FakeAgent:
+    """Records events pushed by the message handler."""
+
+    def __init__(self) -> None:
+        """Start with an empty event list."""
+        self.events: list[str] = []
+
+    async def push(self, event: str) -> None:
+        """Store the event."""
+        self.events.append(event)
+
+
+def make_group_message(**overrides: Any) -> Message:
+    """Build a minimal group-chat text message, with field overrides."""
+    return make_message(
+        chat={"id": -500, "type": "group", "title": "friends"}, **overrides
+    )
+
+
+def test_is_addressed_mention() -> None:
+    """A case-insensitive @username mention addresses the bot."""
+    assert is_addressed(make_group_message(text="hey @libertati_bot, hi"), ME)
+    assert not is_addressed(make_group_message(text="hey @someone_else"), ME)
+
+
+def test_is_addressed_caption_mention() -> None:
+    """Mentions in media captions count too."""
+    message = make_group_message(text=None, caption="look @libertati_bot")
+    assert is_addressed(message, ME)
+
+
+def test_is_addressed_reply_to_bot() -> None:
+    """Replying to one of the bot's messages addresses it."""
+    message = make_group_message(
+        reply_to_message={
+            "message_id": 41,
+            "date": STAMP,
+            "chat": {"id": -500, "type": "group", "title": "friends"},
+            "from": {"id": ME.id, "is_bot": True, "first_name": "libertati"},
+            "text": "earlier",
+        }
+    )
+    assert is_addressed(message, ME)
+
+
+async def test_on_message_private_always_pushed() -> None:
+    """Private messages always become events."""
+    agent = FakeAgent()
+    await on_message(make_message(), agent, UTC_TZ, ME, OPEN_REGISTRY)  # type: ignore[arg-type]
+    assert len(agent.events) == 1
+
+
+async def test_on_message_group_needs_address() -> None:
+    """Group messages are dropped unless the bot is addressed."""
+    agent = FakeAgent()
+    await on_message(make_group_message(), agent, UTC_TZ, ME, OPEN_REGISTRY)  # type: ignore[arg-type]
+    assert agent.events == []
+    mention = make_group_message(text="ping @libertati_bot")
+    await on_message(mention, agent, UTC_TZ, ME, OPEN_REGISTRY)  # type: ignore[arg-type]
+    assert len(agent.events) == 1
+
+
+async def test_on_message_approval_gate(tmp_path: Path) -> None:
+    """In approval mode a new chat is registered and its events dropped."""
+    registry = ChatRegistry(tmp_path / "chats.toml", enabled=True)
+    agent = FakeAgent()
+    await on_message(make_message(), agent, UTC_TZ, ME, registry)  # type: ignore[arg-type]
+    assert agent.events == []
+    assert "100 = false  # Alice (private)" in registry.path.read_text(encoding="utf-8")
+    text = registry.path.read_text(encoding="utf-8")
+    registry.path.write_text(text.replace("false", "true"), encoding="utf-8")
+    await on_message(make_message(), agent, UTC_TZ, ME, registry)  # type: ignore[arg-type]
+    assert len(agent.events) == 1

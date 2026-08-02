@@ -23,7 +23,7 @@ async def db(tmp_path: Path) -> AsyncIterator[Database]:
 
 
 def make_message(
-    message_id: int, text: str, date: int = STAMP, **overrides: Any
+    message_id: int, text: str | None, date: int = STAMP, **overrides: Any
 ) -> Message:
     """Build a minimal private-chat message for persistence tests."""
     data: dict[str, Any] = {
@@ -92,6 +92,47 @@ async def test_list_chats(db: Database) -> None:
     assert chat["name"] == "Alice"
     assert chat["messages"] == 1
     assert chat["last_date"] is not None
+
+
+async def test_chat_members(db: Database) -> None:
+    """Members are the distinct senders seen, most recently active first."""
+    bob = {"id": 8, "is_bot": False, "first_name": "Bob"}
+    await db.save_message(make_message(1, "hi", date=STAMP))
+    await db.save_message(make_message(2, "hey", date=STAMP + 60, **{"from": bob}))
+    await db.save_message(make_message(3, "again", date=STAMP + 120, **{"from": bob}))
+    members = await db.chat_members(100)
+    assert [(m["user_id"], m["messages"]) for m in members] == [(8, 2), (7, 1)]
+    assert await db.chat_members(999) == []
+
+
+def make_sticker_message(
+    message_id: int, file_id: str, unique_id: str, date: int
+) -> Message:
+    """Build a sticker message for the known-sticker tests."""
+    sticker = {
+        "file_id": file_id,
+        "file_unique_id": unique_id,
+        "type": "regular",
+        "width": 512,
+        "height": 512,
+        "is_animated": False,
+        "is_video": False,
+        "emoji": "😀",
+        "set_name": "pack",
+    }
+    return make_message(message_id, None, date=date, sticker=sticker)
+
+
+async def test_known_stickers(db: Database) -> None:
+    """Stickers dedupe on file_unique_id and list newest first."""
+    await db.save_message(make_sticker_message(1, "AAA", "u1", STAMP))
+    await db.save_message(make_sticker_message(2, "AAA2", "u1", STAMP + 60))
+    await db.save_message(make_sticker_message(3, "BBB", "u2", STAMP + 120))
+    await db.save_message(make_message(4, "not a sticker", date=STAMP + 180))
+    stickers = await db.known_stickers(10)
+    assert [row["file_id"] for row in stickers] == ["BBB", "AAA2"]
+    assert stickers[0]["emoji"] == "😀"
+    assert stickers[0]["set_name"] == "pack"
 
 
 async def test_unanswered_chats(db: Database) -> None:

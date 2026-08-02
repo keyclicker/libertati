@@ -15,10 +15,11 @@ from typing import Any
 from zoneinfo import ZoneInfo
 
 from aiogram import BaseMiddleware, Bot, Dispatcher, Router
-from aiogram.types import Message, TelegramObject
+from aiogram.types import Message, TelegramObject, User
 
 from libertati import clock
 from libertati.agent import Agent
+from libertati.chats import ChatRegistry
 from libertati.config import Settings
 from libertati.db import Database
 
@@ -79,9 +80,48 @@ def format_event(message: Message, tz: ZoneInfo) -> str:
     )
 
 
+def is_addressed(message: Message, me: User) -> bool:
+    """True when a message replies to the bot or @-mentions its username."""
+    reply = message.reply_to_message
+    if (
+        reply is not None
+        and reply.from_user is not None
+        and reply.from_user.id == me.id
+    ):
+        return True
+    if me.username:
+        body = (message.text or message.caption or "").lower()
+        return f"@{me.username.lower()}" in body
+    return False
+
+
+def chat_label(message: Message) -> str:
+    """Human-readable chat name for the approval registry comment."""
+    chat = message.chat
+    name = chat.title or chat.full_name or chat.username or "?"
+    return f"{name} ({chat.type})"
+
+
 @router.message()
-async def on_message(message: Message, agent: Agent, tz: ZoneInfo) -> None:
-    """Push any incoming message to the agent loop as an event."""
+async def on_message(
+    message: Message,
+    agent: Agent,
+    tz: ZoneInfo,
+    me: User,
+    registry: ChatRegistry,
+) -> None:
+    """Push an incoming message to the agent loop as an event.
+
+    Messages from unapproved chats are persisted but never become
+    events (in approval mode the chat lands in chats.toml for review).
+    Group messages become events only when the bot is mentioned or
+    replied to — the agent catches up on the rest via history tools on
+    heartbeats.
+    """
+    if not registry.register(message.chat.id, chat_label(message)):
+        return
+    if message.chat.type != "private" and not is_addressed(message, me):
+        return
     await agent.push(format_event(message, tz))
 
 
@@ -103,10 +143,16 @@ async def wakeup_loop(agent: Agent, db: Database, tz: ZoneInfo) -> None:
         await asyncio.sleep(WAKEUP_POLL_SECONDS)
 
 
-async def heartbeat_digest(db: Database, tz: ZoneInfo) -> str:
-    """Build the status text attached to a heartbeat event."""
+async def heartbeat_digest(db: Database, tz: ZoneInfo, registry: ChatRegistry) -> str:
+    """Build the status text attached to a heartbeat event.
+
+    Unapproved chats are left out — the agent shouldn't be nudged
+    towards chats it isn't allowed to see.
+    """
     parts = []
-    unanswered = await db.unanswered_chats()
+    unanswered = [
+        row for row in await db.unanswered_chats() if registry.check(row["chat_id"])
+    ]
     if unanswered:
         chats = []
         for row in unanswered:
@@ -131,14 +177,14 @@ async def heartbeat_digest(db: Database, tz: ZoneInfo) -> str:
 
 
 async def heartbeat_loop(
-    agent: Agent, db: Database, tz: ZoneInfo, minutes: int
+    agent: Agent, db: Database, tz: ZoneInfo, minutes: int, registry: ChatRegistry
 ) -> None:
     """Push periodic (jittered) heartbeat status events; 0 disables."""
     if minutes <= 0:
         return
     while True:
         await asyncio.sleep(minutes * 60 * random.uniform(0.8, 1.2))
-        digest = await heartbeat_digest(db, tz)
+        digest = await heartbeat_digest(db, tz, registry)
         await agent.push(f"[heartbeat {clock.format_now(tz)}] {digest}")
 
 
@@ -160,13 +206,16 @@ async def run() -> None:
     agent = Agent(settings, db, bot)
     await agent.load()
     tz = agent.tz
+    registry = ChatRegistry(settings.chats_path, settings.chat_approval)
     tasks = [
         asyncio.create_task(agent.run_forever()),
         asyncio.create_task(wakeup_loop(agent, db, tz)),
-        asyncio.create_task(heartbeat_loop(agent, db, tz, settings.heartbeat_minutes)),
+        asyncio.create_task(
+            heartbeat_loop(agent, db, tz, settings.heartbeat_minutes, registry)
+        ),
     ]
 
-    dispatcher = Dispatcher(agent=agent, tz=tz)
+    dispatcher = Dispatcher(agent=agent, tz=tz, me=await bot.me(), registry=registry)
     persist_middleware = PersistMiddleware(db)
     dispatcher.message.outer_middleware(persist_middleware)
     # Edits are persisted (updating the stored row) but deliberately not

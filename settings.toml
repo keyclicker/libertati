@@ -27,6 +27,12 @@ web_search = true
 # Directory holding the mind files SOUL.md / MEMORY.md / DIARY.md.
 # memory_dir = "data/memory"
 
+# Chat approval mode: when true, only chats marked true in chats_path
+# reach the agent; new chats are appended there as false for review
+# (edits apply live, no restart).
+# chat_approval = true
+# chats_path = "data/chats.toml"
+
 # Timezone the agent lives in (timestamps, wakeup scheduling).
 timezone = "Europe/Kyiv"
 

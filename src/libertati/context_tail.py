@@ -2,9 +2,11 @@
 
 ``libertati-ctx`` tails the ``context`` table like ``tail -f`` for the
 agent's brain: external events, hidden reasoning, tool calls/results and
-private monologue, each styled by kind. Default mode streams new items to
-stdout; ``--live`` opens a scrollable full-screen viewer. Requires the
-``rich`` and ``textual`` dev dependencies; run via
+private monologue, each styled by kind, with a rough per-item token
+count (o200k_base). Default mode streams new items to stdout; ``--live``
+opens a scrollable full-screen viewer whose status line adds the
+approximate token total of the agent's current window. Requires the
+``rich``, ``textual`` and ``tiktoken`` dev dependencies; run via
 ``uv run libertati-ctx``.
 """
 
@@ -12,16 +14,20 @@ import argparse
 import json
 import sqlite3
 import time
+from collections import deque
 from datetime import UTC, datetime
+from functools import lru_cache
 from pathlib import Path
 from typing import Any, ClassVar
 
+import tiktoken
 from rich.console import Console
 from rich.text import Text
 from textual.app import App, ComposeResult
 from textual.binding import Binding
 from textual.widgets import RichLog, Static
 
+from libertati.agent import MAX_CONTEXT_ITEMS
 from libertati.config import Settings
 
 #: Header style and label per item kind.
@@ -41,6 +47,22 @@ TRUNCATE_AT = 600
 POLL_SECONDS = 0.5
 
 Row = tuple[int, str, str]
+
+
+@lru_cache(maxsize=1)
+def _encoding() -> tiktoken.Encoding:
+    """Load the o200k_base encoding once (cached on disk after first use)."""
+    return tiktoken.get_encoding("o200k_base")
+
+
+def token_count(raw: str) -> int:
+    """Rough token count of a raw context item (o200k_base on its JSON).
+
+    An approximation of what the item costs as API input: JSON framing
+    is counted verbatim, and encrypted reasoning is counted as its
+    base64 text although it bills as the original hidden tokens.
+    """
+    return len(_encoding().encode(raw, disallowed_special=()))
 
 
 def classify(item: dict[str, Any]) -> str:
@@ -92,6 +114,7 @@ def build_block(row: Row, full: bool) -> Text:
     block = Text()
     block.append(f"#{row_id} {label} ", style=f"bold {color}")
     block.append(created_at, style="bright_black")
+    block.append(f" · {token_count(raw)} tok", style="bright_black")
     block.append("\n")
     block.append(body, style="default" if kind == "event" else color)
     return block
@@ -138,11 +161,18 @@ def age_text(created_at: str) -> str:
     return f"{seconds // 3600}h {seconds % 3600 // 60}m ago"
 
 
-def build_status(total: int, last_activity: str | None, following: bool = True) -> Text:
+def build_status(
+    total: int,
+    last_activity: str | None,
+    following: bool = True,
+    window_tokens: int | None = None,
+) -> Text:
     """Build the status line shown below the full-screen context log."""
     status = Text()
     status.append(" libertati-ctx ", style="bold reverse")
     status.append(f"  #{total}", style="bold")
+    if window_tokens is not None:
+        status.append(f"  ·  ~{window_tokens / 1000:.1f}k tok", style="magenta")
     if last_activity is not None:
         status.append(f"  ·  {age_text(last_activity)}", style="cyan")
     status.append(
@@ -213,11 +243,24 @@ class ContextApp(App[None]):
         self.rows: list[Row] = []
         self.has_older = True
         self.paging_ready = False
+        # Rolling token counts of the newest items — approximates what
+        # the agent's in-memory window costs as input right now.
+        tail = fetch_before(conn, 2**63 - 1, MAX_CONTEXT_ITEMS)
+        self.window_tokens: deque[int] = deque(
+            (token_count(row[2]) for row in tail), maxlen=MAX_CONTEXT_ITEMS
+        )
+
+    def _window_total(self) -> int | None:
+        """Sum the rolling window token counts (None while empty)."""
+        return sum(self.window_tokens) if self.window_tokens else None
 
     def compose(self) -> ComposeResult:
         """Create the scrollable log and fixed status line."""
         yield RichLog(id="context", min_width=1, wrap=True, auto_scroll=False)
-        yield Static(build_status(self.last_id, None), id="status")
+        yield Static(
+            build_status(self.last_id, None, window_tokens=self._window_total()),
+            id="status",
+        )
 
     def on_mount(self) -> None:
         """Load initial rows and start polling for new ones."""
@@ -243,6 +286,7 @@ class ContextApp(App[None]):
             log.write(block, scroll_end=following, animate=False)
         if new:
             self.rows.extend(new)
+            self.window_tokens.extend(token_count(row[2]) for row in new)
             self.last_id = new[-1][0]
             self.last_activity = new[-1][1]
         self._update_status()
@@ -287,7 +331,12 @@ class ContextApp(App[None]):
         """Refresh activity age and follow state."""
         log = self.query_one("#context", RichLog)
         self.query_one("#status", Static).update(
-            build_status(self.last_id, self.last_activity, log.is_vertical_scroll_end)
+            build_status(
+                self.last_id,
+                self.last_activity,
+                log.is_vertical_scroll_end,
+                self._window_total(),
+            )
         )
 
     def action_context_down(self) -> None:

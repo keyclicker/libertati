@@ -45,6 +45,11 @@ class Settings(BaseSettings):
     db_path: Path = Path("data/libertati.db")
     # Directory holding SOUL.md / MEMORY.md / DIARY.md.
     memory_dir: Path = Path("data/memory")
+    # Approval mode: when on, only chats marked true in chats_path reach
+    # the agent; new chats are appended there as false for review.
+    chat_approval: bool = False
+    # Chat approval registry (user-editable TOML, re-read live).
+    chats_path: Path = Path("data/chats.toml")
     # Timezone the agent lives in (event timestamps, wakeup scheduling).
     timezone: str = "UTC"
     # Minutes between heartbeat status events (0 disables, ±20% jitter).

@@ -38,6 +38,8 @@ class FakeDB:
         self.wakeups: list[tuple[str, str]] = []
         self.pending: list[dict] = []
         self.chats: list[dict] = []
+        self.members: list[dict] = []
+        self.stickers: list[dict] = []
         self.deleted: list[tuple[int, int]] = []
 
     async def recent_messages(
@@ -57,6 +59,14 @@ class FakeDB:
     async def list_chats(self) -> list[dict]:
         """Return the canned chat list."""
         return self.chats
+
+    async def chat_members(self, chat_id: int) -> list[dict]:
+        """Return the canned member list."""
+        return self.members
+
+    async def known_stickers(self, limit: int) -> list[dict]:
+        """Return the canned sticker list."""
+        return self.stickers
 
     async def save_message(self, message: Any, outgoing: bool = False) -> None:
         """Accept saved messages silently."""
@@ -130,6 +140,11 @@ class RecordingBot:
         self.reactions: list[tuple[int, int, list]] = []
         self.edits: list[dict[str, Any]] = []
         self.deletes: list[tuple[int, int]] = []
+        self.sent_stickers: list[tuple[int, str]] = []
+        self.forwards: list[tuple[int, int, int]] = []
+        self.chat_info: Any = None
+        self.member_count = 0
+        self.admins: list[Any] = []
 
     async def set_message_reaction(
         self, chat_id: int, message_id: int, reaction: list | None = None
@@ -147,6 +162,30 @@ class RecordingBot:
         """Record the deletion."""
         self.deletes.append((chat_id, message_id))
         return True
+
+    async def send_sticker(self, chat_id: int, file_id: str) -> Any:
+        """Record the sticker send and return a minimal sent message."""
+        self.sent_stickers.append((chat_id, file_id))
+        return SimpleNamespace(message_id=6, chat=SimpleNamespace(id=chat_id))
+
+    async def forward_message(
+        self, chat_id: int, from_chat_id: int, message_id: int
+    ) -> Any:
+        """Record the forward and return a minimal sent message."""
+        self.forwards.append((chat_id, from_chat_id, message_id))
+        return SimpleNamespace(message_id=9, chat=SimpleNamespace(id=chat_id))
+
+    async def get_chat(self, chat_id: int) -> Any:
+        """Return the canned chat profile."""
+        return self.chat_info
+
+    async def get_chat_member_count(self, chat_id: int) -> int:
+        """Return the canned member count."""
+        return self.member_count
+
+    async def get_chat_administrators(self, chat_id: int) -> list[Any]:
+        """Return the canned admin list."""
+        return self.admins
 
 
 class FakeClient:
@@ -256,6 +295,97 @@ async def test_delete_message() -> None:
     assert result == "deleted message 2 in chat 1"
     assert bot.deletes == [(1, 2)]
     assert db.deleted == [(1, 2)]
+
+
+async def test_send_sticker() -> None:
+    """Stickers go out by file_id and are confirmed with the message id."""
+    bot = RecordingBot()
+    args = {"chat_id": 1, "file_id": "AAA"}
+    result = await make_toolbox(bot=bot).run("send_sticker", json.dumps(args))
+    assert result == "sent sticker as message 6 to chat 1"
+    assert bot.sent_stickers == [(1, "AAA")]
+
+
+async def test_list_stickers() -> None:
+    """Known stickers come back as JSON; none seen yet says so."""
+    db = FakeDB()
+    toolbox = make_toolbox(db=db)
+    result = await toolbox.run("list_stickers", "{}")
+    assert result.startswith("no stickers seen yet")
+    db.stickers = [{"file_id": "AAA", "emoji": "😀", "set_name": "pack"}]
+    result = await toolbox.run("list_stickers", "{}")
+    assert json.loads(result) == db.stickers
+
+
+async def test_forward_message() -> None:
+    """Forwards reach the bot with the right chats and are confirmed."""
+    bot = RecordingBot()
+    args = {"to_chat_id": 2, "from_chat_id": 1, "message_id": 42}
+    result = await make_toolbox(bot=bot).run("forward_message", json.dumps(args))
+    assert result == "forwarded message 42 from chat 1 to chat 2 as message 9"
+    assert bot.forwards == [(2, 1, 42)]
+
+
+async def test_get_chat_info_private() -> None:
+    """Private chats return profile fields only, with nulls dropped."""
+    bot = RecordingBot()
+    bot.chat_info = SimpleNamespace(
+        id=100,
+        type="private",
+        title=None,
+        first_name="Alice",
+        last_name=None,
+        username="alice",
+        bio="just a cat person",
+        description=None,
+    )
+    result = await make_toolbox(bot=bot).run(
+        "get_chat_info", json.dumps({"chat_id": 100})
+    )
+    assert json.loads(result) == {
+        "chat_id": 100,
+        "type": "private",
+        "first_name": "Alice",
+        "username": "alice",
+        "bio": "just a cat person",
+    }
+
+
+async def test_get_chat_info_group_adds_members_and_admins() -> None:
+    """Group chats include the member count and admin names."""
+    bot = RecordingBot()
+    bot.chat_info = SimpleNamespace(
+        id=-500,
+        type="group",
+        title="friends",
+        first_name=None,
+        last_name=None,
+        username=None,
+        bio=None,
+        description="the gang",
+    )
+    bot.member_count = 5
+    bot.admins = [
+        SimpleNamespace(user=SimpleNamespace(full_name="Bob", username="bob"))
+    ]
+    result = await make_toolbox(bot=bot).run(
+        "get_chat_info", json.dumps({"chat_id": -500})
+    )
+    info = json.loads(result)
+    assert info["member_count"] == 5
+    assert info["admins"] == ["Bob @bob"]
+    assert info["description"] == "the gang"
+
+
+async def test_list_chat_members() -> None:
+    """Seen members come back as JSON; an empty chat says so."""
+    db = FakeDB()
+    toolbox = make_toolbox(db=db)
+    result = await toolbox.run("list_chat_members", json.dumps({"chat_id": 1}))
+    assert result == "nobody seen talking in this chat yet"
+    db.members = [{"user_id": 7, "first_name": "Alice", "messages": 3}]
+    result = await toolbox.run("list_chat_members", json.dumps({"chat_id": 1}))
+    assert json.loads(result) == db.members
 
 
 def test_typing_delay_bounds() -> None:

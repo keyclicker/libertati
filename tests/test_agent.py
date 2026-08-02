@@ -1,8 +1,9 @@
 """Tests for the agent's context-window trimming logic."""
 
-from typing import Any
+from typing import Any, cast
 
-from libertati.agent import Agent
+from libertati.agent import MAX_CONTEXT_ITEMS, TRIM_CONTEXT_ITEMS, Agent
+from libertati.db import Database
 
 EVENT: dict[str, Any] = {"role": "user", "content": "[event] hi"}
 MESSAGE: dict[str, Any] = {
@@ -75,3 +76,28 @@ def test_trim_dangling_does_not_mutate_input() -> None:
     items = [EVENT, CALL]
     Agent._trim_dangling(items)
     assert items == [EVENT, CALL]
+
+
+class FakeContextDB:
+    """Persists nothing; satisfies _remember's write-through call."""
+
+    async def append_context(self, item: dict[str, Any]) -> None:
+        """Discard the item."""
+
+
+async def test_remember_trims_in_chunks() -> None:
+    """Overflow cuts the window back to TRIM_CONTEXT_ITEMS in one go.
+
+    Chunked trimming keeps the context prefix stable between trims so
+    prompt caching stays effective; one-by-one trimming would shift the
+    prefix on every append.
+    """
+    agent = Agent.__new__(Agent)
+    agent.db = cast(Database, FakeContextDB())
+    agent._context = [EVENT] * MAX_CONTEXT_ITEMS
+    await agent._remember(dict(EVENT))
+    assert len(agent._context) == TRIM_CONTEXT_ITEMS
+    head = agent._context[0]
+    await agent._remember(dict(EVENT))
+    assert len(agent._context) == TRIM_CONTEXT_ITEMS + 1
+    assert agent._context[0] is head

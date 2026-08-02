@@ -116,6 +116,75 @@ MESSAGING_TOOLS: list[ToolParam] = [
     },
     {
         "type": "function",
+        "name": "send_sticker",
+        "description": (
+            "Send a sticker to a chat — sometimes a sticker says it "
+            "better than words. Only stickers you've seen can be sent: "
+            "pick a file_id from list_stickers first."
+        ),
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "chat_id": {
+                    "type": "integer",
+                    "description": "Target chat id.",
+                },
+                "file_id": {
+                    "type": "string",
+                    "description": "Sticker file_id (from list_stickers).",
+                },
+            },
+            "required": ["chat_id", "file_id"],
+            "additionalProperties": False,
+        },
+        "strict": True,
+    },
+    {
+        "type": "function",
+        "name": "list_stickers",
+        "description": (
+            "List stickers you can send: every sticker seen in any chat, "
+            "with its emoji, set name and file_id for send_sticker."
+        ),
+        "parameters": {
+            "type": "object",
+            "properties": {},
+            "required": [],
+            "additionalProperties": False,
+        },
+        "strict": True,
+    },
+    {
+        "type": "function",
+        "name": "forward_message",
+        "description": (
+            "Forward a message from one chat to another — share a meme, "
+            "a link, a photo someone sent you. The recipient sees the "
+            "original sender."
+        ),
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "to_chat_id": {
+                    "type": "integer",
+                    "description": "Chat to forward the message to.",
+                },
+                "from_chat_id": {
+                    "type": "integer",
+                    "description": "Chat the message is currently in.",
+                },
+                "message_id": {
+                    "type": "integer",
+                    "description": "Id of the message to forward.",
+                },
+            },
+            "required": ["to_chat_id", "from_chat_id", "message_id"],
+            "additionalProperties": False,
+        },
+        "strict": True,
+    },
+    {
+        "type": "function",
         "name": "react",
         "description": (
             "Put an emoji reaction on a message — the lightest way to "
@@ -284,6 +353,49 @@ HISTORY_TOOLS: list[ToolParam] = [
             "type": "object",
             "properties": {},
             "required": [],
+            "additionalProperties": False,
+        },
+        "strict": True,
+    },
+    {
+        "type": "function",
+        "name": "get_chat_info",
+        "description": (
+            "Fetch a chat's live profile from Telegram: name, username, "
+            "bio or description, and for groups the member count and "
+            "admins."
+        ),
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "chat_id": {
+                    "type": "integer",
+                    "description": "Chat id to look up.",
+                },
+            },
+            "required": ["chat_id"],
+            "additionalProperties": False,
+        },
+        "strict": True,
+    },
+    {
+        "type": "function",
+        "name": "list_chat_members",
+        "description": (
+            "List who you've seen talking in a chat (from stored "
+            "history), with message counts and last activity. Telegram "
+            "hides a group's full roster from bots, so silent members "
+            "don't appear."
+        ),
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "chat_id": {
+                    "type": "integer",
+                    "description": "Chat id to list members of.",
+                },
+            },
+            "required": ["chat_id"],
             "additionalProperties": False,
         },
         "strict": True,
@@ -465,6 +577,9 @@ class Toolbox:
         self._handlers = {
             # messaging
             "send_message": self._send_message,
+            "send_sticker": self._send_sticker,
+            "list_stickers": self._list_stickers,
+            "forward_message": self._forward_message,
             "react": self._react,
             "edit_message": self._edit_message,
             "delete_message": self._delete_message,
@@ -474,6 +589,8 @@ class Toolbox:
             "cancel_wakeup": self._cancel_wakeup,
             # chats & history
             "list_chats": self._list_chats,
+            "get_chat_info": self._get_chat_info,
+            "list_chat_members": self._list_chat_members,
             "get_recent_messages": self._get_recent_messages,
             "search_messages": self._search_messages,
             # memory
@@ -536,6 +653,31 @@ class Toolbox:
         return (
             f"sent message {sent.message_id} to chat {sent.chat.id}"
             f" at {clock.format_now(self.tz)}"
+        )
+
+    async def _send_sticker(self, args: dict[str, Any]) -> str:
+        """Send a known sticker by file_id and persist it as outgoing."""
+        sent = await self.bot.send_sticker(args["chat_id"], args["file_id"])
+        await self.db.save_message(sent, outgoing=True)
+        return f"sent sticker as message {sent.message_id} to chat {sent.chat.id}"
+
+    async def _list_stickers(self, args: dict[str, Any]) -> str:
+        """Return every sticker seen so far (sendable file_ids) as JSON."""
+        rows = await self.db.known_stickers(50)
+        if not rows:
+            return "no stickers seen yet — stickers people send you land here"
+        return json.dumps(rows, ensure_ascii=False)
+
+    async def _forward_message(self, args: dict[str, Any]) -> str:
+        """Forward a message between chats and persist the copy as outgoing."""
+        sent = await self.bot.forward_message(
+            args["to_chat_id"], args["from_chat_id"], args["message_id"]
+        )
+        await self.db.save_message(sent, outgoing=True)
+        return (
+            f"forwarded message {args['message_id']} from chat "
+            f"{args['from_chat_id']} to chat {args['to_chat_id']} "
+            f"as message {sent.message_id}"
         )
 
     @staticmethod
@@ -633,6 +775,43 @@ class Toolbox:
         if not chats:
             return "no chats yet"
         return json.dumps(chats, ensure_ascii=False)
+
+    async def _get_chat_info(self, args: dict[str, Any]) -> str:
+        """Return a chat's live Telegram profile as JSON.
+
+        For group chats the member count and admin names are fetched too;
+        for private chats Telegram only exposes the profile fields.
+        """
+        chat = await self.bot.get_chat(args["chat_id"])
+        info: dict[str, Any] = {
+            "chat_id": chat.id,
+            "type": chat.type,
+            "title": chat.title,
+            "first_name": chat.first_name,
+            "last_name": chat.last_name,
+            "username": chat.username,
+            "bio": chat.bio,
+            "description": chat.description,
+        }
+        if chat.type != "private":
+            info["member_count"] = await self.bot.get_chat_member_count(chat.id)
+            admins = await self.bot.get_chat_administrators(chat.id)
+            info["admins"] = [
+                f"{member.user.full_name}"
+                + (f" @{member.user.username}" if member.user.username else "")
+                for member in admins
+            ]
+        return json.dumps(
+            {key: value for key, value in info.items() if value is not None},
+            ensure_ascii=False,
+        )
+
+    async def _list_chat_members(self, args: dict[str, Any]) -> str:
+        """Return users seen talking in a chat as JSON."""
+        rows = await self.db.chat_members(args["chat_id"])
+        if not rows:
+            return "nobody seen talking in this chat yet"
+        return json.dumps(rows, ensure_ascii=False)
 
     async def _get_recent_messages(self, args: dict[str, Any]) -> str:
         """Return a page of a chat's messages as JSON, oldest first."""

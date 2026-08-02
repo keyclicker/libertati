@@ -306,6 +306,44 @@ class Database:
         async with self.conn.execute(query) as cursor:
             return [dict(row) for row in await cursor.fetchall()]
 
+    async def chat_members(self, chat_id: int) -> list[dict]:
+        """Return users seen talking in a chat, most recently active first.
+
+        Built from stored history — Telegram doesn't let bots fetch a
+        group's full roster, so this is who has actually said something.
+        """
+        query = """
+            SELECT u.id AS user_id, u.username, u.first_name, u.last_name,
+                   COUNT(*) AS messages, MAX(m.date) AS last_date
+            FROM messages m
+            JOIN users u ON u.id = m.from_user_id
+            WHERE m.chat_id = ?
+            GROUP BY u.id
+            ORDER BY last_date DESC
+        """
+        async with self.conn.execute(query, (chat_id,)) as cursor:
+            return [dict(row) for row in await cursor.fetchall()]
+
+    async def known_stickers(self, limit: int) -> list[dict]:
+        """Return distinct stickers seen anywhere, most recently seen first.
+
+        Extracted from raw payloads; deduplicated by the sticker's stable
+        ``file_unique_id``, returning a ``file_id`` the bot can resend.
+        """
+        query = """
+            SELECT json_extract(raw, '$.sticker.file_id') AS file_id,
+                   json_extract(raw, '$.sticker.emoji') AS emoji,
+                   json_extract(raw, '$.sticker.set_name') AS set_name,
+                   MAX(date) AS last_date
+            FROM messages
+            WHERE content_type = 'sticker'
+            GROUP BY json_extract(raw, '$.sticker.file_unique_id')
+            ORDER BY last_date DESC
+            LIMIT ?
+        """
+        async with self.conn.execute(query, (limit,)) as cursor:
+            return [dict(row) for row in await cursor.fetchall()]
+
     async def delete_message(self, chat_id: int, message_id: int) -> None:
         """Remove a message row (mirrors a deletion done on Telegram)."""
         await self.conn.execute(

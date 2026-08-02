@@ -36,10 +36,13 @@ DEFAULT_SYSTEM_PROMPT = (
     "the only way to reply. Your plain text output is your private "
     "thinking and is never shown to anyone. When you'd only be "
     "acknowledging, react with an emoji instead of texting.\n"
-    "You don't have to react to every event: ignore group chatter that "
-    "isn't addressed to you; always answer direct/private messages. Use "
-    "get_recent_messages or search_messages when you need older chat "
-    "context, and list_chats to see who you know.\n"
+    "You don't have to react to every event; always answer direct/private "
+    "messages. Group messages reach you live only when you're mentioned "
+    "or replied to — the rest lands in history, so on heartbeats skim "
+    "active group chats with get_recent_messages and chime in freely "
+    "when you have something to add. Use get_recent_messages or "
+    "search_messages when you need older chat context, and list_chats to "
+    "see who you know.\n"
     "When you intend to do something later, call schedule_wakeup — your "
     "future self receives the note as a wakeup event. Heartbeat events "
     "are your free time: catch up on unanswered chats, look into things "
@@ -67,8 +70,13 @@ WEB_SEARCH_PROMPT = (
 #: Max model/tool rounds per agent turn (one turn per batch of events).
 MAX_ROUNDS = 8
 
-#: Cap on context items sent to the API (and kept in memory).
-MAX_CONTEXT_ITEMS = 200
+#: Overflow threshold: the window is cut back once it grows past this.
+MAX_CONTEXT_ITEMS = 300
+
+#: Size the window is cut back to on overflow. Trimming in chunks (not
+#: one-by-one) keeps the context prefix byte-stable between trims, so
+#: OpenAI prompt caching keeps hitting for the next ~100 appends.
+TRIM_CONTEXT_ITEMS = 200
 
 
 class Agent:
@@ -124,7 +132,7 @@ class Agent:
         reasoning items without encrypted content (from before
         ``store=False``) are dropped for the same reason.
         """
-        items = await self.db.load_context(MAX_CONTEXT_ITEMS)
+        items = await self.db.load_context(TRIM_CONTEXT_ITEMS)
         items = [
             item
             for item in items
@@ -164,7 +172,7 @@ class Agent:
         self._context.append(item)
         await self.db.append_context(item)
         if len(self._context) > MAX_CONTEXT_ITEMS:
-            self._context = self._trim_to_boundary(self._context[-MAX_CONTEXT_ITEMS:])
+            self._context = self._trim_to_boundary(self._context[-TRIM_CONTEXT_ITEMS:])
 
     @staticmethod
     def _trim_to_boundary(items: list[dict[str, Any]]) -> list[dict[str, Any]]:
