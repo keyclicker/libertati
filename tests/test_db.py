@@ -1,26 +1,15 @@
 """Tests for the SQLite persistence layer against a temporary database."""
 
 import sqlite3
-from collections.abc import AsyncIterator
 from pathlib import Path
 from typing import Any
 
-import pytest
 from aiogram.types import Message
 
 from libertati.db import Database
 
 #: 2026-08-02 12:00:00 UTC as a Telegram unix timestamp.
 STAMP = 1785672000
-
-
-@pytest.fixture
-async def db(tmp_path: Path) -> AsyncIterator[Database]:
-    """Yield a connected database in a temporary directory."""
-    database = Database(tmp_path / "test.db")
-    await database.connect()
-    yield database
-    await database.close()
 
 
 def make_message(
@@ -303,3 +292,60 @@ async def test_usage_schema_migrates_existing_table(tmp_path: Path) -> None:
     await database.close()
 
     assert {"turn_id", "input_context_id"} <= columns
+
+
+async def test_dream_ledger_round_trip(db: Database) -> None:
+    """A dream is opened running and closed with its outcome."""
+    dream_id = await db.start_dream("idle")
+    await db.finish_dream(dream_id, "woke", 14, "talk to Alice about the trip")
+
+    async with db.conn.execute(
+        "SELECT trigger, status, steps, summary, finished_at FROM dreams WHERE id = ?",
+        (dream_id,),
+    ) as cursor:
+        row = await cursor.fetchone()
+
+    assert row is not None
+    assert row["trigger"] == "idle"
+    assert row["status"] == "woke"
+    assert row["steps"] == 14
+    assert row["summary"] == "talk to Alice about the trip"
+    assert row["finished_at"] is not None
+
+
+async def test_start_dream_leaves_other_running_rows_alone(db: Database) -> None:
+    """Unlike agent turns, opening a dream never sweeps older rows."""
+    first = await db.start_dream("idle")
+    await db.start_dream("requested")
+
+    async with db.conn.execute(
+        "SELECT status FROM dreams WHERE id = ?", (first,)
+    ) as cursor:
+        row = await cursor.fetchone()
+
+    assert row is not None
+    assert row["status"] == "running"
+
+
+async def test_dreams_since_counts_from_a_stamp(db: Database) -> None:
+    """Budget accounting counts every dream started in the window."""
+    await db.start_dream("idle")
+    await db.start_dream("requested")
+
+    assert await db.dreams_since("1970-01-01 00:00:00") == 2
+    assert await db.dreams_since("2999-01-01 00:00:00") == 0
+
+
+async def test_dreams_since_counts_a_dream_that_never_finished(db: Database) -> None:
+    """A crashed dream still spends its budget, so it cannot loop."""
+    await db.start_dream("idle")
+    assert await db.dreams_since("1970-01-01 00:00:00") == 1
+    assert await db.last_dream_end() is None
+
+
+async def test_last_dream_end_reports_the_newest_finish(db: Database) -> None:
+    """The cooldown reads the most recent finished dream."""
+    assert await db.last_dream_end() is None
+    dream_id = await db.start_dream("idle")
+    await db.finish_dream(dream_id, "woke", 3, "nothing much")
+    assert await db.last_dream_end() is not None

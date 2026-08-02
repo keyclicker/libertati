@@ -8,13 +8,16 @@ from typing import Any
 
 @dataclass(frozen=True)
 class Prompts:
-    """Prompt text used by the main agent and memory helper calls."""
+    """Prompt text used by the agent, dream and memory helper calls."""
 
     system: str
     roleplay: str
     web_search: str
     recall: str
     summary: str
+    dream: str
+    dream_nudge: str
+    dream_tool: str
 
 
 def _required(data: dict[str, Any], section: str, key: str) -> str:
@@ -38,4 +41,7 @@ def load_prompts(path: Path) -> Prompts:
         web_search=_required(data, "agent", "web_search"),
         recall=_required(data, "memory", "recall"),
         summary=_required(data, "memory", "summary"),
+        dream=_required(data, "dream", "system"),
+        dream_nudge=_required(data, "dream", "nudge"),
+        dream_tool=_required(data, "dream", "tool"),
     )

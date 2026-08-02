@@ -29,6 +29,11 @@ def utc_stamp(dt: datetime) -> str:
     return dt.astimezone(UTC).strftime(UTC_STAMP_FORMAT)
 
 
+def file_stamp(dt: datetime) -> str:
+    """Format a UTC datetime for use inside a filename."""
+    return dt.astimezone(UTC).strftime("%Y%m%dT%H%M%SZ")
+
+
 def parse_utc_stamp(text: str) -> datetime:
     """Parse a :func:`utc_stamp` / SQLite ``datetime('now')`` string."""
     return datetime.strptime(text, UTC_STAMP_FORMAT).replace(tzinfo=UTC)

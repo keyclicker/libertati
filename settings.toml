@@ -40,7 +40,8 @@ web_search = true
 # command.
 roleplay = true
 
-# Directory holding the mind files SOUL.md / MEMORY.md / DIARY.md.
+# Directory holding the mind files SOUL.md / MEMORY.md / INBOX.md /
+# DREAMS.md (plus soul/ snapshots written before every soul rewrite).
 # memory_dir = "data/memory"
 
 # Chat approval mode: when true, only chats marked true in chats_path
@@ -67,6 +68,21 @@ heartbeat_minutes = 5
 
 # Simulated typing speed for outgoing messages, chars/second (0 disables).
 # typing_chars_per_second = 15
+
+# Dreaming: while the agent sleeps the waking loop pauses and a
+# differently-prompted loop wanders, then rewrites MEMORY.md from
+# INBOX.md, writes DREAMS.md and may revise SOUL.md.
+# A dream starts after dream_idle_minutes of quiet, or when the agent
+# calls the `dream` tool itself. Budget 0 disables it entirely and
+# hides the tool.
+# dream_daily_budget = 4
+# dream_idle_minutes = 45
+# dream_cooldown_minutes = 120
+# Tool calls required before wake_up is accepted (wake_up counts).
+# dream_min_steps = 12
+# dream_max_rounds = 25
+# Model used while dreaming (comment out for the main model).
+# dream_model = "gpt-5.6-luna"
 
 # User-editable agent and memory prompts.
 # prompts_path = "prompts.toml"

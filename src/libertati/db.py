@@ -88,6 +88,21 @@ CREATE TABLE IF NOT EXISTS api_usage (
     created_at         TEXT NOT NULL DEFAULT (datetime('now'))
 );
 
+-- Bookkeeping only: a dream's context is never persisted, but its budget
+-- has to survive restarts, and a dream that dies before writing its
+-- journal entry still has to count against that budget.
+CREATE TABLE IF NOT EXISTS dreams (
+    id          INTEGER PRIMARY KEY AUTOINCREMENT,
+    trigger     TEXT NOT NULL,
+    status      TEXT NOT NULL DEFAULT 'running',
+    steps       INTEGER NOT NULL DEFAULT 0,
+    summary     TEXT,
+    started_at  TEXT NOT NULL DEFAULT (datetime('now')),
+    finished_at TEXT
+);
+
+CREATE INDEX IF NOT EXISTS idx_dreams_started ON dreams (started_at);
+
 CREATE TABLE IF NOT EXISTS wakeups (
     id         INTEGER PRIMARY KEY AUTOINCREMENT,
     due_at     TEXT NOT NULL,
@@ -311,6 +326,52 @@ class Database:
             ),
         )
         await self.conn.commit()
+
+    async def start_dream(self, trigger: str) -> int:
+        """Open a dream record and return its id.
+
+        Unlike :meth:`start_agent_turn` this does not sweep older
+        ``running`` rows: the waking and dreaming loops write here
+        concurrently, and a stale row only ever costs one dream of
+        budget.
+        """
+        cursor = await self.conn.execute(
+            "INSERT INTO dreams (trigger) VALUES (?)", (trigger,)
+        )
+        await self.conn.commit()
+        return cursor.lastrowid or 0
+
+    async def finish_dream(
+        self,
+        dream_id: int,
+        status: str,
+        steps: int,
+        summary: str,
+    ) -> None:
+        """Close a dream with its outcome, tool-call count and summary."""
+        await self.conn.execute(
+            """
+            UPDATE dreams
+            SET status = ?, steps = ?, summary = ?, finished_at = datetime('now')
+            WHERE id = ?
+            """,
+            (status, steps, summary, dream_id),
+        )
+        await self.conn.commit()
+
+    async def dreams_since(self, since: str) -> int:
+        """Count dreams started at or after a UTC stamp."""
+        async with self.conn.execute(
+            "SELECT COUNT(*) FROM dreams WHERE started_at >= ?", (since,)
+        ) as cursor:
+            row = await cursor.fetchone()
+        return int(row[0]) if row else 0
+
+    async def last_dream_end(self) -> str | None:
+        """Return the UTC stamp of the last finished dream, if any."""
+        async with self.conn.execute("SELECT MAX(finished_at) FROM dreams") as cursor:
+            row = await cursor.fetchone()
+        return row[0] if row else None
 
     async def add_wakeup(self, due_at: str, note: str) -> int:
         """Store a scheduled wakeup (``due_at`` as UTC stamp); return its id."""

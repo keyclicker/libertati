@@ -18,7 +18,7 @@ import random
 import re
 from collections.abc import Awaitable, Callable
 from datetime import UTC, datetime
-from typing import Any
+from typing import TYPE_CHECKING, Any, cast
 from zoneinfo import ZoneInfo
 
 from aiogram import Bot
@@ -32,6 +32,9 @@ from openai.types.responses import ToolParam
 from libertati import clock
 from libertati.db import Database
 from libertati.memory import Mind
+
+if TYPE_CHECKING:  # pragma: no cover - import cycle broken for runtime
+    from libertati.dream import DreamGate
 
 log = logging.getLogger(__name__)
 
@@ -557,6 +560,160 @@ MEMORY_TOOLS: list[ToolParam] = [
     },
 ]
 
+# ==========================================================
+#                     Falling asleep
+# ==========================================================
+SLEEP_TOOLS: list[ToolParam] = [
+    {
+        "type": "function",
+        "name": "dream",
+        "description": (
+            "Fall asleep and dream. Your waking self pauses while a "
+            "dreaming self wanders, reflects, rewrites your long-term "
+            "memory and may revise who you are; you wake up with a "
+            "summary of it. Use it when nothing needs you and there is "
+            "a lot to digest. You only get a few dreams a day."
+        ),
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "note": {
+                    "type": "string",
+                    "description": ("What you want to sleep on, in a sentence or two."),
+                },
+            },
+            "required": ["note"],
+            "additionalProperties": False,
+        },
+        "strict": True,
+    },
+]
+
+# ==========================================================
+#                        Dreaming
+# ==========================================================
+DREAM_TOOLS: list[ToolParam] = [
+    {
+        "type": "function",
+        "name": "read_mind",
+        "description": (
+            "Re-read one of your mind files. All four were handed to you "
+            "when you fell asleep; use this to look at one again after "
+            "you have written to it."
+        ),
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "file": {
+                    "type": "string",
+                    "enum": ["soul", "memory", "inbox", "dreams"],
+                    "description": "Which mind file to read.",
+                },
+            },
+            "required": ["file"],
+            "additionalProperties": False,
+        },
+        "strict": True,
+    },
+    {
+        "type": "function",
+        "name": "write_dream",
+        "description": (
+            "Write this dream's entry into your journal (DREAMS.md): "
+            "what you wandered into, what you noticed, what you now "
+            "think. Honest and in your own voice — nobody else reads it, "
+            "and your future dreams will."
+        ),
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "text": {
+                    "type": "string",
+                    "description": "The journal entry, in markdown.",
+                },
+            },
+            "required": ["text"],
+            "additionalProperties": False,
+        },
+        "strict": True,
+    },
+    {
+        "type": "function",
+        "name": "fold_inbox",
+        "description": (
+            "Replace your long-term memory and clear the inbox, in one "
+            "step. Pass the complete new MEMORY.md: keep what still "
+            "matters, merge duplicates, drop what went stale, fold in "
+            "the dated inbox entries, and add the conclusions and "
+            "patterns worth keeping. Everything you leave out is "
+            "forgotten for good."
+        ),
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "memory": {
+                    "type": "string",
+                    "description": (
+                        "The complete new contents of MEMORY.md, in markdown."
+                    ),
+                },
+            },
+            "required": ["memory"],
+            "additionalProperties": False,
+        },
+        "strict": True,
+    },
+    {
+        "type": "function",
+        "name": "write_soul",
+        "description": (
+            "Rewrite who you are (SOUL.md). Sparingly and gently: small "
+            "edits where what you lived through actually warrants them, "
+            "never a new person. The previous version is kept as a "
+            "dated snapshot."
+        ),
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "text": {
+                    "type": "string",
+                    "description": (
+                        "The complete new soul text. Keep it short — it "
+                        "rides along in every waking thought."
+                    ),
+                },
+            },
+            "required": ["text"],
+            "additionalProperties": False,
+        },
+        "strict": True,
+    },
+    {
+        "type": "function",
+        "name": "wake_up",
+        "description": (
+            "End the dream and wake up. Call it only once you have "
+            "wandered properly, written your journal entry, folded the "
+            "inbox into memory and considered your soul. Your summary is "
+            "the first thing your waking self sees."
+        ),
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "summary": {
+                    "type": "string",
+                    "description": (
+                        "What the waking you should know or act on, in a few sentences."
+                    ),
+                },
+            },
+            "required": ["summary"],
+            "additionalProperties": False,
+        },
+        "strict": True,
+    },
+]
+
 #: All function tools, in the order the model sees them.
 TOOLS: list[ToolParam] = [
     *MESSAGING_TOOLS,
@@ -565,23 +722,60 @@ TOOLS: list[ToolParam] = [
     *MEMORY_TOOLS,
 ]
 
+#: The dreaming loop's function tools: no messaging, no ``remember``
+#: (it edits MEMORY.md directly) and no ``recall``/``summarize_memory``
+#: (it is handed the mind files verbatim when it falls asleep).
+DREAM_API_TOOLS: list[ToolParam] = [
+    *SCHEDULING_TOOLS,
+    *HISTORY_TOOLS,
+    *DREAM_TOOLS,
+]
 
-def build_tools(web_search: bool) -> list[ToolParam]:
+
+def function_names(tools: list[ToolParam]) -> frozenset[str]:
+    """Collect the names of the function tools in a schema list."""
+    return frozenset(
+        cast(dict[str, Any], tool)["name"]
+        for tool in tools
+        if tool["type"] == "function"
+    )
+
+
+#: What a dreaming :class:`Toolbox` is allowed to execute. Restricting
+#: the schema list is not enough on its own — a hallucinated
+#: ``send_message`` call would otherwise still reach its handler.
+DREAM_TOOL_NAMES: frozenset[str] = function_names(DREAM_API_TOOLS)
+
+
+def build_tools(web_search: bool, *, dreaming: bool = False) -> list[ToolParam]:
     """Return the tool list for the API, optionally with built-in web search.
 
     Web search runs on OpenAI's side; it is opt-in because most
-    OpenAI-compatible endpoints don't support it.
+    OpenAI-compatible endpoints don't support it. ``dreaming`` adds the
+    ``dream`` tool, which only means anything when a dream budget exists.
     """
+    tools = list(TOOLS)
+    if dreaming:
+        tools.extend(SLEEP_TOOLS)
     if web_search:
-        return [*TOOLS, {"type": "web_search"}]
-    return list(TOOLS)
+        tools.append({"type": "web_search"})
+    return tools
+
+
+def build_dream_tools(web_search: bool) -> list[ToolParam]:
+    """Return the offline tool list the dreaming loop sees."""
+    if web_search:
+        return [*DREAM_API_TOOLS, {"type": "web_search"}]
+    return list(DREAM_API_TOOLS)
 
 
 class Toolbox:
     """Executes the agent's tool calls against application resources.
 
-    One instance serves the single agent loop; tools that target a chat
-    take an explicit ``chat_id`` argument from the model.
+    One instance serves one loop; tools that target a chat take an
+    explicit ``chat_id`` argument from the model. The dreaming loop gets
+    a second instance restricted with ``allowed`` — sharing handlers but
+    not the ability to reach out to anyone.
     """
 
     def __init__(
@@ -595,6 +789,10 @@ class Toolbox:
         typing_chars_per_second: float,
         recall_prompt: str,
         summary_prompt: str,
+        *,
+        allowed: frozenset[str] | None = None,
+        dream_gate: "DreamGate | None" = None,
+        dream_min_steps: int = 0,
     ) -> None:
         """Keep resource handles and build the name-to-handler dispatch."""
         self.db = db
@@ -606,6 +804,13 @@ class Toolbox:
         self.typing_chars_per_second = typing_chars_per_second
         self.recall_prompt = recall_prompt
         self.summary_prompt = summary_prompt
+        self.dream_gate = dream_gate
+        self.dream_min_steps = dream_min_steps
+        #: Tool calls dispatched so far; the dreaming loop resets it per
+        #: dream and ``wake_up`` refuses to fire below the minimum.
+        self.steps = 0
+        #: Set by ``wake_up`` to the summary that ends the dream.
+        self.wake_summary: str | None = None
         self._handlers = {
             # messaging
             "send_message": self._send_message,
@@ -630,14 +835,29 @@ class Toolbox:
             "remember": self._remember,
             "recall": self._recall,
             "summarize_memory": self._summarize_memory,
+            # falling asleep
+            "dream": self._dream,
+            # dreaming
+            "read_mind": self._read_mind,
+            "write_dream": self._write_dream,
+            "fold_inbox": self._fold_inbox,
+            "write_soul": self._write_soul,
+            "wake_up": self._wake_up,
         }
+        if allowed is not None:
+            self._handlers = {
+                name: handler
+                for name, handler in self._handlers.items()
+                if name in allowed
+            }
 
     async def run(self, name: str, arguments: str | None) -> str:
         """Execute one tool call and return its result as a string.
 
         Never raises: unknown tools, malformed arguments and handler
         failures all come back as ``error: …`` strings so the model can
-        recover on the next loop step.
+        recover on the next loop step. Tools this instance is not allowed
+        to run are simply unknown to it.
         """
         handler = self._handlers.get(name)
         if handler is None:
@@ -646,6 +866,7 @@ class Toolbox:
             args = json.loads(arguments or "{}")
         except json.JSONDecodeError:
             return "error: invalid tool arguments"
+        self.steps += 1
         log.info("tool call: %s(%s)", name, args)
         try:
             return await handler(args)
@@ -907,3 +1128,67 @@ class Toolbox:
         if not notes:
             return "memory is empty"
         return await self._read_memory(self.summary_prompt, notes)
+
+    # ==========================================================
+    #                     Falling asleep
+    # ==========================================================
+
+    async def _dream(self, args: dict[str, Any]) -> str:
+        """Ask the dreaming loop to take over once this turn ends.
+
+        The agent is holding the turn lock while it calls this, so it
+        cannot dream on the spot — the request is picked up by the dream
+        loop's next poll.
+        """
+        if self.dream_gate is None:
+            return "error: dreaming is disabled"
+        left = await self.dream_gate.budget_left()
+        if left <= 0:
+            return (
+                "error: no sleep left — you have already dreamt "
+                f"{self.dream_gate.daily_budget} times in the last 24h"
+            )
+        self.dream_gate.request(args["note"])
+        return f"falling asleep shortly ({left} dreams left for the next 24h)"
+
+    # ==========================================================
+    #                         Dreaming
+    # ==========================================================
+
+    async def _read_mind(self, args: dict[str, Any]) -> str:
+        """Return one mind file's current text."""
+        text = self.mind.read(args["file"])
+        return text or f"{args['file']} is empty"
+
+    async def _write_dream(self, args: dict[str, Any]) -> str:
+        """Append one dated reflection to the dream journal."""
+        text = args["text"].strip()
+        if not text:
+            return "error: nothing to write"
+        self.mind.append_dreams(text, clock.format_now(self.tz))
+        return f"wrote {len(text)} chars into DREAMS.md"
+
+    async def _fold_inbox(self, args: dict[str, Any]) -> str:
+        """Rewrite long-term memory and clear the inbox in one step."""
+        self.mind.fold_inbox(args["memory"])
+        return (
+            f"MEMORY.md rewritten ({len(args['memory'].strip())} chars),"
+            " INBOX.md cleared"
+        )
+
+    async def _write_soul(self, args: dict[str, Any]) -> str:
+        """Snapshot the current soul and replace it."""
+        snapshot = self.mind.write_soul(
+            args["text"], clock.file_stamp(datetime.now(UTC))
+        )
+        return f"soul updated; the previous one is kept as soul/{snapshot.name}"
+
+    async def _wake_up(self, args: dict[str, Any]) -> str:
+        """End the dream, unless it has barely started."""
+        if self.steps < self.dream_min_steps:
+            return (
+                f"error: you have only taken {self.steps} steps this dream;"
+                f" keep wandering, at least {self.dream_min_steps} before waking"
+            )
+        self.wake_summary = args["summary"].strip() or "(the dream said nothing)"
+        return "waking up"

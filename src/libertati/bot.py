@@ -3,7 +3,9 @@
 Handlers don't answer anything themselves — every incoming message is
 persisted, formatted as an event and pushed to the single agent loop,
 which replies (or not) through its ``send_message`` tool. Background
-loops feed the same queue with due wakeups and heartbeat status events.
+loops feed the same queue with due wakeups and heartbeat status events,
+and hand the agent over to the dreaming loop when it has been idle long
+enough.
 """
 
 import asyncio
@@ -22,6 +24,7 @@ from libertati.agent import Agent
 from libertati.chats import ChatRegistry
 from libertati.config import Settings
 from libertati.db import Database
+from libertati.dream import Dreamer, DreamGate
 
 log = logging.getLogger(__name__)
 
@@ -29,6 +32,9 @@ router = Router()
 
 #: How often the wakeup scheduler checks for due alarms.
 WAKEUP_POLL_SECONDS = 30
+
+#: How often the dream loop checks whether it should take over.
+DREAM_POLL_SECONDS = 60
 
 #: Max message body length quoted into an event (rest is elided).
 EVENT_TEXT_LIMIT = 1000
@@ -188,13 +194,31 @@ async def heartbeat_loop(
         await agent.push(f"[heartbeat {clock.format_now(tz)}] {digest}")
 
 
+async def dream_loop(dreamer: Dreamer) -> None:
+    """Let the dreaming loop take over whenever its conditions hold.
+
+    Only polls: the conditions (idleness, cooldown, budget, a pending
+    request) all live in :meth:`Dreamer.maybe_dream`. A failing dream
+    must not take the loop down with it — the agent would then never
+    sleep again until a restart.
+    """
+    if dreamer.gate.daily_budget <= 0:
+        return
+    while True:
+        await asyncio.sleep(DREAM_POLL_SECONDS)
+        try:
+            await dreamer.maybe_dream()
+        except Exception:
+            log.exception("dream loop failed")
+
+
 async def run() -> None:
     """Assemble the bot and run long polling until cancelled.
 
     Loads settings, connects the database, starts the agent worker plus
-    the wakeup and heartbeat loops, and routes all incoming messages to
-    the agent. Background tasks are cancelled and the database closed on
-    the way out.
+    the wakeup, heartbeat and dream loops, and routes all incoming
+    messages to the agent. Background tasks are cancelled and the
+    database closed on the way out.
     """
     settings = Settings()
     logging.basicConfig(level=settings.log_level)
@@ -203,9 +227,11 @@ async def run() -> None:
     await db.connect()
 
     bot = Bot(token=settings.bot_token)
-    agent = Agent(settings, db, bot)
+    dream_gate = DreamGate(db, settings.dream_daily_budget)
+    agent = Agent(settings, db, bot, dream_gate)
     await agent.load()
     tz = agent.tz
+    dreamer = Dreamer(settings, db, bot, agent, dream_gate)
     registry = ChatRegistry(settings.chats_path, settings.chat_approval)
     tasks = [
         asyncio.create_task(agent.run_forever()),
@@ -213,6 +239,7 @@ async def run() -> None:
         asyncio.create_task(
             heartbeat_loop(agent, db, tz, settings.heartbeat_minutes, registry)
         ),
+        asyncio.create_task(dream_loop(dreamer)),
     ]
 
     dispatcher = Dispatcher(agent=agent, tz=tz, me=await bot.me(), registry=registry)

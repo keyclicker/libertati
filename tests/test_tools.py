@@ -13,13 +13,18 @@ from aiogram.exceptions import TelegramBadRequest
 from openai import AsyncOpenAI
 
 from libertati.db import Database
-from libertati.memory import Mind
+from libertati.memory import DEFAULT_SOUL, MEMORY_MAX_CHARS, SOUL_MAX_CHARS, Mind
 from libertati.tools import (
+    DREAM_TOOL_NAMES,
+    MESSAGING_TOOLS,
+    SLEEP_TOOLS,
     TOOLS,
     TYPING_MAX_SECONDS,
     TYPING_MIN_SECONDS,
     Toolbox,
+    build_dream_tools,
     build_tools,
+    function_names,
     typing_delay,
 )
 
@@ -225,6 +230,7 @@ def make_toolbox(
     bot: Any | None = None,
     client: Any | None = None,
     mind: Mind | None = None,
+    **dream: Any,
 ) -> Toolbox:
     """Build a Toolbox around fakes."""
     return Toolbox(
@@ -237,6 +243,7 @@ def make_toolbox(
         15.0,
         RECALL_PROMPT,
         SUMMARY_PROMPT,
+        **dream,
     )
 
 
@@ -594,3 +601,209 @@ def test_build_tools_web_search_toggle() -> None:
     """Web search is appended only when enabled."""
     assert build_tools(False) == TOOLS
     assert build_tools(True) == [*TOOLS, {"type": "web_search"}]
+
+
+# ==========================================================
+#                    Falling asleep
+# ==========================================================
+
+
+class FakeDreamGate:
+    """Stands in for the real gate's budget check and request slot."""
+
+    def __init__(self, left: int = 4, daily_budget: int = 4) -> None:
+        """Start with a fixed budget and no request pending."""
+        self.left = left
+        self.daily_budget = daily_budget
+        self.note: str | None = None
+
+    async def budget_left(self) -> int:
+        """Return the canned remaining budget."""
+        return self.left
+
+    def request(self, note: str) -> None:
+        """Record the requested dream."""
+        self.note = note
+
+
+async def test_dream_tool_records_the_request() -> None:
+    """A dream request is parked for the dream loop's next poll."""
+    gate = FakeDreamGate()
+    toolbox = make_toolbox(dream_gate=cast(Any, gate))
+
+    result = await toolbox.run("dream", json.dumps({"note": "the trip"}))
+
+    assert gate.note == "the trip"
+    assert "falling asleep" in result
+    assert "4 dreams left" in result
+
+
+async def test_dream_tool_reports_a_spent_budget() -> None:
+    """With no budget left the agent is told, not silently ignored."""
+    gate = FakeDreamGate(left=0)
+    toolbox = make_toolbox(dream_gate=cast(Any, gate))
+
+    result = await toolbox.run("dream", json.dumps({"note": "the trip"}))
+
+    assert result.startswith("error:")
+    assert gate.note is None
+
+
+async def test_dream_tool_absent_without_a_gate() -> None:
+    """Dreaming disabled means the tool exists but refuses."""
+    result = await make_toolbox().run("dream", json.dumps({"note": "x"}))
+    assert result == "error: dreaming is disabled"
+
+
+def test_build_tools_dreaming_toggle() -> None:
+    """The `dream` tool only appears when a dream budget exists."""
+    assert build_tools(False) == TOOLS
+    assert build_tools(False, dreaming=True) == [*TOOLS, *SLEEP_TOOLS]
+
+
+# ==========================================================
+#                        Dreaming
+# ==========================================================
+
+
+def make_dream_toolbox(mind: Mind, min_steps: int = 0) -> Toolbox:
+    """Build the restricted toolbox the dreaming loop runs with."""
+    return make_toolbox(
+        mind=mind,
+        allowed=DREAM_TOOL_NAMES,
+        dream_min_steps=min_steps,
+    )
+
+
+def test_dream_tool_list_excludes_messaging() -> None:
+    """A dream has no way to reach another person."""
+    names = function_names(build_dream_tools(False))
+    assert names.isdisjoint(function_names(MESSAGING_TOOLS))
+    assert "wake_up" in names
+    assert names == DREAM_TOOL_NAMES
+
+
+async def test_dream_toolbox_refuses_messaging_by_name(tmp_path: Path) -> None:
+    """A hallucinated send_message never reaches its handler."""
+    toolbox = make_dream_toolbox(make_mind(tmp_path))
+
+    result = await toolbox.run(
+        "send_message",
+        json.dumps({"chat_id": 1, "text": "hi", "reply_to_message_id": None}),
+    )
+
+    assert result == "error: unknown tool 'send_message'"
+
+
+async def test_read_mind_returns_each_file(tmp_path: Path) -> None:
+    """Every mind file is addressable by name; empty ones say so."""
+    mind = make_mind(tmp_path)
+    mind.memory_path.write_text("curated fact\n", encoding="utf-8")
+    toolbox = make_dream_toolbox(mind)
+
+    assert await toolbox.run("read_mind", json.dumps({"file": "memory"})) == (
+        "curated fact"
+    )
+    assert await toolbox.run("read_mind", json.dumps({"file": "inbox"})) == (
+        "inbox is empty"
+    )
+
+
+async def test_write_dream_appends_a_dated_entry(tmp_path: Path) -> None:
+    """The journal entry lands in DREAMS.md under a timestamp."""
+    mind = make_mind(tmp_path)
+    toolbox = make_dream_toolbox(mind)
+
+    await toolbox.run("write_dream", json.dumps({"text": "  thought about Alice  "}))
+
+    journal = mind.dreams_path.read_text(encoding="utf-8")
+    assert journal.startswith("## [")
+    assert "thought about Alice" in journal
+
+
+async def test_fold_inbox_consolidates(tmp_path: Path) -> None:
+    """Memory is replaced and the inbox emptied by a single call."""
+    mind = make_mind(tmp_path)
+    mind.append_inbox("fresh fact", "Sun 2026-08-02 12:00")
+    toolbox = make_dream_toolbox(mind)
+
+    await toolbox.run(
+        "fold_inbox", json.dumps({"memory": "# People\nAlice: likes tea"})
+    )
+
+    assert mind.read("memory") == "# People\nAlice: likes tea"
+    assert mind.read("inbox") == ""
+
+
+async def test_fold_inbox_over_cap_is_an_error_not_a_crash(tmp_path: Path) -> None:
+    """An oversized memory comes back as a retryable error string."""
+    mind = make_mind(tmp_path)
+    mind.append_inbox("fresh fact", "Sun 2026-08-02 12:00")
+    toolbox = make_dream_toolbox(mind)
+
+    result = await toolbox.run(
+        "fold_inbox", json.dumps({"memory": "x" * (MEMORY_MAX_CHARS + 1)})
+    )
+
+    assert result.startswith("error:")
+    assert "fresh fact" in mind.read("inbox")
+
+
+async def test_write_soul_snapshots_and_replaces(tmp_path: Path) -> None:
+    """The soul is replaced only after the old one is filed away."""
+    mind = make_mind(tmp_path)
+    toolbox = make_dream_toolbox(mind)
+
+    result = await toolbox.run("write_soul", json.dumps({"text": "a quieter person"}))
+
+    assert mind.soul() == "a quieter person"
+    assert "soul/" in result
+    assert [path.name for path in mind.soul_dir.iterdir()]
+
+
+async def test_write_soul_over_cap_is_an_error(tmp_path: Path) -> None:
+    """A bloated soul is refused; the current one survives."""
+    mind = make_mind(tmp_path)
+    toolbox = make_dream_toolbox(mind)
+
+    result = await toolbox.run(
+        "write_soul", json.dumps({"text": "x" * (SOUL_MAX_CHARS + 1)})
+    )
+
+    assert result.startswith("error:")
+    assert mind.soul() == DEFAULT_SOUL.strip()
+
+
+async def test_wake_up_refused_before_the_minimum_steps(tmp_path: Path) -> None:
+    """A dream that tidies up and leaves is sent back to wander."""
+    toolbox = make_dream_toolbox(make_mind(tmp_path), min_steps=3)
+
+    result = await toolbox.run("wake_up", json.dumps({"summary": "done"}))
+
+    assert result.startswith("error:")
+    assert toolbox.wake_summary is None
+
+
+async def test_wake_up_accepted_once_the_dream_has_wandered(tmp_path: Path) -> None:
+    """Past the minimum, wake_up ends the dream with its summary."""
+    toolbox = make_dream_toolbox(make_mind(tmp_path), min_steps=3)
+    await toolbox.run("read_mind", json.dumps({"file": "memory"}))
+    await toolbox.run("read_mind", json.dumps({"file": "inbox"}))
+
+    result = await toolbox.run("wake_up", json.dumps({"summary": "  say hi to Bob  "}))
+
+    assert result == "waking up"
+    assert toolbox.wake_summary == "say hi to Bob"
+    assert toolbox.steps == 3
+
+
+async def test_steps_count_only_dispatched_calls(tmp_path: Path) -> None:
+    """Unknown tools and bad arguments are not progress."""
+    toolbox = make_dream_toolbox(make_mind(tmp_path))
+
+    await toolbox.run("send_message", "{}")
+    await toolbox.run("read_mind", "not json")
+    assert toolbox.steps == 0
+
+    await toolbox.run("read_mind", json.dumps({"file": "soul"}))
+    assert toolbox.steps == 1

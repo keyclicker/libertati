@@ -65,6 +65,50 @@ def test_pruning_requires_current_turn_reasoning() -> None:
         make_settings(reasoning_context="omit", prune_completed_reasoning=True)
 
 
+def test_dream_defaults_valid() -> None:
+    """The shipped dream knobs pass validation."""
+    settings = make_settings()
+    assert settings.dream_daily_budget == 4
+    assert settings.dream_min_steps < settings.dream_max_rounds
+    assert settings.dream_model is None
+
+
+def test_dreaming_can_be_disabled_with_a_zero_budget() -> None:
+    """A zero budget is the off switch, not an invalid setting."""
+    settings = Settings(bot_token="t", api_key="k", model="m", dream_daily_budget=0)
+    assert settings.dream_daily_budget == 0
+
+
+def test_negative_dream_budget_is_rejected() -> None:
+    """Only zero disables dreaming; below that is a mistake."""
+    with pytest.raises(ValidationError):
+        Settings(bot_token="t", api_key="k", model="m", dream_daily_budget=-1)
+
+
+def test_dream_min_steps_above_max_rounds_is_rejected() -> None:
+    """A dream that could never satisfy wake_up would never wake up."""
+    with pytest.raises(ValidationError):
+        Settings(
+            bot_token="t",
+            api_key="k",
+            model="m",
+            dream_min_steps=30,
+            dream_max_rounds=25,
+        )
+
+
+def test_dream_max_rounds_must_be_positive() -> None:
+    """A dream with no rounds is not a dream."""
+    with pytest.raises(ValidationError):
+        Settings(
+            bot_token="t",
+            api_key="k",
+            model="m",
+            dream_min_steps=0,
+            dream_max_rounds=0,
+        )
+
+
 def test_cross_turn_reasoning_allowed_when_pruning_disabled() -> None:
     """Operators can retain complete output history for all-turns use."""
     settings = make_settings(

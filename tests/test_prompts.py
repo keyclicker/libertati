@@ -17,6 +17,10 @@ def test_repository_prompts_load() -> None:
     assert "built-in web search" in prompts.web_search
     assert "long-term memory" in prompts.recall
     assert "general overview" in prompts.summary
+    assert "asleep and dreaming" in prompts.dream
+    assert "wake_up" in prompts.dream
+    assert "still asleep" in prompts.dream_nudge
+    assert "You can sleep" in prompts.dream_tool
 
 
 def test_missing_prompt_is_rejected(tmp_path: Path) -> None:

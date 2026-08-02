@@ -203,7 +203,7 @@ async def test_turn_persists_then_prunes_ephemeral_outputs() -> None:
     agent.trim_context_items = TRIM_CONTEXT_ITEMS
     agent._context = [EVENT]
     agent._api_tools = []
-    agent._reasoning = {"effort": "low", "context": "current_turn"}
+    agent.reasoning = {"effort": "low", "context": "current_turn"}
     agent.prune_completed_reasoning = True
     agent.db = cast(Database, db)
 

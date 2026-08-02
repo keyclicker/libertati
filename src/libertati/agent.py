@@ -13,16 +13,18 @@ pruned tail window is kept in memory and sent to the API.
 
 import asyncio
 import logging
+from datetime import UTC, datetime
 from typing import Any, cast
 from zoneinfo import ZoneInfo
 
 from aiogram import Bot
-from openai import AsyncOpenAI, Omit, omit
-from openai.types.responses import ResponseInputParam
+from openai import AsyncOpenAI, omit
 from openai.types.shared_params import Reasoning
 
 from libertati.config import Settings
 from libertati.db import Database
+from libertati.dream import DreamGate
+from libertati.loop import ModelLoop
 from libertati.memory import Mind
 from libertati.prompts import load_prompts
 from libertati.tools import Toolbox, build_tools
@@ -30,7 +32,7 @@ from libertati.tools import Toolbox, build_tools
 log = logging.getLogger(__name__)
 
 
-class Agent:
+class Agent(ModelLoop):
     """One persistent agentic loop consuming events from all sources.
 
     Events are pushed onto an internal queue with :meth:`push` and
@@ -41,33 +43,50 @@ class Agent:
     restart.
     """
 
-    def __init__(self, settings: Settings, db: Database, bot: Bot) -> None:
+    def __init__(
+        self,
+        settings: Settings,
+        db: Database,
+        bot: Bot,
+        dream_gate: DreamGate | None = None,
+    ) -> None:
         """Create the API client, toolbox and the (empty) context window."""
-        self.client = AsyncOpenAI(
-            api_key=settings.api_key,
-            base_url=settings.base_url,
-        )
-        self.model = settings.model
-        prompts = load_prompts(settings.prompts_path)
-        self.base_prompt = prompts.system
+        client = AsyncOpenAI(api_key=settings.api_key, base_url=settings.base_url)
+        self.prompts = load_prompts(settings.prompts_path)
+        self.base_prompt = self.prompts.system
         if settings.roleplay:
-            self.base_prompt += "\n" + prompts.roleplay
+            self.base_prompt += "\n" + self.prompts.roleplay
         if settings.web_search:
-            self.base_prompt += "\n" + prompts.web_search
-        self.db = db
+            self.base_prompt += "\n" + self.prompts.web_search
         self.tz = ZoneInfo(settings.timezone)
         self.mind = Mind(settings.memory_dir)
         self.mind.ensure()
-        self.tools = Toolbox(
-            db,
-            bot,
-            self.tz,
-            self.client,
-            settings.recall_model or settings.model,
-            self.mind,
-            settings.typing_chars_per_second,
-            prompts.recall,
-            prompts.summary,
+        dreaming = dream_gate is not None and settings.dream_daily_budget > 0
+        if dreaming:
+            self.base_prompt += "\n" + self.prompts.dream_tool
+        reasoning: dict[str, Any] = {}
+        if settings.reasoning_effort is not None:
+            reasoning["effort"] = settings.reasoning_effort
+        if settings.reasoning_context != "omit":
+            reasoning["context"] = settings.reasoning_context
+        super().__init__(
+            client=client,
+            model=settings.model,
+            db=db,
+            tools=Toolbox(
+                db,
+                bot,
+                self.tz,
+                client,
+                settings.recall_model or settings.model,
+                self.mind,
+                settings.typing_chars_per_second,
+                self.prompts.recall,
+                self.prompts.summary,
+                dream_gate=dream_gate if dreaming else None,
+            ),
+            api_tools=build_tools(settings.web_search, dreaming=dreaming),
+            reasoning=cast(Reasoning, reasoning) if reasoning else omit,
         )
         # Max model/tool rounds per turn (one turn per batch of events).
         self.max_rounds = settings.max_rounds
@@ -77,17 +96,13 @@ class Agent:
         # append. Cache keys/breakpoints still determine actual hits.
         self.max_context_items = settings.context_max_items
         self.trim_context_items = settings.context_trim_items
-        self._context: list[dict[str, Any]] = []
         self._queue: asyncio.Queue[str] = asyncio.Queue()
-        self._api_tools = build_tools(settings.web_search)
-        reasoning: dict[str, Any] = {}
-        if settings.reasoning_effort is not None:
-            reasoning["effort"] = settings.reasoning_effort
-        if settings.reasoning_context != "omit":
-            reasoning["context"] = settings.reasoning_context
-        self._reasoning: Reasoning | Omit = (
-            cast(Reasoning, reasoning) if reasoning else omit
-        )
+        # Held for the whole of a turn. The dreaming loop takes the same
+        # lock, which is how "the agent sleeps while it dreams" works:
+        # a dream waits for the turn in flight and blocks the next one.
+        self.turn_lock = asyncio.Lock()
+        # When the agent last finished a turn — the dream idle trigger.
+        self.last_active = datetime.now(UTC)
         self.prune_completed_reasoning = settings.prune_completed_reasoning
 
     async def load(self) -> None:
@@ -127,23 +142,26 @@ class Agent:
         All events queued by the time one is picked up are appended as a
         single batch, then the agent takes one thinking/acting turn.
         Failures are logged, dangling context is repaired and the loop
-        moves on.
+        moves on. While the dreaming loop holds the turn lock, events
+        simply pile up in the queue and land as one batch on waking.
         """
         while True:
             events = [await self._queue.get()]
             while not self._queue.empty():
                 events.append(self._queue.get_nowait())
-            for event in events:
-                await self._remember({"role": "user", "content": event})
-            try:
-                await self._turn()
-            except Exception:
-                log.exception("agent turn failed")
-                self._context = self._trim_dangling(self._context)
+            async with self.turn_lock:
+                for event in events:
+                    await self._remember({"role": "user", "content": event})
+                try:
+                    await self._turn()
+                except Exception:
+                    log.exception("agent turn failed")
+                    self._context = self._trim_dangling(self._context)
+            self.last_active = datetime.now(UTC)
 
     async def _remember(self, item: dict[str, Any]) -> None:
         """Append an item to the window and the persistent history."""
-        self._context.append(item)
+        await super()._remember(item)
         await self.db.append_context(item)
         if len(self._context) > self.max_context_items:
             self._context = self._trim_to_boundary(
@@ -210,40 +228,9 @@ class Agent:
         turn_status = "failed"
         try:
             for _ in range(self.max_rounds):
-                input_context_id = await self.db.latest_context_id()
-                response = await self.client.responses.create(
-                    model=self.model,
-                    instructions=instructions,
-                    input=cast(ResponseInputParam, self._context),
-                    tools=self._api_tools,
-                    # Nothing is stored server-side; encrypted reasoning must
-                    # ride along in the context for multi-round tool turns.
-                    store=False,
-                    include=["reasoning.encrypted_content"],
-                    reasoning=self._reasoning,
-                )
-                await self._record_usage(response, turn_id, input_context_id)
-                for item in response.output:
-                    await self._remember(
-                        item.model_dump(mode="json", exclude_none=True)
-                    )
-                calls = [
-                    item for item in response.output if item.type == "function_call"
-                ]
-                if not calls:
-                    if response.output_text:
-                        log.info("agent final output: %s", response.output_text)
+                if not await self._round(instructions, turn_id):
                     turn_status = "completed"
                     return
-                for call in calls:
-                    result = await self.tools.run(call.name, call.arguments)
-                    await self._remember(
-                        {
-                            "type": "function_call_output",
-                            "call_id": call.call_id,
-                            "output": result,
-                        }
-                    )
             turn_status = "max_rounds"
             log.warning("agent hit max_rounds without settling")
         finally:
@@ -269,41 +256,3 @@ class Agent:
         self._context[start:] = kept
         if removed:
             log.debug("pruned %d completed-turn reasoning/output items", removed)
-
-    async def _record_usage(
-        self,
-        response: Any,
-        turn_id: int,
-        input_context_id: int,
-    ) -> None:
-        """Persist and log authoritative usage returned by OpenAI."""
-        usage = getattr(response, "usage", None)
-        if usage is None:
-            return
-        input_details = getattr(usage, "input_tokens_details", None)
-        output_details = getattr(usage, "output_tokens_details", None)
-        cached_tokens = getattr(input_details, "cached_tokens", 0) or 0
-        cache_write_tokens = getattr(input_details, "cache_write_tokens", 0) or 0
-        reasoning_tokens = getattr(output_details, "reasoning_tokens", 0) or 0
-        await self.db.append_api_usage(
-            response_id=getattr(response, "id", None),
-            turn_id=turn_id,
-            input_context_id=input_context_id,
-            model=getattr(response, "model", None) or self.model,
-            input_tokens=usage.input_tokens,
-            cached_tokens=cached_tokens,
-            cache_write_tokens=cache_write_tokens,
-            output_tokens=usage.output_tokens,
-            reasoning_tokens=reasoning_tokens,
-            total_tokens=usage.total_tokens,
-        )
-        log.info(
-            "api usage: input=%d cached=%d cache_write=%d "
-            "output=%d reasoning=%d total=%d",
-            usage.input_tokens,
-            cached_tokens,
-            cache_write_tokens,
-            usage.output_tokens,
-            reasoning_tokens,
-            usage.total_tokens,
-        )

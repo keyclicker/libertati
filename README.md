@@ -13,23 +13,32 @@ when to reply. Plain assistant output is ignored and sends nothing.
 - **Single brain** (`agent.py`): events queue up and are processed one
   batch at a time on the OpenAI Responses API; the full context history
   is persisted append-only in SQLite, with a capped tail window sent to
-  the model.
+  the model. The model/tool round engine itself lives in `loop.py` and
+  is shared with the dreaming loop.
 - **Tools** (`tools.py`): `send_message`, `get_recent_messages`, and
   `schedule_wakeup` — the agent can set alarms for its future self.
+- **Dreaming** (`dream.py`): after a stretch of idleness — or when the
+  agent calls `dream` itself — the waking loop pauses and a
+  differently-prompted loop runs one long offline session. It wanders
+  with read-only and web tools, writes a reflection into `DREAMS.md`,
+  folds `INBOX.md` into a rewritten `MEMORY.md`, and may revise
+  `SOUL.md`. None of a dream's context is persisted; the agent wakes to
+  a `[dream ended …]` event carrying its summary. Budgeted per 24h.
 - **Wiring** (`bot.py`): aiogram handlers persist every message and push
-  it as an event; background loops deliver due wakeups and periodic
-  heartbeat status digests.
+  it as an event; background loops deliver due wakeups, periodic
+  heartbeat status digests, and hand the agent over to a dream.
 - **Storage** (`db.py`): SQLite (WAL) with full raw Telegram payloads,
   append-only model context, and exact API token/cache usage.
-- **Mind** (`memory.py`): three markdown files under `data/memory/`,
+- **Mind** (`memory.py`): four markdown files under `data/memory/`,
   editable by hand at any time. `SOUL.md` is the personality, re-read
-  and attached to the instructions every turn. `MEMORY.md` is the
-  long-term fact store: the `remember` tool appends to it, the `recall`
-  tool answers questions from it with a one-shot extraction call (it is
-  never inlined into the agent's context). `DIARY.md` is reserved for
-  the upcoming Dreaming loop.
-- **Prompts** (`prompts.toml`): user-editable agent, roleplay, web-search
-  and memory-helper instructions loaded at startup.
+  and attached to the instructions every turn. `INBOX.md` is where the
+  `remember` tool drops raw dated facts. `MEMORY.md` is the curated
+  long-term store the `recall` tool answers questions from with a
+  one-shot extraction call (it is never inlined into the agent's
+  context) — only a dream rewrites it. `DREAMS.md` is the dream
+  journal. Every soul rewrite is snapshotted under `soul/` first.
+- **Prompts** (`prompts.toml`): user-editable agent, roleplay,
+  web-search, dream and memory-helper instructions loaded at startup.
 
 ## Setup
 

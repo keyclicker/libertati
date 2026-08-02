@@ -57,7 +57,7 @@ class Settings(BaseSettings):
     web_search: bool = False
     log_level: str = "INFO"
     db_path: Path = Path("data/libertati.db")
-    # Directory holding SOUL.md / MEMORY.md / DIARY.md.
+    # Directory holding SOUL.md / MEMORY.md / INBOX.md / DREAMS.md.
     memory_dir: Path = Path("data/memory")
     # Approval mode: when on, only chats marked true in chats_path reach
     # the agent; new chats are appended there as false for review.
@@ -78,6 +78,20 @@ class Settings(BaseSettings):
     # Simulated typing speed for outgoing messages, chars/second
     # (0 disables the typing emulation).
     typing_chars_per_second: float = 15.0
+    # Dreams allowed in a rolling 24 hours (0 disables dreaming, which
+    # also hides the `dream` tool from the waking agent).
+    dream_daily_budget: int = 4
+    # Quiet minutes before the agent falls asleep on its own.
+    dream_idle_minutes: int = 300
+    # Minimum gap between the end of one dream and the start of the next.
+    dream_cooldown_minutes: int = 120
+    # Tool calls a dream must take (wake_up included) before wake_up is
+    # accepted — a dream is meant to wander, not to tidy up and leave.
+    dream_min_steps: int = 12
+    # Hard cap on model/tool rounds in one dream.
+    dream_max_rounds: int = 25
+    # Model used while dreaming; None = main model.
+    dream_model: str | None = None
 
     @model_validator(mode="after")
     def _validate_context_window(self) -> "Settings":
@@ -89,6 +103,20 @@ class Settings(BaseSettings):
         if self.prune_completed_reasoning and self.reasoning_context != "current_turn":
             raise ValueError(
                 "prune_completed_reasoning requires reasoning_context='current_turn'"
+            )
+        return self
+
+    @model_validator(mode="after")
+    def _validate_dreaming(self) -> "Settings":
+        """Reject dream settings that could never produce a dream."""
+        if self.dream_daily_budget < 0:
+            raise ValueError("dream_daily_budget must not be negative")
+        if self.dream_max_rounds < 1:
+            raise ValueError("dream_max_rounds must be positive")
+        if self.dream_min_steps > self.dream_max_rounds:
+            raise ValueError(
+                "dream_min_steps must not exceed dream_max_rounds,"
+                " or no dream could ever wake up on its own"
             )
         return self
 
