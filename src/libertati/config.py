@@ -19,6 +19,10 @@ class Settings(BaseSettings):
     value wins: real environment variables (``LIBERTATI_*``), the ``.env``
     file (secrets), ``settings.toml`` (non-secret settings), then field
     defaults.
+
+    ``settings.toml`` ships every non-secret setting explicitly and is the
+    file to edit. The defaults below only keep the app runnable without
+    it; the two are grouped in the same order so they read side by side.
     """
 
     model_config = SettingsConfigDict(
@@ -28,8 +32,33 @@ class Settings(BaseSettings):
         extra="ignore",
     )
 
+    # ==========================================================
+    #                         Secrets
+    # ==========================================================
+
     bot_token: str
     api_key: str
+
+    # ==========================================================
+    #                         Runtime
+    # ==========================================================
+
+    log_level: str = "INFO"
+    # Timezone the agent lives in (event timestamps, wakeup scheduling).
+    timezone: str = "UTC"
+
+    # ==========================================================
+    #                         Storage
+    # ==========================================================
+
+    db_path: Path = Path("data/libertati.db")
+    # Directory holding SOUL.md / MEMORY.md / INBOX.md / DREAMS.md.
+    memory_dir: Path = Path("data/memory")
+
+    # ==========================================================
+    #                     Model & reasoning
+    # ==========================================================
+
     # Any OpenAI-compatible endpoint (OpenRouter, local, …); None = OpenAI.
     base_url: str | None = None
     model: str
@@ -45,39 +74,60 @@ class Settings(BaseSettings):
     # window after each turn. Full history remains in SQLite; enabling
     # this can reduce prompt-cache reuse for the completed-turn suffix.
     prune_completed_reasoning: bool = False
+    # Model for the one-shot recall extraction behind `recall` and
+    # `summarize_memory`; None = main model.
+    recall_model: str | None = None
+    # Reasoning effort for that extraction call. It is a lookup, not a
+    # problem to think about, so "none" is the sensible setting where the
+    # model supports it; None sends no preference.
+    recall_reasoning_effort: str | None = None
+    # Model used while dreaming; None = main model.
+    dream_model: str | None = None
+
+    # ==========================================================
+    #                      Context window
+    # ==========================================================
+
+    # Cut back to context_trim_items once the window grows past
+    # context_max_items. Trimming in chunks keeps the prompt prefix
+    # byte-stable between trims instead of rewriting it on every append.
+    context_max_items: int = 300
+    context_trim_items: int = 200
+    # Max model/tool rounds per agent turn (one turn per event batch).
+    max_rounds: int = 8
+
+    # ==========================================================
+    #                         Persona
+    # ==========================================================
+
     # User-editable agent and memory prompts.
     prompts_path: Path = Path("prompts.toml")
     # Harden the persona: never break character, never admit to being a
     # bot/assistant, never discuss internals, no free assistant labor.
     roleplay: bool = False
-    # Model for the one-shot recall extraction; None = main model.
-    recall_model: str | None = None
     # Enable OpenAI's built-in web search tool (server-side; most
     # OpenAI-compatible endpoints don't support it).
     web_search: bool = False
-    log_level: str = "INFO"
-    db_path: Path = Path("data/libertati.db")
-    # Directory holding SOUL.md / MEMORY.md / INBOX.md / DREAMS.md.
-    memory_dir: Path = Path("data/memory")
+
+    # ==========================================================
+    #                    Chats & presence
+    # ==========================================================
+
     # Approval mode: when on, only chats marked true in chats_path reach
     # the agent; new chats are appended there as false for review.
     chat_approval: bool = False
     # Chat approval registry (user-editable TOML, re-read live).
     chats_path: Path = Path("data/chats.toml")
-    # Max model/tool rounds per agent turn (one turn per event batch).
-    max_rounds: int = 8
-    # Context window: cut back to context_trim_items once it grows past
-    # context_max_items. Trimming in chunks keeps the prompt prefix
-    # byte-stable between trims instead of rewriting it on every append.
-    context_max_items: int = 300
-    context_trim_items: int = 200
-    # Timezone the agent lives in (event timestamps, wakeup scheduling).
-    timezone: str = "UTC"
     # Minutes between heartbeat status events (0 disables, ±20% jitter).
     heartbeat_minutes: int = 180
     # Simulated typing speed for outgoing messages, chars/second
     # (0 disables the typing emulation).
     typing_chars_per_second: float = 15.0
+
+    # ==========================================================
+    #                         Dreaming
+    # ==========================================================
+
     # Dreams allowed in a rolling 24 hours (0 disables dreaming, which
     # also hides the `dream` tool from the waking agent).
     dream_daily_budget: int = 4
@@ -90,8 +140,6 @@ class Settings(BaseSettings):
     dream_min_steps: int = 12
     # Hard cap on model/tool rounds in one dream.
     dream_max_rounds: int = 25
-    # Model used while dreaming; None = main model.
-    dream_model: str | None = None
 
     @model_validator(mode="after")
     def _validate_context_window(self) -> "Settings":

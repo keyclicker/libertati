@@ -105,6 +105,7 @@ def make_settings(**overrides: Any) -> Any:
         "model": "main-model",
         "dream_model": None,
         "recall_model": None,
+        "recall_reasoning_effort": None,
         "web_search": False,
         "typing_chars_per_second": 15.0,
         "dream_idle_minutes": 45,

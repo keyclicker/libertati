@@ -26,8 +26,9 @@ from aiogram.enums import ParseMode
 from aiogram.exceptions import TelegramBadRequest
 from aiogram.types import Message, ReactionTypeEmoji, ReplyParameters
 from aiogram.utils.chat_action import ChatActionSender
-from openai import AsyncOpenAI
+from openai import AsyncOpenAI, Omit, omit
 from openai.types.responses import ToolParam
+from openai.types.shared_params import Reasoning
 
 from libertati import clock
 from libertati.db import Database
@@ -790,6 +791,7 @@ class Toolbox:
         recall_prompt: str,
         summary_prompt: str,
         *,
+        recall_effort: str | None = None,
         allowed: frozenset[str] | None = None,
         dream_gate: "DreamGate | None" = None,
         dream_min_steps: int = 0,
@@ -804,6 +806,7 @@ class Toolbox:
         self.typing_chars_per_second = typing_chars_per_second
         self.recall_prompt = recall_prompt
         self.summary_prompt = summary_prompt
+        self.recall_effort = recall_effort
         self.dream_gate = dream_gate
         self.dream_min_steps = dream_min_steps
         #: Tool calls dispatched so far; the dreaming loop resets it per
@@ -1104,11 +1107,20 @@ class Toolbox:
         return f"remembered: {text}"
 
     async def _read_memory(self, instructions: str, input_text: str) -> str:
-        """Run one no-loop extraction call over the memory notes."""
+        """Run one no-loop extraction call over the memory notes.
+
+        Reasoning effort is configurable and meant to be turned off: the
+        call reads notes that are already in the input and answers from
+        them, so thinking tokens buy little and are paid on every recall.
+        """
+        reasoning: Reasoning | Omit = omit
+        if self.recall_effort is not None:
+            reasoning = cast(Reasoning, {"effort": self.recall_effort})
         response = await self.client.responses.create(
             model=self.recall_model,
             instructions=instructions,
             input=input_text,
+            reasoning=reasoning,
             store=False,
         )
         return response.output_text or "recall came back empty"

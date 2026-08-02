@@ -68,9 +68,8 @@ def test_pruning_requires_current_turn_reasoning() -> None:
 def test_dream_defaults_valid() -> None:
     """The shipped dream knobs pass validation."""
     settings = make_settings()
-    assert settings.dream_daily_budget == 4
+    assert settings.dream_daily_budget > 0
     assert settings.dream_min_steps < settings.dream_max_rounds
-    assert settings.dream_model is None
 
 
 def test_dreaming_can_be_disabled_with_a_zero_budget() -> None:

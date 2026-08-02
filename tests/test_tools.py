@@ -10,7 +10,7 @@ import pytest
 from aiogram import Bot
 from aiogram.enums import ParseMode
 from aiogram.exceptions import TelegramBadRequest
-from openai import AsyncOpenAI
+from openai import AsyncOpenAI, Omit
 
 from libertati.db import Database
 from libertati.memory import DEFAULT_SOUL, MEMORY_MAX_CHARS, SOUL_MAX_CHARS, Mind
@@ -574,6 +574,31 @@ async def test_recall_extracts_from_notes(tmp_path: Path) -> None:
     assert "cat named Bober" in call["input"]
     assert "cat name?" in call["input"]
     assert call["store"] is False
+
+
+async def test_recall_omits_reasoning_by_default(tmp_path: Path) -> None:
+    """Without a configured effort the call sends no reasoning preference."""
+    mind = make_mind(tmp_path)
+    mind.append_inbox("cat named Bober", "Sun 2026-08-02 12:00")
+    client = FakeClient()
+    toolbox = make_toolbox(client=client, mind=mind)
+    await toolbox.run("recall", json.dumps({"query": "cat name?"}))
+    (call,) = client.calls
+    assert isinstance(call["reasoning"], Omit)
+
+
+async def test_recall_passes_configured_reasoning_effort(tmp_path: Path) -> None:
+    """A configured effort rides along on both memory-reading calls."""
+    mind = make_mind(tmp_path)
+    mind.append_inbox("cat named Bober", "Sun 2026-08-02 12:00")
+    client = FakeClient()
+    toolbox = make_toolbox(client=client, mind=mind, recall_effort="none")
+    await toolbox.run("recall", json.dumps({"query": "cat name?"}))
+    await toolbox.run("summarize_memory", "{}")
+    assert [call["reasoning"] for call in client.calls] == [
+        {"effort": "none"},
+        {"effort": "none"},
+    ]
 
 
 async def test_summarize_memory_short_circuits_on_empty(tmp_path: Path) -> None:

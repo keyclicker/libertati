@@ -50,9 +50,10 @@ $EDITOR settings.toml     # model, timezone, heartbeat, persona
 uv run libertati
 ```
 
-Any OpenAI-compatible endpoint works (OpenAI, OpenRouter, local) — see
-`settings.toml` for `base_url`/`model` examples. All settings can be
-overridden with `LIBERTATI_*` environment variables.
+`settings.toml` carries every non-secret setting explicitly, grouped by
+area — nothing is hidden in code defaults. Any OpenAI-compatible endpoint
+works (OpenAI, OpenRouter, local); set `base_url`/`model` there. All
+settings can be overridden with `LIBERTATI_*` environment variables.
 
 ## Docker
 

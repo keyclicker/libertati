@@ -83,6 +83,7 @@ class Agent(ModelLoop):
                 settings.typing_chars_per_second,
                 self.prompts.recall,
                 self.prompts.summary,
+                recall_effort=settings.recall_reasoning_effort,
                 dream_gate=dream_gate if dreaming else None,
             ),
             api_tools=build_tools(settings.web_search, dreaming=dreaming),
