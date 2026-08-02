@@ -71,7 +71,10 @@ One package, `src/libertati/`, no sub-packages:
 
 Three places, all in `tools.py`: a strict-mode JSON schema in the right
 `*_TOOLS` list, an async `_handler(self, args)` on `Toolbox`, and an
-entry in `self._handlers`. Strict schemas mean handlers can trust
+entry in `self._handlers`. A tool that reads or acts on a specific chat
+must also list its chat-id argument(s) in `GATED_CHAT_ARGS` so the
+approval registry is enforced before the handler runs (a test asserts
+this for every schema parameter named like a chat id). Strict schemas mean handlers can trust
 argument types; optional parameters are `["type", "null"]` and still
 listed in `required`. Handlers return plain strings (JSON for lists)
 and never raise — `Toolbox.run` converts exceptions to `error: …`

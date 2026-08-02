@@ -41,6 +41,11 @@ DREAM_POLL_SECONDS = 60
 EVENT_TEXT_LIMIT = 1000
 
 
+def one_line(text: str | None) -> str:
+    """Collapse whitespace runs (newlines included) to single spaces."""
+    return " ".join((text or "").split())
+
+
 class PersistMiddleware(BaseMiddleware):
     """Store every incoming (or edited) message before it is handled.
 
@@ -65,9 +70,15 @@ class PersistMiddleware(BaseMiddleware):
 
 
 def format_event(message: Message, tz: ZoneInfo) -> str:
-    """Format an incoming message as a one-line event for the agent."""
+    """Format an incoming message as a one-line event for the agent.
+
+    Strictly one line: every interpolated field is sender-controlled, and
+    a body (or name) containing a newline could otherwise forge extra
+    event lines — a fake wakeup, a fake message from another chat — and
+    steer the agent. Newlines in the body survive as a literal backslash-n.
+    """
     chat = message.chat
-    title = f" “{chat.title}”" if chat.title else ""
+    title = f" “{one_line(chat.title)}”" if chat.title else ""
     where = f"chat {chat.id} ({chat.type}{title})"
     user = message.from_user
     if user is None:
@@ -80,10 +91,12 @@ def format_event(message: Message, tz: ZoneInfo) -> str:
     if message.reply_to_message is not None:
         ref += f", replying to msg {message.reply_to_message.message_id}"
     body = message.text or message.caption or f"<{message.content_type}>"
+    body = "\\n".join(body.splitlines())
     if len(body) > EVENT_TEXT_LIMIT:
         body = body[:EVENT_TEXT_LIMIT] + f" […{len(body) - EVENT_TEXT_LIMIT} chars]"
     return (
-        f"[{clock.format_local(message.date, tz)}] {where} | {sender} ({ref}): {body}"
+        f"[{clock.format_local(message.date, tz)}] {where} | {one_line(sender)}"
+        f" ({ref}): {body}"
     )
 
 
@@ -255,11 +268,11 @@ async def run() -> None:
 
     bot = Bot(token=settings.bot_token)
     dream_gate = DreamGate(db, settings.dream_daily_budget)
-    agent = Agent(settings, db, bot, dream_gate)
+    registry = ChatRegistry(settings.chats_path, settings.chat_approval)
+    agent = Agent(settings, db, bot, registry, dream_gate)
     await agent.load()
     tz = agent.tz
     dreamer = Dreamer(settings, db, bot, agent, dream_gate)
-    registry = ChatRegistry(settings.chats_path, settings.chat_approval)
     tasks = [
         asyncio.create_task(agent.run_forever()),
         asyncio.create_task(wakeup_loop(agent, db, tz)),

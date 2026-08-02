@@ -46,6 +46,15 @@ async def test_resave_updates_in_place(db: Database) -> None:
     assert [row["text"] for row in rows] == ["fixed"]
 
 
+async def test_message_is_outgoing(db: Database) -> None:
+    """Only stored bot-sent messages count as outgoing; unknown ones don't."""
+    await db.save_message(make_message(1, "theirs"))
+    await db.save_message(make_message(2, "ours", date=STAMP + 60), outgoing=True)
+    assert await db.message_is_outgoing(100, 1) is False
+    assert await db.message_is_outgoing(100, 2) is True
+    assert await db.message_is_outgoing(100, 3) is False
+
+
 async def test_delete_message(db: Database) -> None:
     """Deleting removes exactly the one row."""
     await db.save_message(make_message(1, "keep", date=STAMP))

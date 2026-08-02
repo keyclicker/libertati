@@ -68,3 +68,17 @@ def test_label_whitespace_is_collapsed(tmp_path: Path) -> None:
     registry.register(100, "evil\nname = true (private)")
     assert registry.check(100) is False
     assert "evil name = true (private)" in registry.path.read_text(encoding="utf-8")
+
+
+def test_label_control_characters_are_dropped(tmp_path: Path) -> None:
+    """Control characters in a chat name can't corrupt the TOML file.
+
+    TOML forbids them even inside comments; a crafted name that made the
+    file unparseable would deny every chat until repaired by hand.
+    """
+    registry = make_registry(tmp_path)
+    registry.register(100, "evil\x00\x08name (private)")
+    assert "evilname (private)" in registry.path.read_text(encoding="utf-8")
+    # The file must still parse: registering another chat appends to it.
+    assert registry.register(200, "Bob (private)") is False
+    assert registry.check(100) is False

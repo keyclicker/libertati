@@ -11,6 +11,7 @@ from zoneinfo import ZoneInfo
 import pytest
 
 from libertati.agent import Agent
+from libertati.chats import ChatRegistry
 from libertati.db import Database
 from libertati.dream import Dreamer, DreamGate
 from libertati.memory import Mind
@@ -85,6 +86,7 @@ class FakeAgent:
         self.client = client
         self.reasoning = {"effort": "low"}
         self.tz = UTC_TZ
+        self.registry = ChatRegistry(Path("unused-chats.toml"), enabled=False)
         self.turn_lock = asyncio.Lock()
         self.last_active = datetime.now(UTC) - timedelta(minutes=idle_minutes)
         self.pushed: list[str] = []

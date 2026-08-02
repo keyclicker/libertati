@@ -625,6 +625,19 @@ class Database:
         async with self.conn.execute(query, (limit,)) as cursor:
             return [dict(row) for row in await cursor.fetchall()]
 
+    async def message_is_outgoing(self, chat_id: int, message_id: int) -> bool:
+        """Whether a stored message was sent by the bot itself.
+
+        Unknown messages are not outgoing: every message the bot sends is
+        persisted, so "not stored" means "not ours to touch".
+        """
+        async with self.conn.execute(
+            "SELECT outgoing FROM messages WHERE chat_id = ? AND message_id = ?",
+            (chat_id, message_id),
+        ) as cursor:
+            row = await cursor.fetchone()
+        return bool(row and row["outgoing"])
+
     async def delete_message(self, chat_id: int, message_id: int) -> None:
         """Remove a message row (mirrors a deletion done on Telegram)."""
         await self.conn.execute(

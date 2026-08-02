@@ -21,6 +21,7 @@ from aiogram import Bot
 from openai import AsyncOpenAI, omit
 from openai.types.shared_params import Reasoning
 
+from libertati.chats import ChatRegistry
 from libertati.config import Settings
 from libertati.db import Database
 from libertati.dream import DreamGate
@@ -48,10 +49,12 @@ class Agent(ModelLoop):
         settings: Settings,
         db: Database,
         bot: Bot,
+        registry: ChatRegistry,
         dream_gate: DreamGate | None = None,
     ) -> None:
         """Create the API client, toolbox and the (empty) context window."""
         client = AsyncOpenAI(api_key=settings.api_key, base_url=settings.base_url)
+        self.registry = registry
         self.prompts = load_prompts(settings.prompts_path)
         self.base_prompt = self.prompts.system
         if settings.roleplay:
@@ -83,6 +86,7 @@ class Agent(ModelLoop):
                 settings.typing_chars_per_second,
                 self.prompts.recall,
                 self.prompts.summary,
+                registry=registry,
                 recall_effort=settings.recall_reasoning_effort,
                 dream_gate=dream_gate if dreaming else None,
             ),

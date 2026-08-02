@@ -104,6 +104,7 @@ class Dreamer(ModelLoop):
                 settings.typing_chars_per_second,
                 agent.prompts.recall,
                 agent.prompts.summary,
+                registry=agent.registry,
                 recall_effort=settings.recall_reasoning_effort,
                 allowed=DREAM_TOOL_NAMES,
                 dream_min_steps=settings.dream_min_steps,

@@ -31,6 +31,7 @@ from openai.types.responses import ToolParam
 from openai.types.shared_params import Reasoning
 
 from libertati import clock
+from libertati.chats import ChatRegistry
 from libertati.db import Database
 from libertati.memory import Mind
 
@@ -751,6 +752,26 @@ DREAM_TOOL_NAMES: frozenset[str] = function_names(DREAM_API_TOOLS)
 #: activity for the dream idle clock, unlike read-only lookups.
 OUTWARD_TOOL_NAMES: frozenset[str] = function_names(MESSAGING_TOOLS)
 
+#: Chat-id arguments checked against the approval registry before a
+#: handler runs. The incoming-event gate in ``bot.py`` is not enough on
+#: its own: unapproved chats are still persisted, and every handler
+#: takes chat ids straight from the model — without this map a steered
+#: agent could read an unapproved chat's history or message into it.
+#: Every tool that reads or acts on a specific chat must appear here.
+GATED_CHAT_ARGS: dict[str, tuple[str, ...]] = {
+    "send_message": ("chat_id",),
+    "send_sticker": ("chat_id",),
+    "forward_message": ("from_chat_id", "to_chat_id"),
+    "react": ("chat_id",),
+    "edit_message": ("chat_id",),
+    "delete_message": ("chat_id",),
+    "get_chat_info": ("chat_id",),
+    "list_chat_members": ("chat_id",),
+    "get_recent_messages": ("chat_id",),
+    "get_message_thread": ("chat_id",),
+    "search_messages": ("chat_id",),
+}
+
 
 def build_tools(web_search: bool, *, dreaming: bool = False) -> list[ToolParam]:
     """Return the tool list for the API, optionally with built-in web search.
@@ -795,6 +816,7 @@ class Toolbox:
         recall_prompt: str,
         summary_prompt: str,
         *,
+        registry: ChatRegistry,
         recall_effort: str | None = None,
         allowed: frozenset[str] | None = None,
         dream_gate: "DreamGate | None" = None,
@@ -804,6 +826,7 @@ class Toolbox:
         self.db = db
         self.bot = bot
         self.tz = tz
+        self.registry = registry
         self.client = client
         self.recall_model = recall_model
         self.mind = mind
@@ -876,6 +899,10 @@ class Toolbox:
             args = json.loads(arguments or "{}")
         except json.JSONDecodeError:
             return "error: invalid tool arguments"
+        for key in GATED_CHAT_ARGS.get(name, ()):
+            chat_id = args.get(key)
+            if isinstance(chat_id, int) and not self.registry.check(chat_id):
+                return f"error: chat {chat_id} is not approved"
         self.steps += 1
         if name in OUTWARD_TOOL_NAMES:
             self.outward_calls += 1
@@ -987,7 +1014,18 @@ class Toolbox:
         return f"edited message {args['message_id']} in chat {args['chat_id']}"
 
     async def _delete_message(self, args: dict[str, Any]) -> str:
-        """Delete one of the bot's own messages on Telegram and in the DB."""
+        """Delete one of the bot's own messages on Telegram and in the DB.
+
+        Ownership is enforced here, not left to Telegram: a bot that is a
+        group admin may delete anyone's message, and the tool must not be
+        steerable into erasing other people's words (or their stored
+        history).
+        """
+        if not await self.db.message_is_outgoing(args["chat_id"], args["message_id"]):
+            return (
+                f"error: message {args['message_id']} in chat "
+                f"{args['chat_id']} is not one of your own messages"
+            )
         await self.bot.delete_message(args["chat_id"], args["message_id"])
         await self.db.delete_message(args["chat_id"], args["message_id"])
         return f"deleted message {args['message_id']} in chat {args['chat_id']}"
@@ -1038,8 +1076,16 @@ class Toolbox:
     # ==========================================================
 
     async def _list_chats(self, args: dict[str, Any]) -> str:
-        """Return all known chats with names and activity stats as JSON."""
-        chats = await self.db.list_chats()
+        """Return approved chats with names and activity stats as JSON.
+
+        Unapproved chats are persisted too, so the raw list would name
+        chats the agent isn't allowed to see (let alone act on).
+        """
+        chats = [
+            chat
+            for chat in await self.db.list_chats()
+            if self.registry.check(chat["chat_id"])
+        ]
         if not chats:
             return "no chats yet"
         return json.dumps(chats, ensure_ascii=False)

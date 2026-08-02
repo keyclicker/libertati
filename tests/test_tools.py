@@ -12,10 +12,13 @@ from aiogram.enums import ParseMode
 from aiogram.exceptions import TelegramBadRequest
 from openai import AsyncOpenAI, Omit
 
+from libertati.chats import ChatRegistry
 from libertati.db import Database
 from libertati.memory import DEFAULT_SOUL, MEMORY_MAX_CHARS, SOUL_MAX_CHARS, Mind
 from libertati.tools import (
+    DREAM_API_TOOLS,
     DREAM_TOOL_NAMES,
+    GATED_CHAT_ARGS,
     MESSAGING_TOOLS,
     SLEEP_TOOLS,
     TOOLS,
@@ -32,6 +35,9 @@ UTC_TZ = ZoneInfo("UTC")
 RECALL_PROMPT = "test recall prompt"
 SUMMARY_PROMPT = "test summary prompt"
 
+#: Registry with approval mode off — allows everything, touches no file.
+OPEN_REGISTRY = ChatRegistry(Path("unused-chats.toml"), enabled=False)
+
 
 class FakeDB:
     """Records calls made by tool handlers."""
@@ -47,6 +53,7 @@ class FakeDB:
         self.members: list[dict] = []
         self.stickers: list[dict] = []
         self.deleted: list[tuple[int, int]] = []
+        self.outgoing_rows: set[tuple[int, int]] = set()
 
     async def recent_messages(
         self, chat_id: int, limit: int, before_message_id: int | None = None
@@ -87,6 +94,10 @@ class FakeDB:
     async def delete_message(self, chat_id: int, message_id: int) -> None:
         """Record the deletion."""
         self.deleted.append((chat_id, message_id))
+
+    async def message_is_outgoing(self, chat_id: int, message_id: int) -> bool:
+        """Report ownership from the canned outgoing set."""
+        return (chat_id, message_id) in self.outgoing_rows
 
     async def add_wakeup(self, due_at: str, note: str) -> int:
         """Record the wakeup and return a fixed id."""
@@ -230,6 +241,7 @@ def make_toolbox(
     bot: Any | None = None,
     client: Any | None = None,
     mind: Mind | None = None,
+    registry: ChatRegistry | None = None,
     **dream: Any,
 ) -> Toolbox:
     """Build a Toolbox around fakes."""
@@ -243,6 +255,7 @@ def make_toolbox(
         15.0,
         RECALL_PROMPT,
         SUMMARY_PROMPT,
+        registry=registry or OPEN_REGISTRY,
         **dream,
     )
 
@@ -334,14 +347,26 @@ async def test_edit_message() -> None:
 
 
 async def test_delete_message() -> None:
-    """Deletion hits Telegram and removes the stored row."""
+    """Deleting an own message hits Telegram and removes the stored row."""
     bot = RecordingBot()
     db = FakeDB()
+    db.outgoing_rows = {(1, 2)}
     args = {"chat_id": 1, "message_id": 2}
     result = await make_toolbox(db=db, bot=bot).run("delete_message", json.dumps(args))
     assert result == "deleted message 2 in chat 1"
     assert bot.deletes == [(1, 2)]
     assert db.deleted == [(1, 2)]
+
+
+async def test_delete_message_refuses_other_peoples_messages() -> None:
+    """A message the bot didn't send is refused before reaching Telegram."""
+    bot = RecordingBot()
+    db = FakeDB()
+    args = {"chat_id": 1, "message_id": 2}
+    result = await make_toolbox(db=db, bot=bot).run("delete_message", json.dumps(args))
+    assert result.startswith("error:")
+    assert bot.deletes == []
+    assert db.deleted == []
 
 
 async def test_send_sticker() -> None:
@@ -536,6 +561,97 @@ async def test_list_chats() -> None:
     db.chats = [{"chat_id": 100, "name": "Alice"}]
     result = await make_toolbox(db=db).run("list_chats", "{}")
     assert json.loads(result) == [{"chat_id": 100, "name": "Alice"}]
+
+
+# ==========================================================
+#                    Chat approval gating
+# ==========================================================
+
+
+def make_approving_registry(tmp_path: Path, approved: int) -> ChatRegistry:
+    """Build an enabled registry approving exactly one chat."""
+    path = tmp_path / "chats.toml"
+    path.write_text(f"{approved} = true\n", encoding="utf-8")
+    return ChatRegistry(path, enabled=True)
+
+
+async def test_unapproved_chat_is_refused_before_the_handler(
+    tmp_path: Path,
+) -> None:
+    """No tool reaches Telegram or the DB for an unapproved chat."""
+    bot = RecordingBot()
+    db = FakeDB()
+    toolbox = make_toolbox(
+        db=db, bot=bot, registry=make_approving_registry(tmp_path, approved=100)
+    )
+    send = {"chat_id": 200, "text": "hi", "reply_to_message_id": None}
+    result = await toolbox.run("send_message", json.dumps(send))
+    assert result == "error: chat 200 is not approved"
+    assert bot.sent_messages == []
+    history = {"chat_id": 200, "limit": None, "before_message_id": None}
+    result = await toolbox.run("get_recent_messages", json.dumps(history))
+    assert result == "error: chat 200 is not approved"
+    assert db.recent_calls == []
+    assert toolbox.steps == 0
+
+
+async def test_forward_message_gates_both_chats(tmp_path: Path) -> None:
+    """A forward is refused when either end is unapproved."""
+    bot = RecordingBot()
+    toolbox = make_toolbox(
+        bot=bot, registry=make_approving_registry(tmp_path, approved=100)
+    )
+    for args in (
+        {"to_chat_id": 100, "from_chat_id": 200, "message_id": 1},
+        {"to_chat_id": 200, "from_chat_id": 100, "message_id": 1},
+    ):
+        result = await toolbox.run("forward_message", json.dumps(args))
+        assert result == "error: chat 200 is not approved"
+    assert bot.forwards == []
+
+
+async def test_approved_chat_passes_the_gate(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The gate lets approved chats through to the handler."""
+    monkeypatch.setattr("libertati.tools.typing_delay", lambda text, cps: 0.0)
+    bot = RecordingBot()
+    toolbox = make_toolbox(
+        bot=bot, registry=make_approving_registry(tmp_path, approved=100)
+    )
+    send = {"chat_id": 100, "text": "hi", "reply_to_message_id": None}
+    result = await toolbox.run("send_message", json.dumps(send))
+    assert result.startswith("sent message 5 to chat 100")
+
+
+async def test_list_chats_hides_unapproved_chats(tmp_path: Path) -> None:
+    """Unapproved chats never show up in the chat list."""
+    db = FakeDB()
+    db.chats = [{"chat_id": 100, "name": "Alice"}, {"chat_id": 200, "name": "Eve"}]
+    toolbox = make_toolbox(
+        db=db, registry=make_approving_registry(tmp_path, approved=100)
+    )
+    result = await toolbox.run("list_chats", "{}")
+    assert json.loads(result) == [{"chat_id": 100, "name": "Alice"}]
+
+
+def test_every_chat_targeting_tool_is_gated() -> None:
+    """Any schema parameter naming a chat id must be in the gate map.
+
+    Guards the map against new tools that take a chat id but forget to
+    register it — the gate is the only thing standing between the model
+    and unapproved chats.
+    """
+    chat_keys = {"chat_id", "from_chat_id", "to_chat_id"}
+    for tool in [*TOOLS, *SLEEP_TOOLS, *DREAM_API_TOOLS]:
+        if tool["type"] != "function":
+            continue
+        schema = cast(dict[str, Any], tool)
+        expected = tuple(
+            key for key in schema["parameters"]["properties"] if key in chat_keys
+        )
+        gated = GATED_CHAT_ARGS.get(schema["name"], ())
+        assert set(gated) == set(expected), schema["name"]
 
 
 async def test_remember_appends_and_confirms(tmp_path: Path) -> None:

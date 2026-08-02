@@ -66,7 +66,14 @@ class ChatRegistry:
             return approvals[str(chat_id)] is True
         self.path.parent.mkdir(parents=True, exist_ok=True)
         header = "" if self.path.exists() else HEADER
-        comment = " ".join(label.split())
+        # The label is attacker-controlled (chat title / sender name).
+        # Collapsing whitespace kills line injection; dropping the
+        # remaining unprintable characters keeps a crafted name from
+        # rendering the whole TOML file unparseable — which would deny
+        # every chat until the user repairs it by hand.
+        comment = "".join(
+            char for char in " ".join(label.split()) if char.isprintable()
+        )
         with self.path.open("a", encoding="utf-8") as file:
             file.write(f"{header}{chat_id} = false  # {comment}\n")
         log.info("new chat %s (%s) awaiting approval in %s", chat_id, label, self.path)
