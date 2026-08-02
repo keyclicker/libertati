@@ -137,6 +137,7 @@ class RecordingBot:
 
     def __init__(self) -> None:
         """Start with no calls recorded."""
+        self.sent_messages: list[dict[str, Any]] = []
         self.reactions: list[tuple[int, int, list]] = []
         self.edits: list[dict[str, Any]] = []
         self.deletes: list[tuple[int, int]] = []
@@ -145,6 +146,15 @@ class RecordingBot:
         self.chat_info: Any = None
         self.member_count = 0
         self.admins: list[Any] = []
+
+    async def send_chat_action(self, *args: Any, **kwargs: Any) -> bool:
+        """Accept typing indicators silently."""
+        return True
+
+    async def send_message(self, chat_id: int, text: str, **kwargs: Any) -> Any:
+        """Record a sent message and return its minimal Telegram shape."""
+        self.sent_messages.append({"chat_id": chat_id, "text": text, **kwargs})
+        return SimpleNamespace(message_id=5, chat=SimpleNamespace(id=chat_id))
 
     async def set_message_reaction(
         self, chat_id: int, message_id: int, reaction: list | None = None
@@ -259,6 +269,26 @@ async def test_send_message_falls_back_to_plain_text(
     result = await make_toolbox(bot=bot).run("send_message", args)
     assert result.startswith("sent message 5 to chat 1")
     assert bot.parse_modes == [ParseMode.MARKDOWN, None]
+
+
+async def test_send_message_preserves_username_underscores(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Markdown escaping keeps underscores visible in Telegram mentions."""
+    monkeypatch.setattr("libertati.tools.typing_delay", lambda text, cps: 0.0)
+    bot = RecordingBot()
+    args = json.dumps(
+        {
+            "chat_id": 1,
+            "text": "hi @hermes_keyclicker_bot",
+            "reply_to_message_id": None,
+        }
+    )
+    result = await make_toolbox(bot=bot).run("send_message", args)
+    assert result.startswith("sent message 5 to chat 1")
+    (sent,) = bot.sent_messages
+    assert sent["text"] == r"hi @hermes\_keyclicker\_bot"
+    assert sent["parse_mode"] == ParseMode.MARKDOWN
 
 
 async def test_react_sets_and_removes() -> None:

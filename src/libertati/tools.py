@@ -15,6 +15,7 @@ import asyncio
 import json
 import logging
 import random
+import re
 from collections.abc import Awaitable, Callable
 from datetime import UTC, datetime
 from typing import Any
@@ -37,6 +38,18 @@ log = logging.getLogger(__name__)
 #: Bounds for the simulated typing time of outgoing messages.
 TYPING_MIN_SECONDS = 1.0
 TYPING_MAX_SECONDS = 8.0
+
+# Telegram's legacy Markdown parser treats underscores in an otherwise valid
+# @username as italic delimiters.  Protect mentions before enabling Markdown;
+# Telegram removes the escapes and still creates the mention entity.
+USERNAME_MENTION_RE = re.compile(r"(?<![\w@])@[A-Za-z0-9_]{5,32}(?![A-Za-z0-9_])")
+
+
+def escape_markdown_mentions(text: str) -> str:
+    """Escape underscores inside bare Telegram @username mentions."""
+    return USERNAME_MENTION_RE.sub(
+        lambda match: match.group(0).replace("_", r"\_"), text
+    )
 
 
 def typing_delay(text: str, chars_per_second: float) -> float:
@@ -91,7 +104,8 @@ MESSAGING_TOOLS: list[ToolParam] = [
                         "Message text. Telegram markdown only: *bold*, "
                         "_italic_, `code`, ```blocks```. Headers, tables "
                         "and list markup don't render — plain text and "
-                        "bare URLs instead."
+                        "bare URLs instead. Write @usernames normally; "
+                        "their underscores are escaped automatically."
                     ),
                 },
                 "reply_to_message_id": {
@@ -639,10 +653,11 @@ class Toolbox:
         reply_parameters = (
             ReplyParameters(message_id=reply_to) if reply_to is not None else None
         )
+        markdown_text = escape_markdown_mentions(args["text"])
         sent = await self._markdown_send(
             lambda parse_mode: self.bot.send_message(
                 args["chat_id"],
-                args["text"],
+                markdown_text if parse_mode else args["text"],
                 parse_mode=parse_mode,
                 reply_parameters=reply_parameters,
             )
@@ -704,9 +719,10 @@ class Toolbox:
 
     async def _edit_message(self, args: dict[str, Any]) -> str:
         """Rewrite one of the bot's own messages and persist the new text."""
+        markdown_text = escape_markdown_mentions(args["text"])
         edited = await self._markdown_send(
             lambda parse_mode: self.bot.edit_message_text(
-                text=args["text"],
+                text=markdown_text if parse_mode else args["text"],
                 chat_id=args["chat_id"],
                 message_id=args["message_id"],
                 parse_mode=parse_mode,
