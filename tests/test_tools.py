@@ -35,6 +35,7 @@ class FakeDB:
         """Start with empty call records."""
         self.recent_calls: list[tuple[int, int, int | None]] = []
         self.search_calls: list[tuple[int, str, int]] = []
+        self.thread_calls: list[tuple[int, int, int]] = []
         self.wakeups: list[tuple[str, str]] = []
         self.pending: list[dict] = []
         self.chats: list[dict] = []
@@ -54,6 +55,13 @@ class FakeDB:
     ) -> list[dict]:
         """Record the query and return no rows."""
         self.search_calls.append((chat_id, needle, limit))
+        return []
+
+    async def message_thread(
+        self, chat_id: int, message_id: int, limit: int
+    ) -> list[dict]:
+        """Record the query and return no rows."""
+        self.thread_calls.append((chat_id, message_id, limit))
         return []
 
     async def list_chats(self) -> list[dict]:
@@ -492,6 +500,17 @@ async def test_get_recent_messages_passes_cursor() -> None:
     args = {"chat_id": 1, "limit": None, "before_message_id": 42}
     await make_toolbox(db=db).run("get_recent_messages", json.dumps(args))
     assert db.recent_calls == [(1, 20, 42)]
+
+
+async def test_get_message_thread_clamps_limit_and_reports_missing() -> None:
+    """The limit clamps to [1, 50] and an unknown message says so."""
+    db = FakeDB()
+    toolbox = make_toolbox(db=db)
+    for limit, expected in ((999, 50), (None, 20), (-5, 1)):
+        args = {"chat_id": 1, "message_id": 7, "limit": limit}
+        result = await toolbox.run("get_message_thread", json.dumps(args))
+        assert result == "no such message stored"
+        assert db.thread_calls[-1] == (1, 7, expected)
 
 
 async def test_search_messages_reports_no_matches() -> None:

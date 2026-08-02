@@ -422,6 +422,42 @@ class Database:
         async with self.conn.execute(query, params) as cursor:
             return [dict(row) for row in await cursor.fetchall()]
 
+    async def message_thread(
+        self, chat_id: int, message_id: int, limit: int
+    ) -> list[dict]:
+        """Return the reply thread a message belongs to, oldest first.
+
+        The thread is the connected component of reply links through the
+        given message: what it replies to, replies to those, and every
+        branch hanging off any of them. Rows have the shape of
+        :meth:`recent_messages` plus ``reply_to_message_id`` so the
+        reply structure is visible. When the thread exceeds ``limit``
+        the newest messages are kept. Unknown messages yield no rows.
+        """
+        query = r"""
+            WITH RECURSIVE thread (message_id, reply_to_message_id) AS (
+                SELECT message_id, reply_to_message_id FROM messages
+                WHERE chat_id = :chat_id AND message_id = :message_id
+                UNION
+                SELECT m.message_id, m.reply_to_message_id
+                FROM messages m JOIN thread t
+                ON m.chat_id = :chat_id
+                   AND (m.message_id = t.reply_to_message_id
+                        OR m.reply_to_message_id = t.message_id)
+            )
+            SELECT m.message_id, m.date, m.outgoing, u.username, u.first_name,
+                   m.text, m.caption, m.content_type, m.reply_to_message_id
+            FROM messages m LEFT JOIN users u ON u.id = m.from_user_id
+            WHERE m.chat_id = :chat_id
+              AND m.message_id IN (SELECT message_id FROM thread)
+            ORDER BY m.date DESC, m.message_id DESC
+            LIMIT :limit
+        """
+        params = {"chat_id": chat_id, "message_id": message_id, "limit": limit}
+        async with self.conn.execute(query, params) as cursor:
+            rows = list(await cursor.fetchall())
+        return [dict(row) for row in reversed(rows)]
+
     async def list_chats(self) -> list[dict]:
         """Return every known chat with a display name and activity stats.
 

@@ -83,6 +83,44 @@ async def test_search_messages(db: Database) -> None:
     assert await db.search_messages(100, "100%", 10) == []
 
 
+def make_reply(message_id: int, text: str, reply_to: int, date: int) -> Message:
+    """Build a message replying to another message in the same chat."""
+    parent = {
+        "message_id": reply_to,
+        "date": STAMP,
+        "chat": {"id": 100, "type": "private", "first_name": "Alice"},
+    }
+    return make_message(message_id, text, date=date, reply_to_message=parent)
+
+
+async def test_message_thread(db: Database) -> None:
+    """The thread walks reply links both ways and skips unrelated messages."""
+    await db.save_message(make_message(1, "root", date=STAMP))
+    await db.save_message(make_reply(2, "reply", 1, STAMP + 60))
+    await db.save_message(make_reply(3, "deeper", 2, STAMP + 120))
+    await db.save_message(make_message(4, "unrelated", date=STAMP + 180))
+    await db.save_message(make_reply(5, "branch", 1, STAMP + 240))
+    rows = await db.message_thread(100, 3, 10)
+    assert [row["message_id"] for row in rows] == [1, 2, 3, 5]
+    assert rows[2]["reply_to_message_id"] == 2
+    assert rows[0]["reply_to_message_id"] is None
+
+
+async def test_message_thread_truncates_to_newest(db: Database) -> None:
+    """Over-limit threads keep the newest messages, still oldest first."""
+    await db.save_message(make_message(1, "root", date=STAMP))
+    await db.save_message(make_reply(2, "reply", 1, STAMP + 60))
+    await db.save_message(make_reply(3, "deeper", 2, STAMP + 120))
+    rows = await db.message_thread(100, 1, 2)
+    assert [row["message_id"] for row in rows] == [2, 3]
+
+
+async def test_message_thread_unknown_message(db: Database) -> None:
+    """A message id that was never stored yields no rows."""
+    await db.save_message(make_message(1, "hi", date=STAMP))
+    assert await db.message_thread(100, 999, 10) == []
+
+
 async def test_list_chats(db: Database) -> None:
     """Chats list with a display name (peer's name for private chats)."""
     peer = {"id": 100, "is_bot": False, "first_name": "Alice"}

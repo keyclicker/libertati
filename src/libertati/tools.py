@@ -430,6 +430,39 @@ HISTORY_TOOLS: list[ToolParam] = [
     },
     {
         "type": "function",
+        "name": "get_message_thread",
+        "description": (
+            "Fetch the reply thread a message belongs to: what it "
+            "replies to, replies to those, and every branch off any of "
+            "them, oldest first. Use to follow one conversation strand "
+            "in a busy group without paging through unrelated messages."
+        ),
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "chat_id": {
+                    "type": "integer",
+                    "description": "Chat the thread is in.",
+                },
+                "message_id": {
+                    "type": "integer",
+                    "description": "Any message in the thread.",
+                },
+                "limit": {
+                    "type": ["integer", "null"],
+                    "description": (
+                        "How many messages to return (max 50); null = 20. "
+                        "When the thread is longer, the newest are kept."
+                    ),
+                },
+            },
+            "required": ["chat_id", "message_id", "limit"],
+            "additionalProperties": False,
+        },
+        "strict": True,
+    },
+    {
+        "type": "function",
         "name": "search_messages",
         "description": (
             "Search one chat's whole history for messages containing a "
@@ -591,6 +624,7 @@ class Toolbox:
             "get_chat_info": self._get_chat_info,
             "list_chat_members": self._list_chat_members,
             "get_recent_messages": self._get_recent_messages,
+            "get_message_thread": self._get_message_thread,
             "search_messages": self._search_messages,
             # memory
             "remember": self._remember,
@@ -820,6 +854,14 @@ class Toolbox:
         rows = await self.db.recent_messages(
             args["chat_id"], limit, args.get("before_message_id")
         )
+        return json.dumps(rows, ensure_ascii=False)
+
+    async def _get_message_thread(self, args: dict[str, Any]) -> str:
+        """Return the reply thread around a message as JSON, oldest first."""
+        limit = max(1, min(args.get("limit") or 20, 50))
+        rows = await self.db.message_thread(args["chat_id"], args["message_id"], limit)
+        if not rows:
+            return "no such message stored"
         return json.dumps(rows, ensure_ascii=False)
 
     async def _search_messages(self, args: dict[str, Any]) -> str:
