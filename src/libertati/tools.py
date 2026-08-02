@@ -5,6 +5,10 @@ handler on :class:`Toolbox`, and register it in ``self._handlers``.
 
 Schemas use strict mode, so argument types are guaranteed by the API and
 handlers don't need defensive casts; optional parameters are nullable.
+
+Built-in tools (web search) execute server-side: they produce no
+``function_call`` items, so the agent loop needs no handler for them —
+they just have to be listed, which :func:`build_tools` does.
 """
 
 import json
@@ -15,12 +19,31 @@ from zoneinfo import ZoneInfo
 
 from aiogram import Bot
 from aiogram.types import ReplyParameters
+from openai import AsyncOpenAI
 from openai.types.responses import ToolParam
 
 from libertati import clock
 from libertati.db import Database
+from libertati.memory import Mind
 
 log = logging.getLogger(__name__)
+
+#: Instructions for the one-shot recall extraction call.
+RECALL_PROMPT = (
+    "You are the long-term memory of a person texting on Telegram. Below "
+    "are their dated notes, then a query. Answer the query from the notes "
+    "only: quote or paraphrase the relevant entries (with dates when they "
+    "matter) and say plainly when the notes contain nothing relevant."
+)
+
+#: Instructions for the one-shot memory overview call.
+SUMMARY_PROMPT = (
+    "You are the long-term memory of a person texting on Telegram. Below "
+    "are their dated notes. Give a short general overview of what is "
+    "remembered: the people and key facts, recurring themes, open plans "
+    "and promises, and the time span covered. A map, not the details — "
+    "specifics can be fetched later with targeted recall."
+)
 
 TOOLS: list[ToolParam] = [
     {
@@ -110,7 +133,77 @@ TOOLS: list[ToolParam] = [
         },
         "strict": True,
     },
+    {
+        "type": "function",
+        "name": "remember",
+        "description": (
+            "Save one durable fact to your long-term memory (survives "
+            "forever, unlike this context). Use for things worth keeping: "
+            "people, preferences, promises, your own plans. One short "
+            "fact per call."
+        ),
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "text": {
+                    "type": "string",
+                    "description": "The fact to remember, one short sentence.",
+                },
+            },
+            "required": ["text"],
+            "additionalProperties": False,
+        },
+        "strict": True,
+    },
+    {
+        "type": "function",
+        "name": "recall",
+        "description": (
+            "Ask your long-term memory a question. Use before answering "
+            "anything that depends on the past beyond what you currently "
+            "see: names, preferences, promises, earlier plans."
+        ),
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "query": {
+                    "type": "string",
+                    "description": "What you are trying to remember, as a question.",
+                },
+            },
+            "required": ["query"],
+            "additionalProperties": False,
+        },
+        "strict": True,
+    },
+    {
+        "type": "function",
+        "name": "summarize_memory",
+        "description": (
+            "Get a general overview of everything in your long-term "
+            "memory — what do you even remember? Use to orient yourself; "
+            "follow up with recall for specifics."
+        ),
+        "parameters": {
+            "type": "object",
+            "properties": {},
+            "required": [],
+            "additionalProperties": False,
+        },
+        "strict": True,
+    },
 ]
+
+
+def build_tools(web_search: bool) -> list[ToolParam]:
+    """Return the tool list for the API, optionally with built-in web search.
+
+    Web search runs on OpenAI's side; it is opt-in because most
+    OpenAI-compatible endpoints don't support it.
+    """
+    if web_search:
+        return [*TOOLS, {"type": "web_search"}]
+    return list(TOOLS)
 
 
 class Toolbox:
@@ -120,15 +213,29 @@ class Toolbox:
     take an explicit ``chat_id`` argument from the model.
     """
 
-    def __init__(self, db: Database, bot: Bot, tz: ZoneInfo) -> None:
+    def __init__(
+        self,
+        db: Database,
+        bot: Bot,
+        tz: ZoneInfo,
+        client: AsyncOpenAI,
+        recall_model: str,
+        mind: Mind,
+    ) -> None:
         """Keep resource handles and build the name-to-handler dispatch."""
         self.db = db
         self.bot = bot
         self.tz = tz
+        self.client = client
+        self.recall_model = recall_model
+        self.mind = mind
         self._handlers = {
             "send_message": self._send_message,
             "get_recent_messages": self._get_recent_messages,
             "schedule_wakeup": self._schedule_wakeup,
+            "remember": self._remember,
+            "recall": self._recall,
+            "summarize_memory": self._summarize_memory,
         }
 
     async def run(self, name: str, arguments: str | None) -> str:
@@ -187,3 +294,35 @@ class Toolbox:
         limit = max(1, min(args.get("limit") or 20, 50))
         rows = await self.db.recent_messages(args["chat_id"], limit)
         return json.dumps(rows, ensure_ascii=False)
+
+    async def _remember(self, args: dict[str, Any]) -> str:
+        """Append one stamped fact to the long-term memory file."""
+        text = args["text"].strip()
+        self.mind.append_memory(text, clock.format_now(self.tz))
+        return f"remembered: {text}"
+
+    async def _read_memory(self, instructions: str, input_text: str) -> str:
+        """Run one no-loop extraction call over the memory notes."""
+        response = await self.client.responses.create(
+            model=self.recall_model,
+            instructions=instructions,
+            input=input_text,
+            store=False,
+        )
+        return response.output_text or "recall came back empty"
+
+    async def _recall(self, args: dict[str, Any]) -> str:
+        """Answer a query from MEMORY.md via a one-shot extraction call."""
+        notes = self.mind.memory()
+        if not notes:
+            return "memory is empty"
+        return await self._read_memory(
+            RECALL_PROMPT, f"Notes:\n{notes}\n\nQuery: {args['query']}"
+        )
+
+    async def _summarize_memory(self, args: dict[str, Any]) -> str:
+        """Return a general overview of everything in MEMORY.md."""
+        notes = self.mind.memory()
+        if not notes:
+            return "memory is empty"
+        return await self._read_memory(SUMMARY_PROMPT, f"Notes:\n{notes}")

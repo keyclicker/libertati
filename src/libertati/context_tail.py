@@ -31,6 +31,7 @@ STYLES = {
     "message": ("yellow", "MONOLOGUE"),
     "function_call": ("magenta", "TOOL CALL"),
     "function_call_output": ("blue", "TOOL RESULT"),
+    "web_search_call": ("green", "WEB SEARCH"),
     "other": ("white", "OTHER"),
 }
 
@@ -71,6 +72,8 @@ def body_text(kind: str, item: dict[str, Any]) -> str:
         return f"{item.get('name', '?')} {args}"
     if kind == "function_call_output":
         return str(item.get("output", ""))
+    if kind == "web_search_call":
+        return json.dumps(item.get("action", {}), ensure_ascii=False)
     return json.dumps(item, ensure_ascii=False)
 
 

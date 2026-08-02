@@ -23,26 +23,38 @@ from openai.types.shared_params import Reasoning
 
 from libertati.config import Settings
 from libertati.db import Database
-from libertati.tools import TOOLS, Toolbox
+from libertati.memory import Mind
+from libertati.tools import Toolbox, build_tools
 
 log = logging.getLogger(__name__)
 
 DEFAULT_SYSTEM_PROMPT = (
-    "You are libertati, a person texting from their own Telegram account. "
     "You receive a stream of events: incoming messages from different "
-    "chats (with chat ids), and other triggers. You live in one continuous "
-    "timeline across all conversations.\n"
+    "chats (with chat ids), wakeups and heartbeats. You live in one "
+    "continuous timeline across all conversations.\n"
     "To say something, call send_message with the target chat_id — that is "
     "the only way to reply. Your plain text output is your private "
     "thinking and is never shown to anyone.\n"
     "You don't have to react to every event: ignore group chatter that "
-    "isn't addressed to you; always answer direct/private messages. Match "
-    "the sender's language, text like a human — short, casual, no "
-    "assistant-speak. Use get_recent_messages when you need older context.\n"
-    "Be proactive deliberately: when you intend to do something later, call "
-    "schedule_wakeup — your future self receives the note as a wakeup "
-    "event. Heartbeat events are routine status checks: usually no action; "
-    "start conversations rarely and only with a real reason."
+    "isn't addressed to you; always answer direct/private messages. Use "
+    "get_recent_messages when you need older chat context.\n"
+    "When you intend to do something later, call schedule_wakeup — your "
+    "future self receives the note as a wakeup event. Heartbeat events "
+    "are routine status checks: usually no action.\n"
+    "Your long-term memory lives outside this context. Call remember for "
+    "durable facts worth keeping (people, preferences, promises, your own "
+    "plans — one short fact per call). Call recall with a specific "
+    "question before answering anything that depends on the past you "
+    "can't see here; call summarize_memory to orient yourself in what "
+    "you know overall.\n"
+    "Who you are is defined in the Soul section below."
+)
+
+#: Appended to the base prompt when the built-in web search is enabled.
+WEB_SEARCH_PROMPT = (
+    "You have built-in web search. Use it when fresh or external "
+    "information would help: news, prices, weather, facts you're not "
+    "sure about."
 )
 
 #: Max model/tool rounds per agent turn (one turn per batch of events).
@@ -70,12 +82,24 @@ class Agent:
             base_url=settings.base_url,
         )
         self.model = settings.model
-        self.system_prompt = settings.system_prompt or DEFAULT_SYSTEM_PROMPT
+        self.base_prompt = settings.system_prompt or DEFAULT_SYSTEM_PROMPT
+        if settings.web_search:
+            self.base_prompt += "\n" + WEB_SEARCH_PROMPT
         self.db = db
         self.tz = ZoneInfo(settings.timezone)
-        self.tools = Toolbox(db, bot, self.tz)
+        self.mind = Mind(settings.memory_dir)
+        self.mind.ensure()
+        self.tools = Toolbox(
+            db,
+            bot,
+            self.tz,
+            self.client,
+            settings.recall_model or settings.model,
+            self.mind,
+        )
         self._context: list[dict[str, Any]] = []
         self._queue: asyncio.Queue[str] = asyncio.Queue()
+        self._api_tools = build_tools(settings.web_search)
         self._reasoning: Reasoning | Omit = (
             cast(Reasoning, {"effort": settings.reasoning_effort})
             if settings.reasoning_effort is not None
@@ -185,14 +209,16 @@ class Agent:
 
         The turn ends when the model produces no tool calls (its text, if
         any, is logged as internal monologue) or ``MAX_ROUNDS`` is
-        reached. Everything the model produces is remembered.
+        reached. Everything the model produces is remembered. SOUL.md is
+        re-read every turn so personality edits apply live.
         """
+        instructions = f"{self.base_prompt}\n\n## Soul\n{self.mind.soul()}"
         for _ in range(MAX_ROUNDS):
             response = await self.client.responses.create(
                 model=self.model,
-                instructions=self.system_prompt,
+                instructions=instructions,
                 input=cast(ResponseInputParam, self._context),
-                tools=TOOLS,
+                tools=self._api_tools,
                 # Nothing is stored server-side; encrypted reasoning must
                 # ride along in the context for multi-round tool turns.
                 store=False,

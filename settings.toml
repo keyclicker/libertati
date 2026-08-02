@@ -18,11 +18,20 @@ model = "gpt-5.6-luna"
 # Allowed (model-dependent): none, minimal, low, medium, high, xhigh, max.
 reasoning_effort = "low"
 
+# Model for the one-shot recall extraction (comment out for main model).
+# recall_model = "gpt-5-mini"
+
+# Built-in web search (server-side; needs a real OpenAI endpoint).
+web_search = true
+
+# Directory holding the mind files SOUL.md / MEMORY.md / DIARY.md.
+# memory_dir = "data/memory"
+
 # Timezone the agent lives in (timestamps, wakeup scheduling).
 timezone = "Europe/Kyiv"
 
 # Minutes between heartbeat status events (0 disables, ±20% jitter).
-heartbeat_minutes = 180
+heartbeat_minutes = 1
 
 # Persona/system prompt override (multi-line TOML string). Leave unset
 # to use the built-in default from src/libertati/agent.py.

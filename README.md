@@ -20,6 +20,13 @@ when to reply. Plain text output is private thinking and sends nothing.
   it as an event; background loops deliver due wakeups and periodic
   heartbeat status digests.
 - **Storage** (`db.py`): SQLite (WAL) with full raw Telegram payloads.
+- **Mind** (`memory.py`): three markdown files under `data/memory/`,
+  editable by hand at any time. `SOUL.md` is the personality, re-read
+  and attached to the instructions every turn. `MEMORY.md` is the
+  long-term fact store: the `remember` tool appends to it, the `recall`
+  tool answers questions from it with a one-shot extraction call (it is
+  never inlined into the agent's context). `DIARY.md` is reserved for
+  the upcoming Dreaming loop.
 
 ## Setup
 

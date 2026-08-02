@@ -36,8 +36,15 @@ class Settings(BaseSettings):
     reasoning_effort: str | None = None
     # Persona/system prompt override; None uses the built-in default.
     system_prompt: str | None = None
+    # Model for the one-shot recall extraction; None = main model.
+    recall_model: str | None = None
+    # Enable OpenAI's built-in web search tool (server-side; most
+    # OpenAI-compatible endpoints don't support it).
+    web_search: bool = False
     log_level: str = "INFO"
     db_path: Path = Path("data/libertati.db")
+    # Directory holding SOUL.md / MEMORY.md / DIARY.md.
+    memory_dir: Path = Path("data/memory")
     # Timezone the agent lives in (event timestamps, wakeup scheduling).
     timezone: str = "UTC"
     # Minutes between heartbeat status events (0 disables, ±20% jitter).
