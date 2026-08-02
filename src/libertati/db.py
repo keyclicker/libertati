@@ -6,7 +6,7 @@ by dedicated columns.
 """
 
 import json
-from datetime import datetime
+from datetime import UTC, datetime
 from pathlib import Path
 
 import aiosqlite
@@ -39,6 +39,7 @@ CREATE TABLE IF NOT EXISTS messages (
     chat_id             INTEGER NOT NULL REFERENCES chats(id),
     message_id          INTEGER NOT NULL,
     from_user_id        INTEGER REFERENCES users(id),
+    -- Full ISO datetime; named "date" for parity with the Telegram API field.
     date                TEXT NOT NULL,
     edit_date           TEXT,
     content_type        TEXT NOT NULL,
@@ -98,6 +99,7 @@ class Database:
         """Open the database, enable WAL and foreign keys, create schema."""
         self.path.parent.mkdir(parents=True, exist_ok=True)
         self._conn = await aiosqlite.connect(self.path)
+        self._conn.row_factory = aiosqlite.Row
         await self._conn.execute("PRAGMA journal_mode = WAL")
         await self._conn.execute("PRAGMA foreign_keys = ON")
         await self._conn.executescript(SCHEMA)
@@ -172,7 +174,7 @@ class Database:
             "SELECT item FROM context ORDER BY id DESC LIMIT ?", (limit,)
         ) as cursor:
             rows = list(await cursor.fetchall())
-        return [json.loads(row[0]) for row in reversed(rows)]
+        return [json.loads(row["item"]) for row in reversed(rows)]
 
     async def add_wakeup(self, due_at: str, note: str) -> int:
         """Store a scheduled wakeup (``due_at`` as UTC stamp); return its id."""
@@ -182,23 +184,21 @@ class Database:
         await self.conn.commit()
         return cursor.lastrowid or 0
 
-    async def due_wakeups(self, now: str) -> list[tuple[int, str, str]]:
-        """Return (id, due_at, note) of undone wakeups due by ``now`` (UTC)."""
+    async def due_wakeups(self, now: str) -> list[aiosqlite.Row]:
+        """Return id/due_at/note rows of undone wakeups due by ``now`` (UTC)."""
         async with self.conn.execute(
             "SELECT id, due_at, note FROM wakeups"
             " WHERE done = 0 AND due_at <= ? ORDER BY due_at",
             (now,),
         ) as cursor:
-            rows = await cursor.fetchall()
-        return [(r[0], r[1], r[2]) for r in rows]
+            return list(await cursor.fetchall())
 
-    async def pending_wakeups(self) -> list[tuple[int, str, str]]:
-        """Return (id, due_at, note) of all undone wakeups, soonest first."""
+    async def pending_wakeups(self) -> list[aiosqlite.Row]:
+        """Return id/due_at/note rows of all undone wakeups, soonest first."""
         async with self.conn.execute(
             "SELECT id, due_at, note FROM wakeups WHERE done = 0 ORDER BY due_at"
         ) as cursor:
-            rows = await cursor.fetchall()
-        return [(r[0], r[1], r[2]) for r in rows]
+            return list(await cursor.fetchall())
 
     async def complete_wakeup(self, wakeup_id: int) -> None:
         """Mark a wakeup as done."""
@@ -214,7 +214,8 @@ class Database:
         date of that last message.
         """
         query = """
-            SELECT c.id, c.type, c.title, u.first_name, u.username, m.date
+            SELECT c.id AS chat_id, c.type, c.title,
+                   u.first_name, u.username, m.date
             FROM chats c
             JOIN messages m ON m.chat_id = c.id AND m.date = (
                 SELECT MAX(date) FROM messages WHERE chat_id = c.id
@@ -224,9 +225,7 @@ class Database:
             ORDER BY m.date
         """
         async with self.conn.execute(query) as cursor:
-            rows = list(await cursor.fetchall())
-        keys = ("chat_id", "type", "title", "first_name", "username", "date")
-        return [dict(zip(keys, row, strict=True)) for row in rows]
+            return [dict(row) for row in await cursor.fetchall()]
 
     async def recent_messages(self, chat_id: int, limit: int) -> list[dict]:
         """Return the latest ``limit`` messages of a chat, oldest first.
@@ -243,16 +242,7 @@ class Database:
         """
         async with self.conn.execute(query, (chat_id, limit)) as cursor:
             rows = list(await cursor.fetchall())
-        keys = (
-            "date",
-            "outgoing",
-            "username",
-            "first_name",
-            "text",
-            "caption",
-            "content_type",
-        )
-        return [dict(zip(keys, row, strict=True)) for row in reversed(rows)]
+        return [dict(row) for row in reversed(rows)]
 
     async def save_message(self, message: Message, *, outgoing: bool = False) -> None:
         """Persist a message together with its chat and sender.
@@ -285,9 +275,11 @@ class Database:
                 message.message_id,
                 message.from_user.id if message.from_user else None,
                 message.date.isoformat(),
-                message.edit_date.isoformat()
-                if isinstance(message.edit_date, datetime)
-                else message.edit_date,
+                # Telegram sends edit_date as a unix timestamp; normalize to
+                # ISO so it compares with the `date` column.
+                datetime.fromtimestamp(message.edit_date, tz=UTC).isoformat()
+                if message.edit_date
+                else None,
                 message.content_type,
                 message.text,
                 message.caption,

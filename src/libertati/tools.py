@@ -2,6 +2,9 @@
 
 Adding a tool: write its JSON schema into ``TOOLS``, implement an async
 handler on :class:`Toolbox`, and register it in ``self._handlers``.
+
+Schemas use strict mode, so argument types are guaranteed by the API and
+handlers don't need defensive casts; optional parameters are nullable.
 """
 
 import json
@@ -11,6 +14,7 @@ from typing import Any
 from zoneinfo import ZoneInfo
 
 from aiogram import Bot
+from aiogram.types import ReplyParameters
 from openai.types.responses import ToolParam
 
 from libertati import clock
@@ -38,17 +42,18 @@ TOOLS: list[ToolParam] = [
                     "description": "Message text to send.",
                 },
                 "reply_to_message_id": {
-                    "type": "integer",
+                    "type": ["integer", "null"],
                     "description": (
-                        "Optional: message id to reply to (ids are shown in "
-                        "events). Use in groups or when answering a specific "
+                        "Message id to reply to (ids are shown in events), or "
+                        "null. Use in groups or when answering a specific "
                         "message after others arrived."
                     ),
                 },
             },
-            "required": ["chat_id", "text"],
+            "required": ["chat_id", "text", "reply_to_message_id"],
+            "additionalProperties": False,
         },
-        "strict": False,
+        "strict": True,
     },
     {
         "type": "function",
@@ -73,8 +78,9 @@ TOOLS: list[ToolParam] = [
                 },
             },
             "required": ["when", "note"],
+            "additionalProperties": False,
         },
-        "strict": False,
+        "strict": True,
     },
     {
         "type": "function",
@@ -91,14 +97,14 @@ TOOLS: list[ToolParam] = [
                     "description": "Chat id to read history from.",
                 },
                 "limit": {
-                    "type": "integer",
-                    "description": "How many messages to fetch (max 50).",
-                    "default": 20,
+                    "type": ["integer", "null"],
+                    "description": "How many messages to fetch (max 50); null = 20.",
                 },
             },
-            "required": ["chat_id"],
+            "required": ["chat_id", "limit"],
+            "additionalProperties": False,
         },
-        "strict": False,
+        "strict": True,
     },
 ]
 
@@ -146,29 +152,34 @@ class Toolbox:
         """Send a message (optionally as a reply) and persist it as outgoing."""
         reply_to = args.get("reply_to_message_id")
         sent = await self.bot.send_message(
-            int(args["chat_id"]),
-            str(args["text"]),
-            reply_to_message_id=int(reply_to) if reply_to is not None else None,
+            args["chat_id"],
+            args["text"],
+            reply_parameters=(
+                ReplyParameters(message_id=reply_to) if reply_to is not None else None
+            ),
         )
         await self.db.save_message(sent, outgoing=True)
         return (
             f"sent message {sent.message_id} to chat {sent.chat.id}"
-            f" at {clock.now(self.tz)}"
+            f" at {clock.format_now(self.tz)}"
         )
 
     async def _schedule_wakeup(self, args: dict[str, Any]) -> str:
         """Store a future wakeup for the agent itself."""
         try:
-            due = clock.parse_local(str(args["when"]), self.tz)
+            due = clock.parse_local(args["when"], self.tz)
         except ValueError:
             return "error: 'when' must be 'YYYY-MM-DD HH:MM'"
         if due <= datetime.now(UTC):
-            return f"error: {args['when']} is in the past, now is {clock.now(self.tz)}"
-        wakeup_id = await self.db.add_wakeup(clock.utc_stamp(due), str(args["note"]))
-        return f"wakeup #{wakeup_id} scheduled for {clock.fmt(due, self.tz)}"
+            return (
+                f"error: {args['when']} is in the past,"
+                f" now is {clock.format_now(self.tz)}"
+            )
+        wakeup_id = await self.db.add_wakeup(clock.utc_stamp(due), args["note"])
+        return f"wakeup #{wakeup_id} scheduled for {clock.format_local(due, self.tz)}"
 
     async def _get_recent_messages(self, args: dict[str, Any]) -> str:
         """Return recent messages of the given chat as JSON."""
-        limit = min(int(args.get("limit", 20)), 50)
-        rows = await self.db.recent_messages(int(args["chat_id"]), limit)
+        limit = max(1, min(args.get("limit") or 20, 50))
+        rows = await self.db.recent_messages(args["chat_id"], limit)
         return json.dumps(rows, ensure_ascii=False)

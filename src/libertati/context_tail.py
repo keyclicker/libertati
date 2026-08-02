@@ -147,12 +147,10 @@ def build_view(console: Console, rows: deque[Row], total: int, full: bool) -> Gr
     for row in reversed(rows):
         block = build_block(row, full)
         height = block_height(block, width)
-        if budget - height < 0 and chosen:
+        if chosen and height > budget:
             break
-        budget -= height
         chosen.append(block)
-        if budget <= 0:
-            break
+        budget -= height
     chosen.reverse()
 
     parts: list[Any] = [header, Text()]
@@ -168,14 +166,15 @@ def stream(conn: sqlite3.Connection, console: Console, args: Any, last_id: int) 
         for row in fetch_after(conn, last_id):
             console.print(build_block(row, args.full))
             console.print()
-            console.file.flush()
             last_id = row[0]
         if args.once:
             return
         time.sleep(POLL_SECONDS)
 
 
-def live(conn: sqlite3.Connection, console: Console, args: Any, last_id: int) -> None:
+def run_dashboard(
+    conn: sqlite3.Connection, console: Console, args: Any, last_id: int
+) -> None:
     """Run the full-screen dashboard, redrawing on every poll."""
     rows: deque[Row] = deque(maxlen=LIVE_BACKLOG)
     total = 0
@@ -232,7 +231,7 @@ def main() -> None:
     start_id = max(0, row[0] - (LIVE_BACKLOG if args.live else args.tail))
     try:
         if args.live:
-            live(conn, console, args, start_id)
+            run_dashboard(conn, console, args, start_id)
         else:
             stream(conn, console, args, start_id)
     except KeyboardInterrupt:

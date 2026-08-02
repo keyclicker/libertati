@@ -27,13 +27,15 @@ class Settings(BaseSettings):
     )
 
     bot_token: str
-    openai_api_key: str
+    api_key: str
     # Any OpenAI-compatible endpoint (OpenRouter, local, …); None = OpenAI.
     base_url: str | None = None
-    model: str = "gpt-5-mini"
+    model: str
     # For reasoning models: none/minimal/low/medium/high/xhigh/max
     # (model-dependent); None sends no preference.
     reasoning_effort: str | None = None
+    # Persona/system prompt override; None uses the built-in default.
+    system_prompt: str | None = None
     log_level: str = "INFO"
     db_path: Path = Path("data/libertati.db")
     # Timezone the agent lives in (event timestamps, wakeup scheduling).

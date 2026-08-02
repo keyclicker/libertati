@@ -29,6 +29,9 @@ router = Router()
 #: How often the wakeup scheduler checks for due alarms.
 WAKEUP_POLL_SECONDS = 30
 
+#: Max message body length quoted into an event (rest is elided).
+EVENT_TEXT_LIMIT = 1000
+
 
 class PersistMiddleware(BaseMiddleware):
     """Store every incoming (or edited) message before it is handled.
@@ -53,44 +56,50 @@ class PersistMiddleware(BaseMiddleware):
         return await handler(event, data)
 
 
-def describe(message: Message, tz: ZoneInfo) -> str:
+def format_event(message: Message, tz: ZoneInfo) -> str:
     """Format an incoming message as a one-line event for the agent."""
     chat = message.chat
-    where = f"chat {chat.id} ({chat.type}"
-    if chat.title:
-        where += f" “{chat.title}”"
-    where += ")"
-    sender = "unknown"
-    if message.from_user is not None:
-        sender = message.from_user.full_name
-        if message.from_user.username:
-            sender += f" @{message.from_user.username}"
+    title = f" “{chat.title}”" if chat.title else ""
+    where = f"chat {chat.id} ({chat.type}{title})"
+    user = message.from_user
+    if user is None:
+        sender = "unknown"
+    else:
+        sender = (
+            f"{user.full_name} @{user.username}" if user.username else user.full_name
+        )
     ref = f"msg {message.message_id}"
     if message.reply_to_message is not None:
         ref += f", replying to msg {message.reply_to_message.message_id}"
     body = message.text or message.caption or f"<{message.content_type}>"
-    return f"[{clock.fmt(message.date, tz)}] {where} | {sender} ({ref}): {body}"
+    if len(body) > EVENT_TEXT_LIMIT:
+        body = body[:EVENT_TEXT_LIMIT] + f" […{len(body) - EVENT_TEXT_LIMIT} chars]"
+    return (
+        f"[{clock.format_local(message.date, tz)}] {where} | {sender} ({ref}): {body}"
+    )
 
 
 @router.message()
 async def on_message(message: Message, agent: Agent, tz: ZoneInfo) -> None:
     """Push any incoming message to the agent loop as an event."""
-    await agent.push(describe(message, tz))
+    await agent.push(format_event(message, tz))
 
 
 async def wakeup_loop(agent: Agent, db: Database, tz: ZoneInfo) -> None:
-    """Deliver due self-scheduled wakeups to the agent queue."""
+    """Deliver due self-scheduled wakeups to the agent queue.
+
+    A wakeup is marked done only after it was pushed, so a crash in
+    between redelivers it (at-least-once) rather than dropping it.
+    """
     while True:
         now = clock.utc_stamp(datetime.now(UTC))
-        for wakeup_id, due_at, note in await db.due_wakeups(now):
-            await db.complete_wakeup(wakeup_id)
-            due_local = clock.fmt(
-                datetime.strptime(due_at, "%Y-%m-%d %H:%M:%S").replace(tzinfo=UTC), tz
-            )
+        for wakeup in await db.due_wakeups(now):
+            due_local = clock.format_local(clock.parse_utc_stamp(wakeup["due_at"]), tz)
             await agent.push(
-                f"[wakeup #{wakeup_id} at {clock.now(tz)} — you scheduled it "
-                f"for {due_local}] {note}"
+                f"[wakeup #{wakeup['id']} at {clock.format_now(tz)} — you "
+                f"scheduled it for {due_local}] {wakeup['note']}"
             )
+            await db.complete_wakeup(wakeup["id"])
         await asyncio.sleep(WAKEUP_POLL_SECONDS)
 
 
@@ -102,7 +111,7 @@ async def heartbeat_digest(db: Database, tz: ZoneInfo) -> str:
         chats = []
         for row in unanswered:
             name = row["title"] or row["first_name"] or "?"
-            when = clock.fmt(datetime.fromisoformat(row["date"]), tz)
+            when = clock.format_local(datetime.fromisoformat(row["date"]), tz)
             chats.append(
                 f"“{name}” (chat {row['chat_id']}, {row['type']}, last {when})"
             )
@@ -112,8 +121,10 @@ async def heartbeat_digest(db: Database, tz: ZoneInfo) -> str:
     pending = await db.pending_wakeups()
     if pending:
         alarms = ", ".join(
-            f"#{wid} at {clock.fmt(datetime.strptime(due, '%Y-%m-%d %H:%M:%S').replace(tzinfo=UTC), tz)}: {note}"
-            for wid, due, note in pending
+            f"#{row['id']} at "
+            f"{clock.format_local(clock.parse_utc_stamp(row['due_at']), tz)}: "
+            f"{row['note']}"
+            for row in pending
         )
         parts.append(f"pending wakeups: {alarms}")
     return ". ".join(parts)
@@ -128,7 +139,7 @@ async def heartbeat_loop(
     while True:
         await asyncio.sleep(minutes * 60 * random.uniform(0.8, 1.2))
         digest = await heartbeat_digest(db, tz)
-        await agent.push(f"[heartbeat {clock.now(tz)}] {digest}")
+        await agent.push(f"[heartbeat {clock.format_now(tz)}] {digest}")
 
 
 async def run() -> None:
@@ -150,19 +161,22 @@ async def run() -> None:
     await agent.load()
     tz = agent.tz
     tasks = [
-        asyncio.create_task(agent.worker()),
+        asyncio.create_task(agent.run_forever()),
         asyncio.create_task(wakeup_loop(agent, db, tz)),
         asyncio.create_task(heartbeat_loop(agent, db, tz, settings.heartbeat_minutes)),
     ]
 
     dispatcher = Dispatcher(agent=agent, tz=tz)
-    persist = PersistMiddleware(db)
-    dispatcher.message.outer_middleware(persist)
-    dispatcher.edited_message.outer_middleware(persist)
+    persist_middleware = PersistMiddleware(db)
+    dispatcher.message.outer_middleware(persist_middleware)
+    # Edits are persisted (updating the stored row) but deliberately not
+    # pushed as events — the agent only reacts to new messages.
+    dispatcher.edited_message.outer_middleware(persist_middleware)
     dispatcher.include_router(router)
     try:
         await dispatcher.start_polling(bot)
     finally:
         for task in tasks:
             task.cancel()
+        await asyncio.gather(*tasks, return_exceptions=True)
         await db.close()

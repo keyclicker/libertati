@@ -11,7 +11,7 @@ db_path = "data/libertati.db"
 # leave base_url unset for OpenAI, or e.g. for OpenRouter:
 #   base_url = "https://openrouter.ai/api/v1"
 #   model = "openai/gpt-5-mini"
-# (put the OpenRouter key in LIBERTATI_OPENAI_API_KEY in .env)
+# (put the key in LIBERTATI_API_KEY in .env)
 model = "gpt-5.6-luna"
 
 # Reasoning effort for reasoning models (comment out to use model default).
@@ -23,3 +23,9 @@ timezone = "Europe/Kyiv"
 
 # Minutes between heartbeat status events (0 disables, ±20% jitter).
 heartbeat_minutes = 180
+
+# Persona/system prompt override (multi-line TOML string). Leave unset
+# to use the built-in default from src/libertati/agent.py.
+# system_prompt = """
+# You are ...
+# """
