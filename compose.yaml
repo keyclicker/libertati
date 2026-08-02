@@ -5,6 +5,7 @@ services:
     env_file: .env
     volumes:
       - ./settings.toml:/app/settings.toml:ro
+      - ./prompts.toml:/app/prompts.toml:ro
       - ./data:/app/data
     restart: unless-stopped
     init: true
