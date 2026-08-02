@@ -60,6 +60,7 @@ class FakeClient:
         """Take one output-item list per round."""
         self.rounds = rounds
         self.calls: list[dict[str, Any]] = []
+        self.usage: Any = None
         self.responses = SimpleNamespace(create=self._create)
 
     async def _create(self, **kwargs: Any) -> Any:
@@ -71,7 +72,7 @@ class FakeClient:
             model="dream-model",
             output=[FakeOutputItem(item) for item in self.rounds[index]],
             output_text="",
-            usage=None,
+            usage=self.usage,
         )
 
 
@@ -161,18 +162,55 @@ async def test_dream_runs_a_session_and_wakes_the_agent(
     assert rows[0]["steps"] == 1
 
 
-async def test_dream_persists_no_context(db: Database, tmp_path: Path) -> None:
-    """Nothing a dream thinks reaches the agent's history tables."""
+async def test_dream_records_its_own_context_only(db: Database, tmp_path: Path) -> None:
+    """A dream's context lands in its own table, not the agent's."""
     dreamer, _, _ = make_dreamer(db, tmp_path, [[WAKE_CALL]])
 
     await dreamer.maybe_dream()
 
-    for table in ("context", "agent_turns", "api_usage"):
+    async with db.conn.execute(
+        "SELECT dream_id, item FROM dream_context ORDER BY id"
+    ) as cursor:
+        rows = list(await cursor.fetchall())
+    assert [row["dream_id"] for row in rows] == [1, 1, 1]
+    kinds = [json.loads(row["item"]) for row in rows]
+    assert "you fall asleep" in kinds[0]["content"]
+    assert kinds[1]["name"] == "wake_up"
+    assert kinds[2]["type"] == "function_call_output"
+
+    for table in ("context", "agent_turns"):
         async with db.conn.execute(f"SELECT COUNT(*) FROM {table}") as cursor:
             row = await cursor.fetchone()
         assert row is not None
         assert row[0] == 0, table
     assert dreamer._context == []
+    assert dreamer.dream_id is None
+
+
+async def test_dream_usage_is_recorded_against_the_dream(
+    db: Database, tmp_path: Path
+) -> None:
+    """Dreaming token cost is persisted, attributed to the dream."""
+    dreamer, _, client = make_dreamer(db, tmp_path, [[WAKE_CALL]])
+    client.usage = SimpleNamespace(
+        input_tokens=1200,
+        output_tokens=300,
+        total_tokens=1500,
+        input_tokens_details=SimpleNamespace(cached_tokens=800, cache_write_tokens=0),
+        output_tokens_details=SimpleNamespace(reasoning_tokens=120),
+    )
+
+    await dreamer.maybe_dream()
+
+    async with db.conn.execute("SELECT * FROM api_usage") as cursor:
+        rows = list(await cursor.fetchall())
+    assert len(rows) == 1
+    assert rows[0]["dream_id"] == 1
+    assert rows[0]["turn_id"] is None
+    assert rows[0]["input_tokens"] == 1200
+    # The anchor is the dream's own trace: only the opening event was
+    # persisted when the single round fired.
+    assert rows[0]["input_context_id"] == 1
 
 
 async def test_dream_opens_with_the_mind_files(db: Database, tmp_path: Path) -> None:

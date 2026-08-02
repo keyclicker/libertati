@@ -7,15 +7,16 @@ read-only tools take it, then before waking writes a reflection into
 DREAMS.md, folds INBOX.md into a rewritten MEMORY.md and may revise
 SOUL.md.
 
-None of a dream's context is persisted — it exists only in memory and is
-dropped on waking. What survives is what the dream chose to write into
-the mind files, plus a one-line ledger row for budget accounting and the
-``[dream ended …]`` event handed back to the waking agent.
+A dream's context is written to ``dream_context`` for inspection but
+never read back: the live window is dropped on waking and nothing from it
+rejoins the waking agent's. What actually carries over is what the dream
+chose to write into the mind files, plus a ledger row for budget
+accounting and the ``[dream ended …]`` event handed back to the agent.
 """
 
 import logging
 from datetime import UTC, datetime, timedelta
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Any
 
 from aiogram import Bot
 
@@ -120,6 +121,21 @@ class Dreamer(ModelLoop):
         self.cooldown_minutes = settings.dream_cooldown_minutes
         self.max_rounds = settings.dream_max_rounds
 
+    async def _remember(self, item: dict[str, Any]) -> None:
+        """Append an item to the window and to this dream's trace.
+
+        The trace is write-only — a dream never loads it back — so a call
+        outside a session has nothing to attach to and is simply not
+        recorded.
+        """
+        await super()._remember(item)
+        if self.dream_id is not None:
+            await self.db.append_dream_context(self.dream_id, item)
+
+    async def _anchor_id(self) -> int:
+        """Newest persisted dreaming context id."""
+        return await self.db.latest_dream_context_id()
+
     async def maybe_dream(self) -> None:
         """Run a dream when idleness or a request and the budget allow it."""
         if self.gate.daily_budget <= 0:
@@ -153,6 +169,7 @@ class Dreamer(ModelLoop):
         """
         started = datetime.now(UTC)
         dream_id = await self.db.start_dream(trigger)
+        self.dream_id = dream_id
         status = "failed"
         try:
             async with self.agent.turn_lock:
@@ -165,6 +182,7 @@ class Dreamer(ModelLoop):
             minutes = round((datetime.now(UTC) - started).total_seconds() / 60)
             self._context = []
             await self.db.finish_dream(dream_id, status, steps, summary)
+            self.dream_id = None
             log.info("dream #%d %s after %d steps", dream_id, status, steps)
             await self.agent.push(
                 f"[dream #{dream_id} ended {clock.format_now(self.tz)} — you slept"
@@ -180,7 +198,8 @@ class Dreamer(ModelLoop):
         """
         self.tools.steps = 0
         self.tools.wake_summary = None
-        self._context = [{"role": "user", "content": self._opening(dream_id, note)}]
+        self._context = []
+        await self._remember({"role": "user", "content": self._opening(dream_id, note)})
         instructions = f"{self.prompt}\n\n## Soul\n{self.mind.soul()}"
         for _ in range(self.max_rounds):
             acted = await self._round(instructions, turn_id=None)

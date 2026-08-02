@@ -1,5 +1,6 @@
 """Tests for the SQLite persistence layer against a temporary database."""
 
+import json
 import sqlite3
 from pathlib import Path
 from typing import Any
@@ -314,7 +315,7 @@ async def test_usage_schema_migrates_existing_table(tmp_path: Path) -> None:
     }
     await database.close()
 
-    assert {"turn_id", "input_context_id"} <= columns
+    assert {"turn_id", "input_context_id", "dream_id"} <= columns
 
 
 async def test_dream_ledger_round_trip(db: Database) -> None:
@@ -334,6 +335,29 @@ async def test_dream_ledger_round_trip(db: Database) -> None:
     assert row["steps"] == 14
     assert row["summary"] == "talk to Alice about the trip"
     assert row["finished_at"] is not None
+
+
+async def test_dream_context_round_trip(db: Database) -> None:
+    """Dreaming context is stored per dream and apart from the waking one."""
+    first = await db.start_dream("idle")
+    second = await db.start_dream("requested")
+    await db.append_dream_context(first, {"role": "user", "content": "asleep"})
+    await db.append_dream_context(second, {"type": "reasoning"})
+
+    async with db.conn.execute(
+        "SELECT dream_id, item FROM dream_context ORDER BY id"
+    ) as cursor:
+        rows = list(await cursor.fetchall())
+
+    assert [row["dream_id"] for row in rows] == [first, second]
+    assert json.loads(rows[0]["item"])["content"] == "asleep"
+    assert await db.latest_dream_context_id() == 2
+    assert await db.latest_context_id() == 0
+
+
+async def test_latest_dream_context_id_is_zero_when_empty(db: Database) -> None:
+    """An unslept database anchors dreaming usage at zero."""
+    assert await db.latest_dream_context_id() == 0
 
 
 async def test_start_dream_leaves_other_running_rows_alone(db: Database) -> None:

@@ -309,6 +309,7 @@ async def test_record_usage_maps_all_authoritative_counts() -> None:
         {
             "response_id": "resp_1",
             "turn_id": 7,
+            "dream_id": None,
             "input_context_id": 42,
             "model": "actual-model",
             "input_tokens": 100,

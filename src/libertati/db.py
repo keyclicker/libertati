@@ -77,6 +77,7 @@ CREATE TABLE IF NOT EXISTS api_usage (
     id                 INTEGER PRIMARY KEY AUTOINCREMENT,
     response_id        TEXT,
     turn_id            INTEGER,
+    dream_id           INTEGER,
     input_context_id   INTEGER NOT NULL DEFAULT 0,
     model              TEXT NOT NULL,
     input_tokens       INTEGER NOT NULL,
@@ -88,9 +89,9 @@ CREATE TABLE IF NOT EXISTS api_usage (
     created_at         TEXT NOT NULL DEFAULT (datetime('now'))
 );
 
--- Bookkeeping only: a dream's context is never persisted, but its budget
--- has to survive restarts, and a dream that dies before writing its
--- journal entry still has to count against that budget.
+-- One row per dream: its budget has to survive restarts, and a dream
+-- that dies before writing its journal entry still has to count against
+-- that budget.
 CREATE TABLE IF NOT EXISTS dreams (
     id          INTEGER PRIMARY KEY AUTOINCREMENT,
     trigger     TEXT NOT NULL,
@@ -102,6 +103,18 @@ CREATE TABLE IF NOT EXISTS dreams (
 );
 
 CREATE INDEX IF NOT EXISTS idx_dreams_started ON dreams (started_at);
+
+-- A dream's context, kept apart from the waking one: it is written for
+-- inspection only and never read back, so nothing here can leak into
+-- what the waking agent is sent.
+CREATE TABLE IF NOT EXISTS dream_context (
+    id         INTEGER PRIMARY KEY AUTOINCREMENT,
+    dream_id   INTEGER NOT NULL REFERENCES dreams(id),
+    item       TEXT NOT NULL,
+    created_at TEXT NOT NULL DEFAULT (datetime('now'))
+);
+
+CREATE INDEX IF NOT EXISTS idx_dream_context_dream ON dream_context (dream_id, id);
 
 CREATE TABLE IF NOT EXISTS wakeups (
     id         INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -156,6 +169,7 @@ class Database:
         await self._ensure_column(
             "api_usage", "input_context_id", "INTEGER NOT NULL DEFAULT 0"
         )
+        await self._ensure_column("api_usage", "dream_id", "INTEGER")
         await self._conn.commit()
 
     async def _ensure_column(
@@ -243,6 +257,26 @@ class Database:
             row = await cursor.fetchone()
         return int(row[0]) if row else 0
 
+    async def append_dream_context(self, dream_id: int, item: dict) -> None:
+        """Append one dreaming context item (as JSON) to a dream's trace."""
+        await self.conn.execute(
+            "INSERT INTO dream_context (dream_id, item) VALUES (?, ?)",
+            (dream_id, json.dumps(item, ensure_ascii=False)),
+        )
+        await self.conn.commit()
+
+    async def latest_dream_context_id(self) -> int:
+        """Return newest persisted dreaming context id, or zero when empty.
+
+        Deliberately not scoped to one dream: ids are monotonic, so an
+        ``id > anchor`` comparison within a single dream holds either way.
+        """
+        async with self.conn.execute(
+            "SELECT COALESCE(MAX(id), 0) FROM dream_context"
+        ) as cursor:
+            row = await cursor.fetchone()
+        return int(row[0]) if row else 0
+
     async def start_agent_turn(self, start_context_id: int) -> int:
         """Open a turn and mark any crash-left turn interrupted."""
         await self.conn.execute(
@@ -301,7 +335,7 @@ class Database:
         self,
         *,
         response_id: str | None,
-        turn_id: int,
+        turn_id: int | None,
         input_context_id: int,
         model: str,
         input_tokens: int,
@@ -310,19 +344,25 @@ class Database:
         output_tokens: int,
         reasoning_tokens: int,
         total_tokens: int,
+        dream_id: int | None = None,
     ) -> None:
-        """Persist exact token and prompt-cache usage for one API call."""
+        """Persist exact token and prompt-cache usage for one API call.
+
+        Exactly one of ``turn_id`` and ``dream_id`` is set: the row
+        belongs either to a waking turn or to a dream.
+        """
         await self.conn.execute(
             """
             INSERT INTO api_usage (
-                response_id, turn_id, input_context_id, model,
+                response_id, turn_id, dream_id, input_context_id, model,
                 input_tokens, cached_tokens, cache_write_tokens,
                 output_tokens, reasoning_tokens, total_tokens
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """,
             (
                 response_id,
                 turn_id,
+                dream_id,
                 input_context_id,
                 model,
                 input_tokens,

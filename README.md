@@ -22,13 +22,15 @@ when to reply. Plain assistant output is ignored and sends nothing.
   differently-prompted loop runs one long offline session. It wanders
   with read-only and web tools, writes a reflection into `DREAMS.md`,
   folds `INBOX.md` into a rewritten `MEMORY.md`, and may revise
-  `SOUL.md`. None of a dream's context is persisted; the agent wakes to
-  a `[dream ended …]` event carrying its summary. Budgeted per 24h.
+  `SOUL.md`. Its context is recorded in `dream_context` for the viewer
+  but never read back — the agent wakes to a `[dream ended …]` event
+  carrying its summary, and nothing else carries over. Budgeted per 24h.
 - **Wiring** (`bot.py`): aiogram handlers persist every message and push
   it as an event; background loops deliver due wakeups, periodic
   heartbeat status digests, and hand the agent over to a dream.
 - **Storage** (`db.py`): SQLite (WAL) with full raw Telegram payloads,
-  append-only model context, and exact API token/cache usage.
+  append-only model context (waking and dreaming kept apart), and exact
+  API token/cache usage per turn or dream.
 - **Mind** (`memory.py`): four markdown files under `data/memory/`,
   editable by hand at any time. `SOUL.md` is the personality, re-read
   and attached to the instructions every turn. `INBOX.md` is where the
@@ -78,6 +80,11 @@ vim-like: `j`/`k` and `ctrl+e`/`ctrl+y` by line, `ctrl+d`/`ctrl+u` by
 half a screen, `ctrl+f`/`ctrl+b` by screen, `g`/`G` for the ends,
 `/`, `?`, `n`, `N` to search (smartcase, highlighted), `f` to un-truncate
 long bodies, `q` to quit. Older history pages in as you scroll up.
+
+`d` switches to a dream's context and back. While you are at the bottom
+and have not pressed `d`, a starting dream is followed on its own and let
+go again on waking, so leaving the viewer open shows the dream as it
+happens. `uv run libertati-spy --dream 3` reopens a past dream.
 
 The status shows authoritative input/cache counts from the latest API
 call next to the projected size of the next one — that projection is the

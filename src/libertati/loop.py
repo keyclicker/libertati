@@ -4,8 +4,8 @@ At the lowest level both loops do the same thing: send the context to the
 Responses API with a set of tools, remember everything that comes back,
 execute any tool calls and remember their output too. They differ only in
 what sits above that — the waking agent runs one turn per batch of
-external events and persists its whole context, the dreaming loop runs
-one long offline session and persists nothing — so only the round itself
+external events, the dreaming loop runs one long offline session — and in
+which table each of them records what it said, so only the round itself
 lives here.
 """
 
@@ -32,6 +32,10 @@ class ModelLoop:
     beyond the in-memory window.
     """
 
+    #: Set by the dreaming loop for the length of one dream, so usage
+    #: rows can say which dream they belong to.
+    dream_id: int | None = None
+
     def __init__(
         self,
         *,
@@ -55,17 +59,23 @@ class ModelLoop:
         """Append one item to the in-memory context window."""
         self._context.append(item)
 
+    async def _anchor_id(self) -> int:
+        """Newest persisted context id the next API call builds on.
+
+        Subclasses that persist somewhere other than the waking history
+        point this at their own table.
+        """
+        return await self.db.latest_context_id()
+
     async def _round(self, instructions: str, turn_id: int | None) -> bool:
         """Call the model once and run whatever tools it asked for.
 
         Returns whether any tool ran — i.e. whether the loop has a reason
-        to go around again. ``turn_id`` links persisted usage to a turn;
-        ``None`` means this round belongs to a loop that persists nothing
-        (usage is still logged).
+        to go around again. ``turn_id`` links persisted usage to a waking
+        turn; a dreaming round passes ``None`` and is linked by
+        :attr:`dream_id` instead.
         """
-        input_context_id = 0
-        if turn_id is not None:
-            input_context_id = await self.db.latest_context_id()
+        input_context_id = await self._anchor_id()
         response = await self.client.responses.create(
             model=self.model,
             instructions=instructions,
@@ -102,7 +112,7 @@ class ModelLoop:
         turn_id: int | None,
         input_context_id: int,
     ) -> None:
-        """Log authoritative usage; persist it for persisted turns only."""
+        """Log authoritative usage; persist it against its turn or dream."""
         usage = getattr(response, "usage", None)
         if usage is None:
             return
@@ -111,10 +121,11 @@ class ModelLoop:
         cached_tokens = getattr(input_details, "cached_tokens", 0) or 0
         cache_write_tokens = getattr(input_details, "cache_write_tokens", 0) or 0
         reasoning_tokens = getattr(output_details, "reasoning_tokens", 0) or 0
-        if turn_id is not None:
+        if turn_id is not None or self.dream_id is not None:
             await self.db.append_api_usage(
                 response_id=getattr(response, "id", None),
                 turn_id=turn_id,
+                dream_id=self.dream_id,
                 input_context_id=input_context_id,
                 model=getattr(response, "model", None) or self.model,
                 input_tokens=usage.input_tokens,

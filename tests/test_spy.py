@@ -12,7 +12,11 @@ from libertati.spy import (
     build_block,
     build_status,
     estimate_tokens,
+    fetch_after,
+    fetch_before,
     fetch_usage,
+    latest_dream,
+    latest_recorded_dream,
     predict_context,
 )
 
@@ -30,12 +34,28 @@ def make_context_db(rows: int = 30) -> sqlite3.Connection:
     conn.execute(
         """CREATE TABLE api_usage (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
+            dream_id INTEGER,
             input_tokens INTEGER NOT NULL,
             cached_tokens INTEGER NOT NULL,
             cache_write_tokens INTEGER NOT NULL,
             output_tokens INTEGER NOT NULL,
             reasoning_tokens INTEGER NOT NULL,
             input_context_id INTEGER NOT NULL
+        )"""
+    )
+    conn.execute(
+        """CREATE TABLE dreams (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            trigger TEXT NOT NULL,
+            status TEXT NOT NULL DEFAULT 'running'
+        )"""
+    )
+    conn.execute(
+        """CREATE TABLE dream_context (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            dream_id INTEGER NOT NULL,
+            created_at TEXT NOT NULL DEFAULT (datetime('now')),
+            item TEXT NOT NULL
         )"""
     )
     conn.executemany(
@@ -53,14 +73,35 @@ def append_event(conn: sqlite3.Connection, text: str) -> None:
     )
 
 
-def append_usage(conn: sqlite3.Connection, tokens: int, context_id: int) -> None:
+def start_dream(conn: sqlite3.Connection, status: str = "running") -> int:
+    """Open a dream ledger row and return its id."""
+    cursor = conn.execute(
+        "INSERT INTO dreams (trigger, status) VALUES ('idle', ?)", (status,)
+    )
+    return int(cursor.lastrowid or 0)
+
+
+def append_dream_event(conn: sqlite3.Connection, dream_id: int, text: str) -> None:
+    """Append one event to a dream's recorded context."""
+    conn.execute(
+        "INSERT INTO dream_context (dream_id, item) VALUES (?, ?)",
+        (dream_id, json.dumps({"role": "user", "content": text})),
+    )
+
+
+def append_usage(
+    conn: sqlite3.Connection,
+    tokens: int,
+    context_id: int,
+    dream_id: int | None = None,
+) -> None:
     """Record one authoritative API usage snapshot."""
     conn.execute(
         """INSERT INTO api_usage (
-            input_tokens, cached_tokens, cache_write_tokens,
+            dream_id, input_tokens, cached_tokens, cache_write_tokens,
             output_tokens, reasoning_tokens, input_context_id
-        ) VALUES (?, ?, 100, 1200, 900, ?)""",
-        (tokens, tokens // 2, context_id),
+        ) VALUES (?, ?, ?, 100, 1200, 900, ?)""",
+        (dream_id, tokens, tokens // 2, context_id),
     )
 
 
@@ -154,6 +195,91 @@ def test_status_explains_missing_api_usage() -> None:
 
     assert "no API usage yet" in status.plain
     assert "next ~19.1k" in status.plain
+
+
+def test_status_names_the_dream_being_viewed() -> None:
+    """Dreaming mode is unmistakable in the status chip."""
+    waking = build_status(50, None)
+    dreaming = build_status(50, None, dream_id=3)
+
+    assert waking.plain.startswith("spy")
+    assert dreaming.plain.startswith("DREAM #3")
+
+
+def test_fetching_is_scoped_to_the_viewed_context() -> None:
+    """Waking and dreaming rows never appear in each other's view."""
+    conn = make_context_db(0)
+    append_event(conn, "awake")
+    first = start_dream(conn)
+    second = start_dream(conn)
+    append_dream_event(conn, first, "wandering")
+    append_dream_event(conn, second, "wandering elsewhere")
+
+    assert [row[2] for row in fetch_after(conn, 0)] == [
+        json.dumps({"role": "user", "content": "awake"})
+    ]
+    assert len(fetch_after(conn, 0, first)) == 1
+    assert json.loads(fetch_after(conn, 0, first)[0][2])["content"] == "wandering"
+    assert fetch_before(conn, 99, 10, second)[0][0] == 2
+    conn.close()
+
+
+def test_waking_usage_ignores_dreaming_rows() -> None:
+    """A dream's cost never lands in the waking status line."""
+    conn = make_context_db(0)
+    append_usage(conn, 18400, context_id=1)
+    append_usage(conn, 90000, context_id=4, dream_id=1)
+
+    assert fetch_usage(conn) == Usage(18400, 9200, 100, 1200, 900, 1)
+    assert fetch_usage(conn, 1) == Usage(90000, 45000, 100, 1200, 900, 4)
+    assert fetch_usage(conn, 2) is None
+    conn.close()
+
+
+def test_usage_survives_a_database_without_the_dream_column() -> None:
+    """An unmigrated database still shows its waking usage."""
+    conn = sqlite3.connect(":memory:")
+    conn.execute(
+        """CREATE TABLE api_usage (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            input_tokens INTEGER NOT NULL,
+            cached_tokens INTEGER NOT NULL,
+            cache_write_tokens INTEGER NOT NULL,
+            output_tokens INTEGER NOT NULL,
+            reasoning_tokens INTEGER NOT NULL,
+            input_context_id INTEGER NOT NULL
+        )"""
+    )
+    conn.execute(
+        "INSERT INTO api_usage VALUES (1, 18400, 9200, 100, 1200, 900, 1)",
+    )
+
+    assert fetch_usage(conn) == Usage(18400, 9200, 100, 1200, 900, 1)
+    assert fetch_usage(conn, 1) is None
+    conn.close()
+
+
+def test_dream_lookups_tolerate_a_database_without_dreams() -> None:
+    """Opening an old database must not crash the viewer."""
+    conn = sqlite3.connect(":memory:")
+
+    assert latest_dream(conn) is None
+    assert latest_recorded_dream(conn) is None
+    conn.close()
+
+
+def test_latest_recorded_dream_ignores_dreams_with_no_context() -> None:
+    """A dream that never got to think has nothing to show."""
+    conn = make_context_db(0)
+    start_dream(conn, "woke")
+
+    assert latest_recorded_dream(conn) is None
+
+    second = start_dream(conn, "woke")
+    append_dream_event(conn, second, "wandering")
+
+    assert latest_recorded_dream(conn) == second
+    conn.close()
 
 
 @pytest.mark.asyncio
@@ -323,5 +449,132 @@ async def test_full_toggle_untruncates_bodies() -> None:
         await pilot.pause()
         assert app.view.full
         assert "chars]" not in app.view.blocks[0].plain
+
+    conn.close()
+
+
+@pytest.mark.asyncio
+async def test_dream_key_switches_the_viewed_context_both_ways() -> None:
+    """`d` swaps the loaded blocks for a dream's, and back again."""
+    conn = make_context_db(0)
+    append_event(conn, "awake")
+    dream = start_dream(conn, "woke")
+    append_dream_event(conn, dream, "dreaming about Alice")
+    app = SpyApp(conn, last_id=0)
+
+    async with app.run_test(size=(80, 10)) as pilot:
+        await pilot.pause()
+        assert "awake" in app.view.blocks[0].plain
+
+        await pilot.press("d")
+        app.poll()
+        await pilot.pause()
+        assert app.dream_id == dream
+        assert not app.auto
+        assert [block.plain for block in app.view.blocks] == [
+            block.plain for block in app.view.blocks if "Alice" in block.plain
+        ]
+        await pilot.press("d")
+        app.poll()
+        await pilot.pause()
+        assert app.dream_id is None
+        assert "awake" in app.view.blocks[0].plain
+
+    conn.close()
+
+
+@pytest.mark.asyncio
+async def test_dream_key_says_so_when_there_is_nothing_to_show() -> None:
+    """Pressing `d` on a database with no dreams explains itself."""
+    conn = make_context_db(0)
+    append_event(conn, "awake")
+    app = SpyApp(conn, last_id=0)
+
+    async with app.run_test(size=(80, 10)) as pilot:
+        await pilot.pause()
+        await pilot.press("d")
+        await pilot.pause()
+
+        assert app.dream_id is None
+        assert app.hint == "no dream recorded yet"
+
+    conn.close()
+
+
+@pytest.mark.asyncio
+async def test_a_running_dream_is_followed_and_let_go_on_waking() -> None:
+    """While following, the viewer rides along with a dream by itself."""
+    conn = make_context_db(0)
+    append_event(conn, "awake")
+    app = SpyApp(conn, last_id=0)
+
+    async with app.run_test(size=(80, 10)) as pilot:
+        await pilot.pause()
+        assert app.dream_id is None
+
+        dream = start_dream(conn)
+        append_dream_event(conn, dream, "wandering")
+        app.poll()
+        await pilot.pause()
+        assert app.dream_id == dream
+        assert "wandering" in app.view.blocks[0].plain
+
+        conn.execute("UPDATE dreams SET status = 'woke' WHERE id = ?", (dream,))
+        append_event(conn, "[dream #1 ended] say hi to Bob")
+        app.poll()
+        await pilot.pause()
+        assert app.dream_id is None
+        # Back on the waking tail, with what happened while asleep.
+        assert "awake" in app.view.blocks[0].plain
+        assert "say hi to Bob" in app.view.blocks[-1].plain
+
+    conn.close()
+
+
+@pytest.mark.asyncio
+async def test_a_scrolled_viewer_is_not_dragged_into_a_dream() -> None:
+    """Reading history beats following: the view stays put, and says why."""
+    conn = make_context_db(30)
+    app = SpyApp(conn, last_id=0)
+
+    async with app.run_test(size=(80, 10)) as pilot:
+        await pilot.pause()
+        await pilot.press("ctrl+b")
+        await pilot.pause()
+        scrolled_y = app.view.scroll_y
+
+        dream = start_dream(conn)
+        append_dream_event(conn, dream, "wandering")
+        app.poll()
+        await pilot.pause()
+
+        assert app.dream_id is None
+        assert app.view.scroll_y == scrolled_y
+        assert app.hint == "dream #1 running (d)"
+
+    conn.close()
+
+
+@pytest.mark.asyncio
+async def test_opening_a_dream_directly_pins_the_view() -> None:
+    """`--dream` starts in a dream's context and stays there."""
+    conn = make_context_db(0)
+    append_event(conn, "awake")
+    dream = start_dream(conn, "woke")
+    append_dream_event(conn, dream, "dreaming about Alice")
+    running = start_dream(conn)
+    append_dream_event(conn, running, "wandering right now")
+    app = SpyApp(conn, last_id=0, dream_id=dream)
+
+    async with app.run_test(size=(80, 10)) as pilot:
+        await pilot.pause()
+        assert app.dream_id == dream
+        assert not app.auto
+        assert "Alice" in app.view.blocks[0].plain
+
+        app.poll()
+        await pilot.pause()
+        # A dream running right now must not steal a pinned view.
+        assert app.dream_id == dream
 
     conn.close()

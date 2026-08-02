@@ -6,6 +6,11 @@ styled by kind. Navigation is vim-like — ``j``/``k``, ``ctrl+e``/
 ``ctrl+y``, ``ctrl+d``/``ctrl+u``, ``ctrl+f``/``ctrl+b``, ``g``/``G`` —
 with ``/``, ``?``, ``n``, ``N`` search and ``f`` to un-truncate bodies.
 
+``d`` switches to a dream's context (``dream_context``) and back; while
+nothing is pinned and the view is following, a starting dream is picked
+up on its own and dropped again on waking. ``--dream ID`` opens a past
+dream directly.
+
 Per-item token figures are estimates from UTF-8 byte length, scaled per
 content shape (dense JSON framing, multi-byte prose, base64 reasoning
 blobs). The projected next context is anchored on the newest
@@ -200,36 +205,112 @@ def build_block(
     return block
 
 
-def fetch_after(conn: sqlite3.Connection, last_id: int) -> list[Row]:
-    """Return all context rows with id greater than ``last_id``."""
+def source(dream_id: int | None) -> tuple[str, str, tuple[int, ...]]:
+    """Return the table, ``WHERE`` scope and params for one view mode.
+
+    The scope is always a complete condition (``1`` for the waking
+    context) so every caller can ``AND`` its own onto it.
+    """
+    if dream_id is None:
+        return "context", "1", ()
+    return "dream_context", "dream_id = ?", (dream_id,)
+
+
+def fetch_after(
+    conn: sqlite3.Connection,
+    last_id: int,
+    dream_id: int | None = None,
+) -> list[Row]:
+    """Return all rows of the viewed context with id greater than ``last_id``."""
+    table, scope, params = source(dream_id)
     return conn.execute(
-        "SELECT id, created_at, item FROM context WHERE id > ? ORDER BY id",
-        (last_id,),
+        f"SELECT id, created_at, item FROM {table}"
+        f" WHERE {scope} AND id > ? ORDER BY id",
+        (*params, last_id),
     ).fetchall()
 
 
-def fetch_before(conn: sqlite3.Connection, first_id: int, limit: int) -> list[Row]:
+def fetch_before(
+    conn: sqlite3.Connection,
+    first_id: int,
+    limit: int,
+    dream_id: int | None = None,
+) -> list[Row]:
     """Return up to ``limit`` rows before ``first_id``, oldest first."""
+    table, scope, params = source(dream_id)
     rows = conn.execute(
-        "SELECT id, created_at, item FROM context WHERE id < ? ORDER BY id DESC LIMIT ?",
-        (first_id, limit),
+        f"SELECT id, created_at, item FROM {table}"
+        f" WHERE {scope} AND id < ? ORDER BY id DESC LIMIT ?",
+        (*params, first_id, limit),
     ).fetchall()
     return list(reversed(rows))
 
 
-def fetch_usage(conn: sqlite3.Connection) -> Usage | None:
-    """Return exact usage from the newest API response when available."""
+#: Usage columns the status line needs, in :class:`Usage` field order.
+USAGE_SELECT = """
+    SELECT input_tokens, cached_tokens, cache_write_tokens,
+           output_tokens, reasoning_tokens, input_context_id
+    FROM api_usage
+"""
+
+
+def fetch_usage(
+    conn: sqlite3.Connection,
+    dream_id: int | None = None,
+) -> Usage | None:
+    """Return exact usage from the newest API response of one mode.
+
+    Waking usage excludes dreaming rows explicitly, so a dream's cost
+    never shows up under the waking context.
+    """
+    scope = "dream_id IS NULL" if dream_id is None else "dream_id = ?"
+    params = () if dream_id is None else (dream_id,)
     try:
         row = conn.execute(
-            """
-            SELECT input_tokens, cached_tokens, cache_write_tokens,
-                   output_tokens, reasoning_tokens, input_context_id
-            FROM api_usage ORDER BY id DESC LIMIT 1
-            """
+            f"{USAGE_SELECT} WHERE {scope} ORDER BY id DESC LIMIT 1", params
+        ).fetchone()
+    except sqlite3.OperationalError:
+        if dream_id is not None:
+            return None
+        # A database written before dreams had usage rows: everything in
+        # the table is waking usage anyway.
+        try:
+            row = conn.execute(f"{USAGE_SELECT} ORDER BY id DESC LIMIT 1").fetchone()
+        except sqlite3.OperationalError:
+            return None
+    return Usage(*row) if row else None
+
+
+def newest_id(conn: sqlite3.Connection, dream_id: int | None = None) -> int:
+    """Return the newest row id of one view mode, or zero when it is empty."""
+    table, scope, params = source(dream_id)
+    try:
+        row = conn.execute(
+            f"SELECT COALESCE(MAX(id), 0) FROM {table} WHERE {scope}", params
+        ).fetchone()
+    except sqlite3.OperationalError:
+        return 0
+    return row[0] if row else 0
+
+
+def latest_dream(conn: sqlite3.Connection) -> tuple[int, str] | None:
+    """Return the newest dream's id and status, if the ledger has one."""
+    try:
+        row = conn.execute(
+            "SELECT id, status FROM dreams ORDER BY id DESC LIMIT 1"
         ).fetchone()
     except sqlite3.OperationalError:
         return None
-    return Usage(*row) if row else None
+    return (row[0], row[1]) if row else None
+
+
+def latest_recorded_dream(conn: sqlite3.Connection) -> int | None:
+    """Return the newest dream that actually has context rows."""
+    try:
+        row = conn.execute("SELECT MAX(dream_id) FROM dream_context").fetchone()
+    except sqlite3.OperationalError:
+        return None
+    return row[0] if row and row[0] is not None else None
 
 
 def _estimate_rows(rows: list[tuple[str, str]]) -> int:
@@ -241,6 +322,7 @@ def predict_context(
     conn: sqlite3.Connection,
     usage: Usage | None,
     max_items: int,
+    dream_id: int | None = None,
 ) -> int | None:
     """Estimate the input size of the agent's next API call.
 
@@ -250,15 +332,19 @@ def predict_context(
     window when there is no usage row yet, or when so much has piled up
     since one that the window would have been trimmed anyway.
     """
-    select = "SELECT item, COALESCE(json_extract(item, '$.type'), '') FROM context"
+    table, scope, params = source(dream_id)
+    select = f"SELECT item, COALESCE(json_extract(item, '$.type'), '') FROM {table}"
     if usage is not None:
         pending = conn.execute(
-            f"{select} WHERE id > ? ORDER BY id LIMIT ?",
-            (usage.context_id, max_items),
+            f"{select} WHERE {scope} AND id > ? ORDER BY id LIMIT ?",
+            (*params, usage.context_id, max_items),
         ).fetchall()
         if len(pending) < max_items:
             return usage.input_tokens + _estimate_rows(pending)
-    window = conn.execute(f"{select} ORDER BY id DESC LIMIT ?", (max_items,)).fetchall()
+    window = conn.execute(
+        f"{select} WHERE {scope} ORDER BY id DESC LIMIT ?",
+        (*params, max_items),
+    ).fetchall()
     return _estimate_rows(window) or None
 
 
@@ -269,10 +355,14 @@ def build_status(
     usage: Usage | None = None,
     next_tokens: int | None = None,
     note: str = "",
+    dream_id: int | None = None,
 ) -> Text:
     """Build the two-line status: position on top, token figures below."""
     status = Text()
-    status.append("spy", style="bold reverse")
+    if dream_id is None:
+        status.append("spy", style="bold reverse")
+    else:
+        status.append(f"DREAM #{dream_id}", style="bold reverse magenta")
     status.append(f"  #{last_id}", style="bold")
     if last_activity is not None:
         status.append(f"  {age_text(last_activity)}", style="cyan")
@@ -355,11 +445,18 @@ class ContextView(ScrollView):
         Binding("G,end", "scroll_end", "Latest", show=False),
     ]
 
-    def __init__(self, conn: sqlite3.Connection, page_size: int, **kwargs: Any) -> None:
+    def __init__(
+        self,
+        conn: sqlite3.Connection,
+        page_size: int,
+        dream_id: int | None = None,
+        **kwargs: Any,
+    ) -> None:
         """Create a view over an open read-only database connection."""
         super().__init__(**kwargs)
         self.conn = conn
         self.page_size = max(1, page_size)
+        self.dream_id = dream_id
         self.full = False
         self.pattern: re.Pattern[str] | None = None
         self.blocks: list[Block] = []
@@ -367,6 +464,20 @@ class ContextView(ScrollView):
         self.oldest_id: int | None = None
         self.has_older = True
         self._paging = False
+
+    def switch(self, dream_id: int | None) -> None:
+        """Point the view at another context and empty it.
+
+        Nothing is fetched here: the next poll refills the view from the
+        new source, through the same append path as any other row.
+        """
+        self.dream_id = dream_id
+        self.blocks = []
+        self.lines = []
+        self.oldest_id = None
+        self.has_older = True
+        self._resize_virtual()
+        self.refresh()
 
     def append(self, rows: list[Row]) -> None:
         """Append newly arrived rows, keeping the follow position."""
@@ -389,7 +500,9 @@ class ContextView(ScrollView):
             return 0
         self._paging = True
         try:
-            rows = fetch_before(self.conn, self.oldest_id, self.page_size)
+            rows = fetch_before(
+                self.conn, self.oldest_id, self.page_size, self.dream_id
+            )
             if len(rows) < self.page_size:
                 self.has_older = False
             if not rows:
@@ -615,6 +728,7 @@ class SpyApp(App[None]):
     BINDINGS: ClassVar[list[Binding]] = [
         Binding("q", "quit", "Quit", show=False),
         Binding("f", "toggle_full", "Full bodies", show=False),
+        Binding("d", "toggle_dream", "Dream context", show=False),
         Binding("slash", "search('forward')", "Search", show=False),
         Binding("question_mark", "search('backward')", "Search back", show=False),
         Binding("n", "repeat_search(False)", "Next match", show=False),
@@ -628,17 +742,26 @@ class SpyApp(App[None]):
         last_id: int,
         page_size: int = 50,
         max_items: int = 300,
+        dream_id: int | None = None,
     ) -> None:
         """Create a viewer over an open read-only database connection."""
         super().__init__()
         self.conn = conn
-        self.last_id = last_id
         self.page_size = page_size
         self.max_items = max_items
+        self.dream_id = dream_id
+        # Newest row already on screen for the mode being viewed;
+        # re-anchored to a tail on every switch.
+        self.cursor = last_id
+        # Opening straight into a dream is a deliberate choice; don't
+        # then drag the view somewhere else.
+        self.auto = dream_id is None
+        self.running_dream: int | None = None
         self.last_activity: str | None = None
         self.usage: Usage | None = None
         self.next_tokens: int | None = None
         self.note = ""
+        self.hint = ""
         self.search_backward = False
 
     @property
@@ -646,9 +769,14 @@ class SpyApp(App[None]):
         """The context view widget."""
         return self.query_one(ContextView)
 
+    @property
+    def last_id(self) -> int:
+        """Newest row seen in the mode currently on screen."""
+        return self.cursor
+
     def compose(self) -> ComposeResult:
         """Create the context view, the search prompt and the status."""
-        yield ContextView(self.conn, self.page_size, id="context")
+        yield ContextView(self.conn, self.page_size, self.dream_id, id="context")
         yield SearchInput(id="search")
         yield Static(id="status")
 
@@ -663,16 +791,56 @@ class SpyApp(App[None]):
 
     def poll(self) -> None:
         """Append rows added since the last poll and refresh the status."""
-        rows = fetch_after(self.conn, self.last_id)
+        self.follow_dream()
+        rows = fetch_after(self.conn, self.cursor, self.dream_id)
         if rows:
-            self.last_id = rows[-1][0]
+            self.cursor = rows[-1][0]
             self.last_activity = rows[-1][1]
             self.view.append(rows)
-        usage = fetch_usage(self.conn)
+        usage = fetch_usage(self.conn, self.dream_id)
         if rows or usage != self.usage:
             self.usage = usage
-            self.next_tokens = predict_context(self.conn, usage, self.max_items)
+            self.next_tokens = predict_context(
+                self.conn, usage, self.max_items, self.dream_id
+            )
         self.update_status()
+
+    def follow_dream(self) -> None:
+        """Track a dream that starts or ends, unless something says not to.
+
+        Two gates: a manual ``d`` pins the mode, and a scrolled-back
+        viewport is left alone — being yanked to another context while
+        reading history is worse than missing the switch.
+        """
+        dream = latest_dream(self.conn)
+        self.running_dream = dream[0] if dream and dream[1] == "running" else None
+        if self.running_dream is not None and self.dream_id != self.running_dream:
+            self.hint = f"dream #{self.running_dream} running (d)"
+        else:
+            self.hint = ""
+        if not self.auto or not self.view.is_vertical_scroll_end:
+            return
+        if self.running_dream is not None:
+            self.open_dream(self.running_dream)
+        elif self.dream_id is not None:
+            self.open_dream(None)
+
+    def open_dream(self, dream_id: int | None) -> None:
+        """Point the viewer at a dream's context, or back at the waking one.
+
+        The new mode opens on its tail — the same anchor the viewer
+        starts at — rather than wherever it was last left, so switching
+        never lands on an empty screen. Older rows page in on scroll.
+        """
+        if dream_id == self.dream_id:
+            return
+        self.dream_id = dream_id
+        self.cursor = max(0, newest_id(self.conn, dream_id) - self.page_size)
+        self.hint = ""
+        self.last_activity = None
+        self.usage = None
+        self.next_tokens = None
+        self.view.switch(dream_id)
 
     def update_status(self) -> None:
         """Redraw the status line."""
@@ -683,13 +851,27 @@ class SpyApp(App[None]):
                 self.view.is_vertical_scroll_end,
                 self.usage,
                 self.next_tokens,
-                self.note,
+                self.note or self.hint,
+                self.dream_id,
             )
         )
 
     def action_toggle_full(self) -> None:
         """Show full bodies instead of truncated ones."""
         self.view.set_full(not self.view.full)
+
+    def action_toggle_dream(self) -> None:
+        """Switch between the waking context and a dream's, pinning the mode."""
+        self.auto = False
+        if self.dream_id is not None:
+            self.open_dream(None)
+        else:
+            target = self.running_dream or latest_recorded_dream(self.conn)
+            if target is None:
+                self.hint = "no dream recorded yet"
+            else:
+                self.open_dream(target)
+        self.update_status()
 
     def action_search(self, direction: str) -> None:
         """Open the search prompt."""
@@ -752,7 +934,8 @@ def main() -> None:
         description="Live full-screen view of the agent's context history.",
         epilog=(
             "keys: j/k ctrl+e/ctrl+y line, ctrl+d/ctrl+u half page, "
-            "ctrl+f/ctrl+b page, g/G ends, / ? n N search, f full bodies, q quit"
+            "ctrl+f/ctrl+b page, g/G ends, / ? n N search, f full bodies, "
+            "d dream context, q quit"
         ),
     )
     parser.add_argument(
@@ -760,6 +943,13 @@ def main() -> None:
         type=Path,
         default=None,
         help="database path (default: db_path from settings)",
+    )
+    parser.add_argument(
+        "--dream",
+        type=int,
+        default=None,
+        metavar="ID",
+        help="open a dream's context instead of the waking one",
     )
     parser.add_argument(
         "-n",
@@ -783,9 +973,17 @@ def main() -> None:
         parser.error(f"database not found: {db_path}")
 
     conn = sqlite3.connect(f"file:{db_path}?mode=ro", uri=True)
+    if (
+        args.dream is not None
+        and not conn.execute(
+            "SELECT 1 FROM dreams WHERE id = ?", (args.dream,)
+        ).fetchone()
+    ):
+        conn.close()
+        parser.error(f"no dream #{args.dream} in {db_path}")
     row = conn.execute("SELECT COALESCE(MAX(id), 0) FROM context").fetchone()
     try:
-        SpyApp(conn, max(0, row[0] - args.tail), args.tail, max_items).run()
+        SpyApp(conn, max(0, row[0] - args.tail), args.tail, max_items, args.dream).run()
     except KeyboardInterrupt:
         pass
     finally:
