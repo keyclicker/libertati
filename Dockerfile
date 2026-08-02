@@ -1,6 +1,5 @@
 # syntax=docker/dockerfile:1
 
-# --- builder: install deps into a venv with uv --------------------------------
 FROM ghcr.io/astral-sh/uv:python3.12-bookworm-slim AS builder
 
 ENV UV_COMPILE_BYTECODE=1 \
@@ -9,32 +8,31 @@ ENV UV_COMPILE_BYTECODE=1 \
 
 WORKDIR /app
 
-# Install dependencies first (cached layer) using only the lockfile + manifest.
-COPY pyproject.toml uv.lock ./
+# Dependencies first, so they cache independently of source changes.
 RUN --mount=type=cache,target=/root/.cache/uv \
-    uv sync --frozen --no-install-project --no-dev
+    --mount=type=bind,source=uv.lock,target=uv.lock \
+    --mount=type=bind,source=pyproject.toml,target=pyproject.toml \
+    uv sync --locked --no-install-project --no-dev
 
-# Now install the project itself.
-COPY src ./src
-COPY README.md ./
+COPY . /app
 RUN --mount=type=cache,target=/root/.cache/uv \
-    uv sync --frozen --no-dev
+    uv sync --locked --no-dev --no-editable
 
-# --- runtime ------------------------------------------------------------------
-FROM python:3.12-slim-bookworm AS runtime
 
-RUN groupadd --system app && useradd --system --gid app --create-home app
+FROM python:3.12-slim-bookworm
+
+# uid/gid 1000 matches the typical host user so the bind-mounted ./data
+# stays readable/writable on both sides.
+RUN groupadd --gid 1000 app \
+    && useradd --uid 1000 --gid app --home-dir /app --shell /usr/sbin/nologin app
 
 WORKDIR /app
-COPY --from=builder --chown=app:app /app /app
+RUN mkdir -p /app/data && chown app:app /app/data
+COPY --from=builder --chown=app:app /app/.venv /app/.venv
 
 ENV PATH="/app/.venv/bin:$PATH" \
-    PYTHONUNBUFFERED=1 \
-    LIBERTATI_DB_PATH=/data/libertati.db \
-    LIBERTATI_MEMORY_DIR=/memory
-
-RUN mkdir -p /data /memory && chown app:app /data /memory
-VOLUME ["/data", "/memory"]
+    PYTHONUNBUFFERED=1
 
 USER app
-CMD ["libertati"]
+
+ENTRYPOINT ["libertati"]

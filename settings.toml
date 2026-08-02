@@ -1,0 +1,25 @@
+# Non-secret settings. Secrets (tokens, API keys) go in .env.
+# Any value here can be overridden with a LIBERTATI_* env var,
+# e.g. LIBERTATI_LOG_LEVEL=DEBUG.
+
+log_level = "INFO"
+
+# SQLite database location (all chats/users/messages are stored here).
+db_path = "data/libertati.db"
+
+# LLM model for the agent loop. Any OpenAI-compatible endpoint works:
+# leave base_url unset for OpenAI, or e.g. for OpenRouter:
+#   base_url = "https://openrouter.ai/api/v1"
+#   model = "openai/gpt-5-mini"
+# (put the OpenRouter key in LIBERTATI_OPENAI_API_KEY in .env)
+model = "gpt-5.6-luna"
+
+# Reasoning effort for reasoning models (comment out to use model default).
+# Allowed (model-dependent): none, minimal, low, medium, high, xhigh, max.
+reasoning_effort = "low"
+
+# Timezone the agent lives in (timestamps, wakeup scheduling).
+timezone = "Europe/Kyiv"
+
+# Minutes between heartbeat status events (0 disables, ±20% jitter).
+heartbeat_minutes = 180
