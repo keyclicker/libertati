@@ -31,7 +31,7 @@ web_search = true
 timezone = "Europe/Kyiv"
 
 # Minutes between heartbeat status events (0 disables, ±20% jitter).
-heartbeat_minutes = 1
+heartbeat_minutes = 10
 
 # Simulated typing speed for outgoing messages, chars/second (0 disables).
 # typing_chars_per_second = 15
