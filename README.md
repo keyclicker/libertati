@@ -51,5 +51,5 @@ uv run ruff check .       # lint (incl. docstring rules)
 uv run ty check           # type check
 uv run pytest             # tests
 uv run libertati-ctx      # live colored tail of the agent's context
-uv run libertati-ctx --live   # full-screen dashboard
+uv run libertati-ctx --live   # paged full-screen viewer (j/k, g/G, q)
 ```
