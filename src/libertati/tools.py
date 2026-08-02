@@ -53,7 +53,8 @@ def typing_delay(text: str, chars_per_second: float) -> float:
 #: Instructions for the one-shot recall extraction call.
 RECALL_PROMPT = (
     "You are the long-term memory of a person texting on Telegram. Below "
-    "are their dated notes, then a query. Answer the query from the notes "
+    "are their notes — a curated '# Memory' section and fresh dated "
+    "'# Inbox' entries — then a query. Answer the query from the notes "
     "only: quote or paraphrase the relevant entries (with dates when they "
     "matter) and say plainly when the notes contain nothing relevant."
 )
@@ -61,7 +62,8 @@ RECALL_PROMPT = (
 #: Instructions for the one-shot memory overview call.
 SUMMARY_PROMPT = (
     "You are the long-term memory of a person texting on Telegram. Below "
-    "are their dated notes. Give a short general overview of what is "
+    "are their notes — a curated '# Memory' section and fresh dated "
+    "'# Inbox' entries. Give a short general overview of what is "
     "remembered: the people and key facts, recurring themes, open plans "
     "and promises, and the time span covered. A map, not the details — "
     "specifics can be fetched later with targeted recall."
@@ -653,9 +655,9 @@ class Toolbox:
     # ==========================================================
 
     async def _remember(self, args: dict[str, Any]) -> str:
-        """Append one stamped fact to the long-term memory file."""
+        """Append one dated fact to the memory inbox."""
         text = args["text"].strip()
-        self.mind.append_memory(text, clock.format_now(self.tz))
+        self.mind.append_inbox(text, clock.format_now(self.tz))
         return f"remembered: {text}"
 
     async def _read_memory(self, instructions: str, input_text: str) -> str:
@@ -669,17 +671,17 @@ class Toolbox:
         return response.output_text or "recall came back empty"
 
     async def _recall(self, args: dict[str, Any]) -> str:
-        """Answer a query from MEMORY.md via a one-shot extraction call."""
-        notes = self.mind.memory()
+        """Answer a query from memory + inbox via a one-shot extraction call."""
+        notes = self.mind.notes()
         if not notes:
             return "memory is empty"
         return await self._read_memory(
-            RECALL_PROMPT, f"Notes:\n{notes}\n\nQuery: {args['query']}"
+            RECALL_PROMPT, f"{notes}\n\nQuery: {args['query']}"
         )
 
     async def _summarize_memory(self, args: dict[str, Any]) -> str:
-        """Return a general overview of everything in MEMORY.md."""
-        notes = self.mind.memory()
+        """Return a general overview of everything in memory + inbox."""
+        notes = self.mind.notes()
         if not notes:
             return "memory is empty"
-        return await self._read_memory(SUMMARY_PROMPT, f"Notes:\n{notes}")
+        return await self._read_memory(SUMMARY_PROMPT, notes)

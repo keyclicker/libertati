@@ -1,11 +1,15 @@
-"""The agent's file-based mind: soul, long-term memory and diary.
+"""The agent's file-based mind: soul, long-term memory, inbox and diary.
 
-Three plain markdown files the user (and later the Dreaming loop) can
-inspect and edit directly:
+Plain markdown files the user (and later the Dreaming loop) can inspect
+and edit directly:
 
 - ``SOUL.md`` — personality, attached to the instructions every turn.
-- ``MEMORY.md`` — append-only fact store; written by the ``remember``
-  tool, read only by the ``recall`` tool, never inlined into context.
+- ``MEMORY.md`` — curated long-term memory; rewritten only by the
+  Dreaming loop, read by the ``recall``/``summarize_memory`` tools,
+  never inlined into context.
+- ``INBOX.md`` — landing zone for new memories; the ``remember`` tool
+  appends dated entries here, Dreaming folds them into MEMORY.md and
+  clears the file.
 - ``DIARY.md`` — reserved for the Dreaming loop; created empty.
 """
 
@@ -34,6 +38,7 @@ class Mind:
         self.path = path
         self.soul_path = path / "SOUL.md"
         self.memory_path = path / "MEMORY.md"
+        self.inbox_path = path / "INBOX.md"
         self.diary_path = path / "DIARY.md"
 
     def ensure(self) -> None:
@@ -46,17 +51,29 @@ class Mind:
         if not self.soul_path.exists():
             self.soul_path.write_text(DEFAULT_SOUL, encoding="utf-8")
         self.memory_path.touch(exist_ok=True)
+        self.inbox_path.touch(exist_ok=True)
         self.diary_path.touch(exist_ok=True)
 
     def soul(self) -> str:
         """Return the current personality text."""
         return self.soul_path.read_text(encoding="utf-8").strip()
 
-    def memory(self) -> str:
-        """Return the full long-term memory text ('' when empty)."""
-        return self.memory_path.read_text(encoding="utf-8").strip()
+    def notes(self) -> str:
+        """Return curated memory and inbox as one document ('' when empty).
 
-    def append_memory(self, text: str, stamp: str) -> None:
-        """Append one stamped fact to MEMORY.md."""
-        with self.memory_path.open("a", encoding="utf-8") as file:
-            file.write(f"- [{stamp}] {text}\n")
+        Non-empty parts appear under ``# Memory`` / ``# Inbox`` headers —
+        the combined view the recall/summary tools read.
+        """
+        parts = []
+        memory = self.memory_path.read_text(encoding="utf-8").strip()
+        inbox = self.inbox_path.read_text(encoding="utf-8").strip()
+        if memory:
+            parts.append(f"# Memory\n{memory}")
+        if inbox:
+            parts.append(f"# Inbox\n{inbox}")
+        return "\n\n".join(parts)
+
+    def append_inbox(self, text: str, stamp: str) -> None:
+        """Append one dated entry to INBOX.md."""
+        with self.inbox_path.open("a", encoding="utf-8") as file:
+            file.write(f"## [{stamp}]\n{text}\n\n")

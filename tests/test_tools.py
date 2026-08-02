@@ -351,15 +351,15 @@ async def test_list_chats() -> None:
 
 
 async def test_remember_appends_and_confirms(tmp_path: Path) -> None:
-    """A remembered fact lands stamped in MEMORY.md and is confirmed."""
+    """A remembered fact lands dated in INBOX.md and is confirmed."""
     mind = make_mind(tmp_path)
     result = await make_toolbox(mind=mind).run(
         "remember", json.dumps({"text": "  cat named Bober  "})
     )
     assert result == "remembered: cat named Bober"
-    memory = mind.memory_path.read_text(encoding="utf-8")
-    assert memory.startswith("- [")
-    assert memory.endswith("] cat named Bober\n")
+    inbox = mind.inbox_path.read_text(encoding="utf-8")
+    assert inbox.startswith("## [")
+    assert inbox.endswith("]\ncat named Bober\n\n")
 
 
 async def test_recall_short_circuits_on_empty_memory(tmp_path: Path) -> None:
@@ -374,7 +374,7 @@ async def test_recall_short_circuits_on_empty_memory(tmp_path: Path) -> None:
 async def test_recall_extracts_from_notes(tmp_path: Path) -> None:
     """Recall sends notes plus query to the recall model and relays the answer."""
     mind = make_mind(tmp_path)
-    mind.append_memory("cat named Bober", "Sun 2026-08-02 12:00")
+    mind.append_inbox("cat named Bober", "Sun 2026-08-02 12:00")
     client = FakeClient()
     toolbox = make_toolbox(client=client, mind=mind)
     result = await toolbox.run("recall", json.dumps({"query": "cat name?"}))
@@ -382,6 +382,7 @@ async def test_recall_extracts_from_notes(tmp_path: Path) -> None:
     (call,) = client.calls
     assert call["model"] == "recall-model"
     assert call["instructions"] == RECALL_PROMPT
+    assert "# Inbox" in call["input"]
     assert "cat named Bober" in call["input"]
     assert "cat name?" in call["input"]
     assert call["store"] is False
@@ -399,7 +400,7 @@ async def test_summarize_memory_short_circuits_on_empty(tmp_path: Path) -> None:
 async def test_summarize_memory_overviews_notes(tmp_path: Path) -> None:
     """The summary call sends all notes with the overview prompt, no query."""
     mind = make_mind(tmp_path)
-    mind.append_memory("cat named Bober", "Sun 2026-08-02 12:00")
+    mind.append_inbox("cat named Bober", "Sun 2026-08-02 12:00")
     client = FakeClient()
     result = await make_toolbox(client=client, mind=mind).run("summarize_memory", "{}")
     assert result == "the cat is named Bober"
