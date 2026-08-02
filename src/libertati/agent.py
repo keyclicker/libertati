@@ -96,6 +96,7 @@ class Agent:
             self.client,
             settings.recall_model or settings.model,
             self.mind,
+            settings.typing_chars_per_second,
         )
         self._context: list[dict[str, Any]] = []
         self._queue: asyncio.Queue[str] = asyncio.Queue()

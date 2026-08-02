@@ -11,14 +11,17 @@ Built-in tools (web search) execute server-side: they produce no
 they just have to be listed, which :func:`build_tools` does.
 """
 
+import asyncio
 import json
 import logging
+import random
 from datetime import UTC, datetime
 from typing import Any
 from zoneinfo import ZoneInfo
 
 from aiogram import Bot
 from aiogram.types import ReplyParameters
+from aiogram.utils.chat_action import ChatActionSender
 from openai import AsyncOpenAI
 from openai.types.responses import ToolParam
 
@@ -27,6 +30,22 @@ from libertati.db import Database
 from libertati.memory import Mind
 
 log = logging.getLogger(__name__)
+
+#: Bounds for the simulated typing time of outgoing messages.
+TYPING_MIN_SECONDS = 1.0
+TYPING_MAX_SECONDS = 8.0
+
+
+def typing_delay(text: str, chars_per_second: float) -> float:
+    """How long to pretend to type a message, with human jitter.
+
+    A non-positive speed disables the emulation (returns 0).
+    """
+    if chars_per_second <= 0:
+        return 0.0
+    seconds = TYPING_MIN_SECONDS + len(text) / chars_per_second
+    return min(seconds, TYPING_MAX_SECONDS) * random.uniform(0.8, 1.2)
+
 
 #: Instructions for the one-shot recall extraction call.
 RECALL_PROMPT = (
@@ -221,6 +240,7 @@ class Toolbox:
         client: AsyncOpenAI,
         recall_model: str,
         mind: Mind,
+        typing_chars_per_second: float,
     ) -> None:
         """Keep resource handles and build the name-to-handler dispatch."""
         self.db = db
@@ -229,6 +249,7 @@ class Toolbox:
         self.client = client
         self.recall_model = recall_model
         self.mind = mind
+        self.typing_chars_per_second = typing_chars_per_second
         self._handlers = {
             "send_message": self._send_message,
             "get_recent_messages": self._get_recent_messages,
@@ -260,8 +281,16 @@ class Toolbox:
             return f"error: {exc}"
 
     async def _send_message(self, args: dict[str, Any]) -> str:
-        """Send a message (optionally as a reply) and persist it as outgoing."""
+        """Send a message (optionally as a reply) and persist it as outgoing.
+
+        Shows the Telegram "typing…" indicator for a length-proportional
+        moment first, so replies land at a human pace.
+        """
         reply_to = args.get("reply_to_message_id")
+        delay = typing_delay(args["text"], self.typing_chars_per_second)
+        if delay > 0:
+            async with ChatActionSender.typing(chat_id=args["chat_id"], bot=self.bot):
+                await asyncio.sleep(delay)
         sent = await self.bot.send_message(
             args["chat_id"],
             args["text"],

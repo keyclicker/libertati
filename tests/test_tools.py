@@ -6,12 +6,22 @@ from types import SimpleNamespace
 from typing import Any, cast
 from zoneinfo import ZoneInfo
 
+import pytest
 from aiogram import Bot
 from openai import AsyncOpenAI
 
 from libertati.db import Database
 from libertati.memory import Mind
-from libertati.tools import RECALL_PROMPT, SUMMARY_PROMPT, TOOLS, Toolbox, build_tools
+from libertati.tools import (
+    RECALL_PROMPT,
+    SUMMARY_PROMPT,
+    TOOLS,
+    TYPING_MAX_SECONDS,
+    TYPING_MIN_SECONDS,
+    Toolbox,
+    build_tools,
+    typing_delay,
+)
 
 UTC_TZ = ZoneInfo("UTC")
 
@@ -37,6 +47,14 @@ class FakeDB:
 
 class ExplodingBot:
     """A bot whose send always fails, to exercise error wrapping."""
+
+    #: ChatActionSender logs bot.id before anything else; without it the
+    #: sender's worker dies pre-``try`` and its stop event never fires.
+    id = 1
+
+    async def send_chat_action(self, *args: Any, **kwargs: Any) -> bool:
+        """Accept typing indicators silently."""
+        return True
 
     async def send_message(self, *args: Any, **kwargs: Any) -> Any:
         """Raise unconditionally."""
@@ -71,6 +89,7 @@ def make_toolbox(
         cast(AsyncOpenAI, client or FakeClient()),
         "recall-model",
         cast(Mind, mind),
+        15.0,
     )
 
 
@@ -93,11 +112,26 @@ async def test_invalid_arguments() -> None:
     assert result == "error: invalid tool arguments"
 
 
-async def test_handler_exception_is_wrapped() -> None:
+async def test_handler_exception_is_wrapped(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
     """A raising handler is reported as an error, not propagated."""
+    monkeypatch.setattr("libertati.tools.typing_delay", lambda text, cps: 0.0)
     args = json.dumps({"chat_id": 1, "text": "hi", "reply_to_message_id": None})
     result = await make_toolbox().run("send_message", args)
     assert result == "error: boom"
+
+
+def test_typing_delay_bounds() -> None:
+    """Typing time grows with length within the min/max bounds."""
+    assert typing_delay("hi", 15) >= TYPING_MIN_SECONDS * 0.8
+    assert typing_delay("hi", 15) <= (TYPING_MIN_SECONDS + 1) * 1.2
+    assert typing_delay("x" * 10_000, 15) <= TYPING_MAX_SECONDS * 1.2
+
+
+def test_typing_delay_disabled() -> None:
+    """A non-positive speed turns the emulation off entirely."""
+    assert typing_delay("some long message", 0) == 0.0
 
 
 async def test_schedule_wakeup_rejects_past() -> None:

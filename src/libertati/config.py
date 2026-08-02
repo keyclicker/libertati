@@ -49,6 +49,9 @@ class Settings(BaseSettings):
     timezone: str = "UTC"
     # Minutes between heartbeat status events (0 disables, ±20% jitter).
     heartbeat_minutes: int = 180
+    # Simulated typing speed for outgoing messages, chars/second
+    # (0 disables the typing emulation).
+    typing_chars_per_second: float = 15.0
 
     @classmethod
     def settings_customise_sources(
