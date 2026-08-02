@@ -69,10 +69,18 @@ The compose file bind-mounts `./settings.toml` (read-only) and `./data`
 uv run ruff check .       # lint (incl. docstring rules)
 uv run ty check           # type check
 uv run pytest             # tests
-uv run libertati-ctx      # live colored tail of the agent's context
-uv run libertati-ctx --live   # paged full-screen viewer (j/k, g/G, q)
+uv run libertati-spy      # live full-screen view of the agent's context
 ```
 
-The full-screen status shows authoritative token/cache counts from the
-latest API call plus a separate rough estimate for the next effective
-context after reasoning and pruning policy are applied.
+`libertati-spy` tails the context table as it is written. Navigation is
+vim-like: `j`/`k` and `ctrl+e`/`ctrl+y` by line, `ctrl+d`/`ctrl+u` by
+half a screen, `ctrl+f`/`ctrl+b` by screen, `g`/`G` for the ends,
+`/`, `?`, `n`, `N` to search (smartcase, highlighted), `f` to un-truncate
+long bodies, `q` to quit. Older history pages in as you scroll up.
+
+The status shows authoritative input/cache counts from the latest API
+call next to the projected size of the next one — that projection is the
+last measured input plus an estimate of everything appended since, so
+the instructions/tool overhead comes from real numbers rather than a
+guess. Per-item counts are estimated from byte length (scaled for JSON
+framing, multi-byte text and base64 reasoning blobs), not tokenized.
