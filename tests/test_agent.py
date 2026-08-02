@@ -1,5 +1,7 @@
 """Tests for the agent's context-window trimming logic."""
 
+import asyncio
+from datetime import UTC, datetime
 from types import SimpleNamespace
 from typing import Any, cast
 
@@ -83,6 +85,23 @@ def test_trim_dangling_does_not_mutate_input() -> None:
     assert items == [EVENT, CALL]
 
 
+def test_drop_legacy_reasoning_cuts_paired_calls_too() -> None:
+    """The window is cut after the last legacy item, not filtered in place.
+
+    A function call whose paired reasoning item is missing is rejected by
+    the API just like the content-less reasoning item itself.
+    """
+    items = [EVENT, REASONING, CALL, CALL_OUTPUT, EVENT, MESSAGE]
+    assert Agent._drop_legacy_reasoning(items) == [CALL, CALL_OUTPUT, EVENT, MESSAGE]
+
+
+def test_drop_legacy_reasoning_keeps_encrypted_items() -> None:
+    """Reasoning items with encrypted content are valid input and stay."""
+    encrypted = {"type": "reasoning", "summary": [], "encrypted_content": "x"}
+    items = [EVENT, encrypted, MESSAGE]
+    assert Agent._drop_legacy_reasoning(items) == items
+
+
 def test_finish_turn_prunes_only_new_ephemeral_outputs() -> None:
     """Settling removes new reasoning/messages but keeps durable items."""
     old_message = dict(MESSAGE)
@@ -162,6 +181,52 @@ async def test_remember_trims_in_chunks() -> None:
     await agent._remember(dict(EVENT))
     assert len(agent._context) == TRIM_CONTEXT_ITEMS + 1
     assert agent._context[0] is head
+
+
+STALE = datetime(2020, 1, 1, tzinfo=UTC)
+
+
+def make_processing_agent(outward_calls_per_turn: int = 0) -> Agent:
+    """Build a bare agent whose turn only makes fake outward tool calls."""
+    agent = Agent.__new__(Agent)
+    agent.db = cast(Database, FakeContextDB())
+    agent.max_context_items = MAX_CONTEXT_ITEMS
+    agent.trim_context_items = TRIM_CONTEXT_ITEMS
+    agent._context = []
+    agent.turn_lock = asyncio.Lock()
+    agent.tools = cast(Any, SimpleNamespace(outward_calls=0))
+    agent.last_active = STALE
+
+    async def turn() -> None:
+        agent.tools.outward_calls += outward_calls_per_turn
+
+    cast(Any, agent)._turn = turn
+    return agent
+
+
+async def test_process_heartbeat_only_leaves_idle_clock() -> None:
+    """A quiet heartbeat turn does not reset last_active.
+
+    Otherwise a heartbeat interval below dream_idle_minutes would make
+    the idle dream trigger unreachable.
+    """
+    agent = make_processing_agent()
+    await agent._process([("[heartbeat] all quiet", False)])
+    assert agent.last_active is STALE
+
+
+async def test_process_activity_event_resets_idle_clock() -> None:
+    """A batch with a real event moves last_active."""
+    agent = make_processing_agent()
+    await agent._process([("[heartbeat] quiet", False), ("[event] hi", True)])
+    assert agent.last_active is not STALE
+
+
+async def test_process_outward_action_resets_idle_clock() -> None:
+    """A heartbeat turn that reached out to someone counts as activity."""
+    agent = make_processing_agent(outward_calls_per_turn=1)
+    await agent._process([("[heartbeat] quiet", False)])
+    assert agent.last_active is not STALE
 
 
 class FakeOutputItem:

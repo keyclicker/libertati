@@ -414,6 +414,7 @@ async def test_a_held_lock_stops_the_real_agent_loop(
     agent._api_tools = []
     agent.prune_completed_reasoning = False
     agent._queue = asyncio.Queue()
+    agent.tools = cast(Any, SimpleNamespace(outward_calls=0))
     agent.turn_lock = asyncio.Lock()
     agent.last_active = datetime.now(UTC) - timedelta(minutes=90)
 

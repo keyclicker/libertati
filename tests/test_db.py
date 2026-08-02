@@ -72,6 +72,22 @@ async def test_search_messages(db: Database) -> None:
     assert await db.search_messages(100, "100%", 10) == []
 
 
+async def test_search_messages_folds_unicode_case(db: Database) -> None:
+    """Case-insensitivity holds beyond ASCII (SQLite LIKE would not)."""
+    await db.save_message(make_message(1, "Привіт з Києва", date=STAMP))
+    rows = await db.search_messages(100, "привіт", 10)
+    assert [row["message_id"] for row in rows] == [1]
+    assert await db.search_messages(100, "КИЄВА", 10) != []
+
+
+async def test_recent_messages_same_second_keeps_id_order(db: Database) -> None:
+    """Messages sharing a timestamp are ordered by message id."""
+    for i in (1, 2, 3):
+        await db.save_message(make_message(i, f"m{i}", date=STAMP))
+    rows = await db.recent_messages(100, 2)
+    assert [row["message_id"] for row in rows] == [2, 3]
+
+
 def make_reply(message_id: int, text: str, reply_to: int, date: int) -> Message:
     """Build a message replying to another message in the same chat."""
     parent = {
@@ -169,6 +185,13 @@ async def test_unanswered_chats(db: Database) -> None:
     unanswered = await db.unanswered_chats()
     assert [row["chat_id"] for row in unanswered] == [100]
     await db.save_message(make_message(2, "hey", date=STAMP + 60), outgoing=True)
+    assert await db.unanswered_chats() == []
+
+
+async def test_unanswered_chats_same_second_reply_counts(db: Database) -> None:
+    """An outgoing reply in the same second still marks the chat answered."""
+    await db.save_message(make_message(1, "hi", date=STAMP))
+    await db.save_message(make_message(2, "yo", date=STAMP), outgoing=True)
     assert await db.unanswered_chats() == []
 
 

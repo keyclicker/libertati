@@ -119,8 +119,9 @@ typing_chars_per_second = 15.0
 # While the agent sleeps the waking loop pauses and a differently-prompted
 # loop wanders, then rewrites MEMORY.md from INBOX.md, writes DREAMS.md and
 # may revise SOUL.md. A dream starts after dream_idle_minutes of quiet, or
-# when the agent calls the `dream` tool itself. Budget 0 disables it
-# entirely and hides the tool.
+# when the agent calls the `dream` tool itself. Heartbeat turns count as
+# quiet unless the agent reached out during one. Budget 0 disables
+# dreaming entirely and hides the tool.
 dream_daily_budget = 4
 dream_idle_minutes = 45
 dream_cooldown_minutes = 120

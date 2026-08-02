@@ -11,6 +11,7 @@ enough.
 import asyncio
 import logging
 import random
+import re
 from collections.abc import Awaitable, Callable
 from datetime import UTC, datetime
 from typing import Any
@@ -96,8 +97,11 @@ def is_addressed(message: Message, me: User) -> bool:
     ):
         return True
     if me.username:
-        body = (message.text or message.caption or "").lower()
-        return f"@{me.username.lower()}" in body
+        body = message.text or message.caption or ""
+        # Bounded on both sides so "@name" doesn't match inside a longer
+        # "@namesake" mention or an email-like "user@name".
+        pattern = rf"(?<![\w@])@{re.escape(me.username)}(?![A-Za-z0-9_])"
+        return re.search(pattern, body, re.IGNORECASE) is not None
     return False
 
 
@@ -131,21 +135,33 @@ async def on_message(
     await agent.push(format_event(message, tz))
 
 
-async def wakeup_loop(agent: Agent, db: Database, tz: ZoneInfo) -> None:
-    """Deliver due self-scheduled wakeups to the agent queue.
+async def deliver_wakeups(agent: Agent, db: Database, tz: ZoneInfo) -> None:
+    """Push every due wakeup to the agent queue, one delivery pass.
 
     A wakeup is marked done only after it was pushed, so a crash in
     between redelivers it (at-least-once) rather than dropping it.
     """
+    now = clock.utc_stamp(datetime.now(UTC))
+    for wakeup in await db.due_wakeups(now):
+        due_local = clock.format_local(clock.parse_utc_stamp(wakeup["due_at"]), tz)
+        await agent.push(
+            f"[wakeup #{wakeup['id']} at {clock.format_now(tz)} — you "
+            f"scheduled it for {due_local}] {wakeup['note']}"
+        )
+        await db.complete_wakeup(wakeup["id"])
+
+
+async def wakeup_loop(agent: Agent, db: Database, tz: ZoneInfo) -> None:
+    """Deliver due self-scheduled wakeups to the agent queue.
+
+    A transient failure must not take the loop down with it — wakeups
+    would then silently never fire again until a restart.
+    """
     while True:
-        now = clock.utc_stamp(datetime.now(UTC))
-        for wakeup in await db.due_wakeups(now):
-            due_local = clock.format_local(clock.parse_utc_stamp(wakeup["due_at"]), tz)
-            await agent.push(
-                f"[wakeup #{wakeup['id']} at {clock.format_now(tz)} — you "
-                f"scheduled it for {due_local}] {wakeup['note']}"
-            )
-            await db.complete_wakeup(wakeup["id"])
+        try:
+            await deliver_wakeups(agent, db, tz)
+        except Exception:
+            log.exception("wakeup delivery failed")
         await asyncio.sleep(WAKEUP_POLL_SECONDS)
 
 
@@ -185,13 +201,24 @@ async def heartbeat_digest(db: Database, tz: ZoneInfo, registry: ChatRegistry) -
 async def heartbeat_loop(
     agent: Agent, db: Database, tz: ZoneInfo, minutes: int, registry: ChatRegistry
 ) -> None:
-    """Push periodic (jittered) heartbeat status events; 0 disables."""
+    """Push periodic (jittered) heartbeat status events; 0 disables.
+
+    Heartbeats are pushed as non-activity events: a heartbeat turn where
+    the agent only reads leaves the dream idle clock alone, so regular
+    heartbeats don't make the idle dream trigger unreachable. A transient
+    failure is logged and the loop carries on.
+    """
     if minutes <= 0:
         return
     while True:
         await asyncio.sleep(minutes * 60 * random.uniform(0.8, 1.2))
-        digest = await heartbeat_digest(db, tz, registry)
-        await agent.push(f"[heartbeat {clock.format_now(tz)}] {digest}")
+        try:
+            digest = await heartbeat_digest(db, tz, registry)
+            await agent.push(
+                f"[heartbeat {clock.format_now(tz)}] {digest}", activity=False
+            )
+        except Exception:
+            log.exception("heartbeat failed")
 
 
 async def dream_loop(dreamer: Dreamer) -> None:

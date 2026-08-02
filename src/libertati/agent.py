@@ -97,12 +97,14 @@ class Agent(ModelLoop):
         # append. Cache keys/breakpoints still determine actual hits.
         self.max_context_items = settings.context_max_items
         self.trim_context_items = settings.context_trim_items
-        self._queue: asyncio.Queue[str] = asyncio.Queue()
+        self._queue: asyncio.Queue[tuple[str, bool]] = asyncio.Queue()
         # Held for the whole of a turn. The dreaming loop takes the same
         # lock, which is how "the agent sleeps while it dreams" works:
         # a dream waits for the turn in flight and blocks the next one.
         self.turn_lock = asyncio.Lock()
-        # When the agent last finished a turn — the dream idle trigger.
+        # When the agent last did something real — the dream idle
+        # trigger. Heartbeat-only turns with no outward action leave it
+        # alone, or regular heartbeats would keep idleness at zero.
         self.last_active = datetime.now(UTC)
         self.prune_completed_reasoning = settings.prune_completed_reasoning
 
@@ -112,9 +114,11 @@ class Agent(ModelLoop):
         Besides trimming to a window boundary, drops any trailing items
         left dangling by a crash (a function call without its output, a
         reasoning item without its follow-up) — the API rejects such
-        context outright, which would wedge the agent permanently. Legacy
-        reasoning items without encrypted content (from before
-        ``store=False``) are dropped for the same reason.
+        context outright, which would wedge the agent permanently.
+        Everything up to the last legacy reasoning item (from before
+        ``store=False``) is dropped for the same reason: the item itself
+        has no encrypted content to send, and a function call whose
+        paired reasoning is missing is rejected just the same.
         """
         excluded_types = (
             ("reasoning", "message") if self.prune_completed_reasoning else ()
@@ -123,41 +127,52 @@ class Agent(ModelLoop):
             self.trim_context_items,
             exclude_types=excluded_types,
         )
-        items = [
-            item
-            for item in items
-            if not (
-                item.get("type") == "reasoning" and not item.get("encrypted_content")
-            )
-        ]
+        items = self._drop_legacy_reasoning(items)
         self._context = self._trim_dangling(self._trim_to_boundary(items))
         log.info("restored %d context items", len(self._context))
 
-    async def push(self, event: str) -> None:
-        """Queue an external event (formatted as text) for the agent."""
-        await self._queue.put(event)
+    async def push(self, event: str, *, activity: bool = True) -> None:
+        """Queue an external event (formatted as text) for the agent.
+
+        ``activity=False`` marks events (heartbeats) that should not by
+        themselves reset the dream idle clock; the clock still moves
+        when the turn they trigger reaches out to anyone.
+        """
+        await self._queue.put((event, activity))
 
     async def run_forever(self) -> None:
         """Consume events forever; cancel the task to stop.
 
         All events queued by the time one is picked up are appended as a
         single batch, then the agent takes one thinking/acting turn.
-        Failures are logged, dangling context is repaired and the loop
-        moves on. While the dreaming loop holds the turn lock, events
-        simply pile up in the queue and land as one batch on waking.
+        While the dreaming loop holds the turn lock, events simply pile
+        up in the queue and land as one batch on waking.
         """
         while True:
-            events = [await self._queue.get()]
+            batch = [await self._queue.get()]
             while not self._queue.empty():
-                events.append(self._queue.get_nowait())
-            async with self.turn_lock:
-                for event in events:
-                    await self._remember({"role": "user", "content": event})
-                try:
-                    await self._turn()
-                except Exception:
-                    log.exception("agent turn failed")
-                    self._context = self._trim_dangling(self._context)
+                batch.append(self._queue.get_nowait())
+            await self._process(batch)
+
+    async def _process(self, batch: list[tuple[str, bool]]) -> None:
+        """Run one turn over a batch of events and update the idle clock.
+
+        Failures are logged, dangling context is repaired and the caller
+        moves on. ``last_active`` moves only when the batch held real
+        activity or the turn acted outward — a heartbeat turn spent just
+        reading leaves it alone, so idleness can actually accumulate.
+        """
+        outward_before = self.tools.outward_calls
+        async with self.turn_lock:
+            for event, _ in batch:
+                await self._remember({"role": "user", "content": event})
+            try:
+                await self._turn()
+            except Exception:
+                log.exception("agent turn failed")
+                self._context = self._trim_dangling(self._context)
+        acted = self.tools.outward_calls > outward_before
+        if acted or any(activity for _, activity in batch):
             self.last_active = datetime.now(UTC)
 
     async def _remember(self, item: dict[str, Any]) -> None:
@@ -189,6 +204,30 @@ class Agent(ModelLoop):
                 log.warning("no event boundary in %d items; window emptied", len(items))
             return []
         return items[start:]
+
+    @staticmethod
+    def _drop_legacy_reasoning(items: list[dict[str, Any]]) -> list[dict[str, Any]]:
+        """Drop everything up to the last reasoning item lacking content.
+
+        Reasoning items persisted before ``store=False`` carry no
+        encrypted content, and the API rejects both such an item and any
+        function call whose paired reasoning item is missing — so the
+        window is cut just after the last one instead of filtering it
+        out in place.
+        """
+        last = next(
+            (
+                i
+                for i in range(len(items) - 1, -1, -1)
+                if items[i].get("type") == "reasoning"
+                and not items[i].get("encrypted_content")
+            ),
+            None,
+        )
+        if last is None:
+            return items
+        log.warning("dropping %d items up to a legacy reasoning item", last + 1)
+        return items[last + 1 :]
 
     @staticmethod
     def _trim_dangling(items: list[dict[str, Any]]) -> list[dict[str, Any]]:

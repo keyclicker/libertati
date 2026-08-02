@@ -141,6 +141,14 @@ class Database:
         self._conn.row_factory = aiosqlite.Row
         await self._conn.execute("PRAGMA journal_mode = WAL")
         await self._conn.execute("PRAGMA foreign_keys = ON")
+        # SQLite's own LIKE/NOCASE are case-insensitive for ASCII only;
+        # message search needs real Unicode folding (Cyrillic etc.).
+        await self._conn.create_function(
+            "casefold",
+            1,
+            lambda text: text.casefold() if text else "",
+            deterministic=True,
+        )
         await self._conn.executescript(SCHEMA)
         # ``CREATE TABLE IF NOT EXISTS`` does not add columns to DBs
         # created before usage snapshots gained context linkage.
@@ -422,8 +430,9 @@ class Database:
             SELECT c.id AS chat_id, c.type, c.title,
                    u.first_name, u.username, m.date
             FROM chats c
-            JOIN messages m ON m.chat_id = c.id AND m.date = (
-                SELECT MAX(date) FROM messages WHERE chat_id = c.id
+            JOIN messages m ON m.rowid = (
+                SELECT rowid FROM messages WHERE chat_id = c.id
+                ORDER BY date DESC, message_id DESC LIMIT 1
             )
             LEFT JOIN users u ON u.id = m.from_user_id
             WHERE m.outgoing = 0
@@ -453,7 +462,7 @@ class Database:
             self._MESSAGE_ROW
             + """
             WHERE m.chat_id = ? AND (? IS NULL OR m.message_id < ?)
-            ORDER BY m.date DESC LIMIT ?
+            ORDER BY m.date DESC, m.message_id DESC LIMIT ?
         """
         )
         params = (chat_id, before_message_id, before_message_id, limit)
@@ -466,20 +475,19 @@ class Database:
     ) -> list[dict]:
         """Return a chat's messages containing ``needle``, newest first.
 
-        Case-insensitive substring match over text and caption; rows have
-        the same shape as :meth:`recent_messages`.
+        Literal substring match over text and caption, case-insensitive
+        via Unicode casefold (LIKE would only fold ASCII); rows have the
+        same shape as :meth:`recent_messages`.
         """
-        escaped = needle.replace("\\", "\\\\").replace("%", "\\%").replace("_", "\\_")
         query = (
             self._MESSAGE_ROW
-            + r"""
-            WHERE m.chat_id = ? AND (m.text LIKE ? ESCAPE '\'
-                                     OR m.caption LIKE ? ESCAPE '\')
-            ORDER BY m.date DESC LIMIT ?
+            + """
+            WHERE m.chat_id = ? AND (instr(casefold(m.text), casefold(?))
+                                     OR instr(casefold(m.caption), casefold(?)))
+            ORDER BY m.date DESC, m.message_id DESC LIMIT ?
         """
         )
-        pattern = f"%{escaped}%"
-        params = (chat_id, pattern, pattern, limit)
+        params = (chat_id, needle, needle, limit)
         async with self.conn.execute(query, params) as cursor:
             return [dict(row) for row in await cursor.fetchall()]
 

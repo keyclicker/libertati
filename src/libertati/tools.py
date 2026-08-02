@@ -747,6 +747,10 @@ def function_names(tools: list[ToolParam]) -> frozenset[str]:
 #: ``send_message`` call would otherwise still reach its handler.
 DREAM_TOOL_NAMES: frozenset[str] = function_names(DREAM_API_TOOLS)
 
+#: Tools that visibly act on Telegram. Dispatching one counts as real
+#: activity for the dream idle clock, unlike read-only lookups.
+OUTWARD_TOOL_NAMES: frozenset[str] = function_names(MESSAGING_TOOLS)
+
 
 def build_tools(web_search: bool, *, dreaming: bool = False) -> list[ToolParam]:
     """Return the tool list for the API, optionally with built-in web search.
@@ -812,6 +816,9 @@ class Toolbox:
         #: Tool calls dispatched so far; the dreaming loop resets it per
         #: dream and ``wake_up`` refuses to fire below the minimum.
         self.steps = 0
+        #: Outward (Telegram-visible) calls dispatched so far; the agent
+        #: loop samples it around a turn to feed the dream idle clock.
+        self.outward_calls = 0
         #: Set by ``wake_up`` to the summary that ends the dream.
         self.wake_summary: str | None = None
         self._handlers = {
@@ -870,6 +877,8 @@ class Toolbox:
         except json.JSONDecodeError:
             return "error: invalid tool arguments"
         self.steps += 1
+        if name in OUTWARD_TOOL_NAMES:
+            self.outward_calls += 1
         log.info("tool call: %s(%s)", name, args)
         try:
             return await handler(args)

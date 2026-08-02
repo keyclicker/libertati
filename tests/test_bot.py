@@ -1,13 +1,20 @@
 """Tests for event formatting and routing of incoming Telegram messages."""
 
 from pathlib import Path
-from typing import Any
+from typing import Any, cast
 from zoneinfo import ZoneInfo
 
 from aiogram.types import Message, User
 
-from libertati.bot import EVENT_TEXT_LIMIT, format_event, is_addressed, on_message
+from libertati.bot import (
+    EVENT_TEXT_LIMIT,
+    deliver_wakeups,
+    format_event,
+    is_addressed,
+    on_message,
+)
 from libertati.chats import ChatRegistry
+from libertati.db import Database
 
 UTC_TZ = ZoneInfo("UTC")
 
@@ -85,7 +92,7 @@ class FakeAgent:
         """Start with an empty event list."""
         self.events: list[str] = []
 
-    async def push(self, event: str) -> None:
+    async def push(self, event: str, *, activity: bool = True) -> None:
         """Store the event."""
         self.events.append(event)
 
@@ -101,6 +108,13 @@ def test_is_addressed_mention() -> None:
     """A case-insensitive @username mention addresses the bot."""
     assert is_addressed(make_group_message(text="hey @libertati_bot, hi"), ME)
     assert not is_addressed(make_group_message(text="hey @someone_else"), ME)
+
+
+def test_is_addressed_mention_is_bounded() -> None:
+    """Neither a longer username nor an email-like string is a mention."""
+    assert not is_addressed(make_group_message(text="cc @libertati_bot_2"), ME)
+    assert not is_addressed(make_group_message(text="mail me@libertati_bot"), ME)
+    assert is_addressed(make_group_message(text="(@Libertati_Bot)"), ME)
 
 
 def test_is_addressed_caption_mention() -> None:
@@ -138,6 +152,16 @@ async def test_on_message_group_needs_address() -> None:
     mention = make_group_message(text="ping @libertati_bot")
     await on_message(mention, agent, UTC_TZ, ME, OPEN_REGISTRY)  # type: ignore[arg-type]
     assert len(agent.events) == 1
+
+
+async def test_deliver_wakeups_pushes_due_and_completes(db: Database) -> None:
+    """A due wakeup becomes one event and leaves the pending set."""
+    agent = FakeAgent()
+    await db.add_wakeup("2000-01-01 00:00:00", "ping alice")
+    await deliver_wakeups(cast(Any, agent), db, UTC_TZ)
+    assert len(agent.events) == 1
+    assert "ping alice" in agent.events[0]
+    assert await db.pending_wakeups() == []
 
 
 async def test_on_message_approval_gate(tmp_path: Path) -> None:

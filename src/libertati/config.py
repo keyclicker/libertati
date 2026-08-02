@@ -21,8 +21,9 @@ class Settings(BaseSettings):
     defaults.
 
     ``settings.toml`` ships every non-secret setting explicitly and is the
-    file to edit. The defaults below only keep the app runnable without
-    it; the two are grouped in the same order so they read side by side.
+    file to edit. The defaults below only keep the file optional (the
+    secrets and ``model`` must then come from the environment); the two
+    are grouped in the same order so they read side by side.
     """
 
     model_config = SettingsConfigDict(
@@ -131,7 +132,8 @@ class Settings(BaseSettings):
     # Dreams allowed in a rolling 24 hours (0 disables dreaming, which
     # also hides the `dream` tool from the waking agent).
     dream_daily_budget: int = 4
-    # Quiet minutes before the agent falls asleep on its own.
+    # Quiet minutes before the agent falls asleep on its own. Heartbeat
+    # turns count as quiet unless the agent reached out during one.
     dream_idle_minutes: int = 300
     # Minimum gap between the end of one dream and the start of the next.
     dream_cooldown_minutes: int = 120
