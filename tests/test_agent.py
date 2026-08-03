@@ -1,199 +1,322 @@
-from __future__ import annotations
+"""Tests for the agent's context-window trimming logic."""
 
-from conftest import FakeLLM, assistant, make_message
-from libertati.config import Settings
-from libertati.llm.agent import Agent
-from libertati.llm.tools import ToolBox
-from libertati.news.reader import NewsReader
+import asyncio
+from datetime import UTC, datetime
+from types import SimpleNamespace
+from typing import Any, cast
+
+from libertati.agent import Agent
+from libertati.db import Database
+
+#: Window sizes used by the trim test (mirrors the settings defaults).
+MAX_CONTEXT_ITEMS = 300
+TRIM_CONTEXT_ITEMS = 200
+
+EVENT: dict[str, Any] = {"role": "user", "content": "[event] hi"}
+MESSAGE: dict[str, Any] = {
+    "type": "message",
+    "role": "assistant",
+    "content": [{"type": "output_text", "text": "ok"}],
+}
+REASONING: dict[str, Any] = {"type": "reasoning", "summary": []}
+CALL: dict[str, Any] = {
+    "type": "function_call",
+    "call_id": "call_1",
+    "name": "send_message",
+    "arguments": "{}",
+}
+CALL_OUTPUT: dict[str, Any] = {
+    "type": "function_call_output",
+    "call_id": "call_1",
+    "output": "sent",
+}
 
 
-def build_agent(settings, history, memory, script):
-    tools = ToolBox(history, memory, NewsReader(feeds=[]))
-    llm = FakeLLM(script)
-    return Agent(settings, llm, tools, history, memory), llm
+def test_trim_to_boundary_keeps_from_first_event() -> None:
+    """Leading non-event items are dropped up to the first event."""
+    items = [CALL_OUTPUT, MESSAGE, EVENT, MESSAGE]
+    assert Agent._trim_to_boundary(items) == [EVENT, MESSAGE]
 
 
-async def test_respond_plain(settings, history, memory):
-    await history.add_message(make_message("привіт", message_id=1))
-    agent, _ = build_agent(settings, history, memory, [assistant("йо, шо треба?")])
-    incoming = make_message("привіт", message_id=1)
-    reply = await agent.respond(incoming)
-    assert reply == "йо, шо треба?"
+def test_trim_to_boundary_ignores_assistant_messages() -> None:
+    """Assistant messages have a role too but are not event boundaries."""
+    items = [MESSAGE, EVENT]
+    assert Agent._trim_to_boundary(items) == [EVENT]
 
 
-async def test_respond_runs_tool_then_answers(settings, history, memory, tool_call):
-    await history.add_message(make_message("що ти памʼятаєш?", message_id=1))
-    memory.overwrite("self.md", "я Ана")
-    script = [
-        assistant(tool_calls=[tool_call("c1", "read_memory", {"path": "self.md"})]),
-        assistant("памʼятаю що я Ана"),
+def test_trim_to_boundary_empty_when_no_event() -> None:
+    """Without any event the window is emptied entirely."""
+    assert Agent._trim_to_boundary([MESSAGE, CALL, CALL_OUTPUT]) == []
+
+
+def test_trim_to_boundary_empty_input() -> None:
+    """An empty window stays empty."""
+    assert Agent._trim_to_boundary([]) == []
+
+
+def test_trim_dangling_drops_unanswered_call() -> None:
+    """A trailing function call without its output is removed."""
+    items = [EVENT, REASONING, CALL]
+    assert Agent._trim_dangling(items) == [EVENT]
+
+
+def test_trim_dangling_keeps_answered_call() -> None:
+    """A call followed by its output is complete and stays."""
+    items = [EVENT, CALL, CALL_OUTPUT]
+    assert Agent._trim_dangling(items) == items
+
+
+def test_trim_dangling_drops_trailing_reasoning() -> None:
+    """A bare trailing reasoning item is removed."""
+    items = [EVENT, REASONING]
+    assert Agent._trim_dangling(items) == [EVENT]
+
+
+def test_trim_dangling_keeps_completed_turn() -> None:
+    """Reasoning followed by a message is a complete turn."""
+    items = [EVENT, REASONING, MESSAGE]
+    assert Agent._trim_dangling(items) == items
+
+
+def test_trim_dangling_does_not_mutate_input() -> None:
+    """The original list is left untouched."""
+    items = [EVENT, CALL]
+    Agent._trim_dangling(items)
+    assert items == [EVENT, CALL]
+
+
+def test_drop_legacy_reasoning_cuts_paired_calls_too() -> None:
+    """The window is cut after the last legacy item, not filtered in place.
+
+    A function call whose paired reasoning item is missing is rejected by
+    the API just like the content-less reasoning item itself.
+    """
+    items = [EVENT, REASONING, CALL, CALL_OUTPUT, EVENT, MESSAGE]
+    assert Agent._drop_legacy_reasoning(items) == [CALL, CALL_OUTPUT, EVENT, MESSAGE]
+
+
+def test_drop_legacy_reasoning_keeps_encrypted_items() -> None:
+    """Reasoning items with encrypted content are valid input and stay."""
+    encrypted = {"type": "reasoning", "summary": [], "encrypted_content": "x"}
+    items = [EVENT, encrypted, MESSAGE]
+    assert Agent._drop_legacy_reasoning(items) == items
+
+
+def test_finish_turn_prunes_only_new_ephemeral_outputs() -> None:
+    """Settling removes new reasoning/messages but keeps durable items."""
+    old_message = dict(MESSAGE)
+    agent = Agent.__new__(Agent)
+    agent.prune_completed_reasoning = True
+    agent._context = [EVENT, old_message, REASONING, CALL, CALL_OUTPUT, MESSAGE]
+
+    agent._finish_turn(2)
+
+    assert agent._context == [EVENT, old_message, CALL, CALL_OUTPUT]
+
+
+def test_finish_turn_can_retain_complete_outputs() -> None:
+    """Disabling pruning preserves reasoning and assistant output."""
+    agent = Agent.__new__(Agent)
+    agent.prune_completed_reasoning = False
+    agent._context = [EVENT, REASONING, MESSAGE]
+
+    agent._finish_turn(1)
+
+    assert agent._context == [EVENT, REASONING, MESSAGE]
+
+
+class FakeContextDB:
+    """Persists nothing; satisfies _remember's write-through call."""
+
+    def __init__(self) -> None:
+        """Collect context and usage writes."""
+        self.items: list[dict[str, Any]] = []
+        self.usage: list[dict[str, Any]] = []
+        self.turns: list[dict[str, Any]] = []
+
+    async def append_context(self, item: dict[str, Any]) -> None:
+        """Collect one full-history item."""
+        self.items.append(item)
+
+    async def append_api_usage(self, **usage: Any) -> None:
+        """Collect one usage record."""
+        self.usage.append(usage)
+
+    async def latest_context_id(self) -> int:
+        """Use collected history length as a stable fake id."""
+        return len(self.items)
+
+    async def start_agent_turn(self, start_context_id: int) -> int:
+        """Collect a running turn and return its fake id."""
+        self.turns.append({"start_context_id": start_context_id, "status": "running"})
+        return len(self.turns)
+
+    async def finish_agent_turn(
+        self,
+        turn_id: int,
+        end_context_id: int,
+        status: str,
+    ) -> None:
+        """Close one collected fake turn."""
+        self.turns[turn_id - 1].update(
+            end_context_id=end_context_id,
+            status=status,
+        )
+
+
+async def test_remember_trims_in_chunks() -> None:
+    """Overflow cuts the window back to TRIM_CONTEXT_ITEMS in one go.
+
+    Chunked trimming keeps the context prefix stable between trims;
+    one-by-one trimming would shift the prefix on every append.
+    """
+    agent = Agent.__new__(Agent)
+    agent.db = cast(Database, FakeContextDB())
+    agent.max_context_items = MAX_CONTEXT_ITEMS
+    agent.trim_context_items = TRIM_CONTEXT_ITEMS
+    agent._context = [EVENT] * MAX_CONTEXT_ITEMS
+    await agent._remember(dict(EVENT))
+    assert len(agent._context) == TRIM_CONTEXT_ITEMS
+    head = agent._context[0]
+    await agent._remember(dict(EVENT))
+    assert len(agent._context) == TRIM_CONTEXT_ITEMS + 1
+    assert agent._context[0] is head
+
+
+STALE = datetime(2020, 1, 1, tzinfo=UTC)
+
+
+def make_processing_agent(outward_calls_per_turn: int = 0) -> Agent:
+    """Build a bare agent whose turn only makes fake outward tool calls."""
+    agent = Agent.__new__(Agent)
+    agent.db = cast(Database, FakeContextDB())
+    agent.max_context_items = MAX_CONTEXT_ITEMS
+    agent.trim_context_items = TRIM_CONTEXT_ITEMS
+    agent._context = []
+    agent.turn_lock = asyncio.Lock()
+    agent.tools = cast(Any, SimpleNamespace(outward_calls=0))
+    agent.last_active = STALE
+
+    async def turn() -> None:
+        agent.tools.outward_calls += outward_calls_per_turn
+
+    cast(Any, agent)._turn = turn
+    return agent
+
+
+async def test_process_heartbeat_only_leaves_idle_clock() -> None:
+    """A quiet heartbeat turn does not reset last_active.
+
+    Otherwise a heartbeat interval below dream_idle_minutes would make
+    the idle dream trigger unreachable.
+    """
+    agent = make_processing_agent()
+    await agent._process([("[heartbeat] all quiet", False)])
+    assert agent.last_active is STALE
+
+
+async def test_process_activity_event_resets_idle_clock() -> None:
+    """A batch with a real event moves last_active."""
+    agent = make_processing_agent()
+    await agent._process([("[heartbeat] quiet", False), ("[event] hi", True)])
+    assert agent.last_active is not STALE
+
+
+async def test_process_outward_action_resets_idle_clock() -> None:
+    """A heartbeat turn that reached out to someone counts as activity."""
+    agent = make_processing_agent(outward_calls_per_turn=1)
+    await agent._process([("[heartbeat] quiet", False)])
+    assert agent.last_active is not STALE
+
+
+class FakeOutputItem:
+    """Minimal Responses API output item used by the turn test."""
+
+    def __init__(self, item: dict[str, Any]) -> None:
+        """Expose its type and serialized payload."""
+        self.type = item["type"]
+        self.item = item
+
+    def model_dump(self, **_: Any) -> dict[str, Any]:
+        """Return the canned API payload."""
+        return dict(self.item)
+
+
+async def test_turn_persists_then_prunes_ephemeral_outputs() -> None:
+    """Completed output remains in SQLite but leaves the live window."""
+    response = SimpleNamespace(
+        id="resp_1",
+        model="gpt-test",
+        output=[FakeOutputItem(REASONING), FakeOutputItem(MESSAGE)],
+        output_text="",
+        usage=None,
+    )
+    calls: list[dict[str, Any]] = []
+
+    async def create(**kwargs: Any) -> Any:
+        calls.append(kwargs)
+        return response
+
+    db = FakeContextDB()
+    agent = Agent.__new__(Agent)
+    agent.client = cast(Any, SimpleNamespace(responses=SimpleNamespace(create=create)))
+    agent.model = "gpt-test"
+    agent.mind = cast(Any, SimpleNamespace(soul=lambda: "soul"))
+    agent.base_prompt = "base"
+    agent.max_rounds = 1
+    agent.max_context_items = MAX_CONTEXT_ITEMS
+    agent.trim_context_items = TRIM_CONTEXT_ITEMS
+    agent._context = [EVENT]
+    agent._api_tools = []
+    agent.reasoning = {"effort": "low", "context": "current_turn"}
+    agent.prune_completed_reasoning = True
+    agent.db = cast(Database, db)
+
+    await agent._turn()
+
+    assert calls[0]["reasoning"]["context"] == "current_turn"
+    assert db.items == [REASONING, MESSAGE]
+    assert agent._context == [EVENT]
+    assert db.turns == [
+        {"start_context_id": 0, "end_context_id": 2, "status": "completed"}
     ]
-    agent, llm = build_agent(settings, history, memory, script)
-    reply = await agent.respond(make_message("що ти памʼятаєш?", message_id=1))
-    assert reply == "памʼятаю що я Ана"
-    # the tool result must have been fed back to the model
-    last_call = llm.calls[-1]
-    assert any(m.get("role") == "tool" for m in last_call)
 
 
-async def test_respond_tool_updates_memory(settings, history, memory, tool_call):
-    await history.add_message(make_message("я люблю пітон", message_id=1))
-    call = tool_call("c1", "remember_user", {"handle": "@alice", "note": "любить пітон"})
-    script = [
-        assistant(tool_calls=[call]),
-        assistant("окей, запамʼятала"),
+async def test_record_usage_maps_all_authoritative_counts() -> None:
+    """Response usage fields map into persistent records unchanged."""
+    db = FakeContextDB()
+    agent = Agent.__new__(Agent)
+    agent.db = cast(Database, db)
+    agent.model = "fallback-model"
+    response = SimpleNamespace(
+        id="resp_1",
+        model="actual-model",
+        usage=SimpleNamespace(
+            input_tokens=100,
+            input_tokens_details=SimpleNamespace(
+                cached_tokens=80,
+                cache_write_tokens=20,
+            ),
+            output_tokens=30,
+            output_tokens_details=SimpleNamespace(reasoning_tokens=25),
+            total_tokens=130,
+        ),
+    )
+
+    await agent._record_usage(response, turn_id=7, input_context_id=42)
+
+    assert db.usage == [
+        {
+            "response_id": "resp_1",
+            "turn_id": 7,
+            "dream_id": None,
+            "input_context_id": 42,
+            "model": "actual-model",
+            "input_tokens": 100,
+            "cached_tokens": 80,
+            "cache_write_tokens": 20,
+            "output_tokens": 30,
+            "reasoning_tokens": 25,
+            "total_tokens": 130,
+        }
     ]
-    agent, _ = build_agent(settings, history, memory, script)
-    await agent.respond(make_message("я люблю пітон", message_id=1))
-    assert "пітон" in memory.read_user("@alice")
-
-
-async def test_tool_loop_cap(settings, history, memory, tool_call):
-    # model keeps calling tools forever; loop must terminate and still answer
-    script = [
-        assistant(tool_calls=[tool_call(f"c{i}", "read_memory", {"path": "self.md"})])
-        for i in range(20)
-    ]
-    script.append(assistant("нарешті відповідь"))
-    agent, _ = build_agent(settings, history, memory, script)
-    reply = await agent.respond(make_message("hi", message_id=1))
-    assert isinstance(reply, str)
-    assert reply  # non-empty final answer
-
-
-async def test_heartbeat_pass(settings, history, memory):
-    agent, _ = build_agent(settings, history, memory, [assistant("PASS")])
-    assert await agent.heartbeat() is None
-
-
-async def test_heartbeat_action(settings, history, memory):
-    payload = '{"target": "@alice", "text": "ти живий?"}'
-    agent, _ = build_agent(settings, history, memory, [assistant(payload)])
-    action = await agent.heartbeat()
-    assert action is not None
-    assert action.target == "@alice"
-    assert action.text == "ти живий?"
-
-
-async def test_dream_writes_diary(settings, history, memory):
-    agent, _ = build_agent(settings, history, memory, [assistant("сьогодні я думала про свободу")])
-    reflection = await agent.dream()
-    assert "свободу" in reflection
-    diary = memory.read(memory.diary_path())
-    assert "свободу" in diary
-
-
-async def test_browse_returns_remark_and_notes(settings, history, memory, tool_call):
-    script = [
-        assistant(tool_calls=[tool_call("c1", "update_memory",
-                  {"path": "reading.md", "content": "- цікавий пост про ринки"})]),
-        assistant("бачила в каналі мут про ринки, лол"),
-    ]
-    agent, _ = build_agent(settings, history, memory, script)
-    remark = await agent.browse("канал @markets", "author: ринки падають")
-    assert "ринки" in remark
-    assert "ринки" in memory.read("reading.md")
-
-
-async def test_browse_pass(settings, history, memory):
-    agent, _ = build_agent(settings, history, memory, [assistant("PASS")])
-    remark = await agent.browse("канал @dull", "author: нічого цікавого")
-    assert remark.strip().upper() == "PASS"
-
-
-async def test_respond_includes_recent_messages_beyond_thread(settings, history, memory):
-    # an OLD reply thread: root (msg 1) <- reply (msg 2)
-    await history.add_message(make_message("стара тема корінь", message_id=1))
-    await history.add_message(make_message("стара тема відповідь", message_id=2, reply_to=1))
-    # newer, unrelated chatter in the same chat (not part of the thread)
-    await history.add_message(make_message("свіже повідомлення A", message_id=10))
-    await history.add_message(make_message("свіже повідомлення B", message_id=11))
-
-    agent, llm = build_agent(settings, history, memory, [assistant("ок")])
-    # reply to the OLD message 2
-    await agent.respond(make_message("стара тема відповідь", message_id=2, reply_to=1))
-
-    convo = " ".join(m["content"] for m in llm.calls[-1] if m["role"] in ("user", "assistant"))
-    assert "стара тема корінь" in convo        # thread is present
-    assert "свіже повідомлення A" in convo      # and so are recent unrelated messages
-    assert "свіже повідомлення B" in convo
-
-
-async def test_recent_context_respects_char_budget(history, memory):
-    s = Settings(openai_api_key="k", bot_token="1:x", recent_context_chars=10)
-    await history.add_message(make_message("root", message_id=1))
-    await history.add_message(make_message("x" * 30, message_id=10))
-    await history.add_message(make_message("y" * 30, message_id=11))
-
-    agent, llm = build_agent(s, history, memory, [assistant("ок")])
-    await agent.respond(make_message("root", message_id=1))
-
-    convo = " ".join(m["content"] for m in llm.calls[-1] if m["role"] == "user")
-    assert "x" * 30 not in convo  # each recent extra exceeds the 10-char budget
-    assert "y" * 30 not in convo
-
-
-async def test_memory_context_clips_large_files(settings, history, memory):
-    memory.overwrite("world.md", "\n".join(f"line {i}" for i in range(2000)))
-    agent, _ = build_agent(settings, history, memory, [assistant("ok")])
-    ctx = agent._memory_context()
-    # each file is clipped to the per-file budget (+ ellipsis + heading)
-    assert len(ctx) < settings.memory_context_file_chars + 200
-    assert ctx.startswith("## Памʼять")
-    assert "line 1999" in ctx  # tail (most recent) is what survives
-    assert "line 0" not in ctx
-
-
-async def test_memory_context_includes_user_and_group_when_replying(settings, history, memory):
-    memory.append(memory.user_path("@alice"), "- любить крипту")
-    memory.append(memory.group_path("Test Group"), "- багато мемів")
-    agent, _ = build_agent(settings, history, memory, [assistant("ok")])
-    ctx = agent._memory_context(make_message("шо там", message_id=1))
-    assert "любить крипту" in ctx
-    assert "багато мемів" in ctx
-
-
-async def test_respond_emits_correlated_turn(settings, history, memory, tool_call, tmp_path):
-    import json
-
-    from libertati.observability import EventLogger
-
-    await history.add_message(make_message("шо там?", message_id=1))
-    ev = EventLogger(path=tmp_path / "e.jsonl", enabled=True)
-    tools = ToolBox(history, memory, NewsReader(feeds=[]), events=ev)
-    script = [
-        assistant(tool_calls=[tool_call("c1", "read_memory", {"path": "self.md"})]),
-        assistant("та нічо, живу"),
-    ]
-    agent = Agent(settings, FakeLLM(script), tools, history, memory, events=ev)
-    await agent.respond(make_message("шо там?", message_id=1))
-    ev.close()
-
-    rows = [json.loads(x) for x in (tmp_path / "e.jsonl").read_text().splitlines()]
-    types = [r["type"] for r in rows]
-    assert types[0] == "turn_start" and types[-1] == "turn_end"
-    assert "tool_call" in types and "reply" in types
-    # everything shares one turn id
-    assert len({r["turn"] for r in rows}) == 1
-    end = next(r for r in rows if r["type"] == "turn_end")
-    assert end["kind"] == "respond"
-    assert end["tool_calls"] == 1
-
-
-async def test_tool_loop_cap_emits_event(settings, history, memory, tool_call, tmp_path):
-    import json
-
-    from libertati.observability import EventLogger
-
-    ev = EventLogger(path=tmp_path / "e.jsonl", enabled=True)
-    tools = ToolBox(history, memory, NewsReader(feeds=[]), events=ev)
-    script = [
-        assistant(tool_calls=[tool_call(f"c{i}", "read_memory", {"path": "self.md"})])
-        for i in range(20)
-    ]
-    script.append(assistant("нарешті"))
-    agent = Agent(settings, FakeLLM(script), tools, history, memory, events=ev)
-    await agent.respond(make_message("hi", message_id=1))
-    ev.close()
-    rows = [json.loads(x) for x in (tmp_path / "e.jsonl").read_text().splitlines()]
-    assert any(r["type"] == "tool_loop_cap" for r in rows)

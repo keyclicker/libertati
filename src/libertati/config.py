@@ -1,127 +1,189 @@
-"""Application configuration loaded from environment / .env."""
-
-from __future__ import annotations
+"""Application settings loaded from the environment and config files."""
 
 from pathlib import Path
-from typing import Annotated, Literal
+from typing import Literal
 
-from pydantic import Field, field_validator
-from pydantic_settings import BaseSettings, NoDecode, SettingsConfigDict
-
-TelegramMode = Literal["bot", "account"]
-
-DEFAULT_NEWS_FEEDS = [
-    "https://feeds.bbci.co.uk/news/world/rss.xml",
-    "https://www.pravda.com.ua/rss/",
-    "https://hnrss.org/frontpage",
-]
+from pydantic import model_validator
+from pydantic_settings import (
+    BaseSettings,
+    PydanticBaseSettingsSource,
+    SettingsConfigDict,
+    TomlConfigSettingsSource,
+)
 
 
 class Settings(BaseSettings):
-    """Runtime settings. Validation errors fail fast at startup."""
+    """Runtime configuration.
+
+    Values are merged from several sources; the first one that provides a
+    value wins: real environment variables (``LIBERTATI_*``), the ``.env``
+    file (secrets), ``settings.toml`` (non-secret settings), then field
+    defaults.
+
+    ``settings.toml`` ships every non-secret setting explicitly and is the
+    file to edit. The defaults below only keep the file optional (the
+    secrets and ``model`` must then come from the environment); the two
+    are grouped in the same order so they read side by side.
+    """
 
     model_config = SettingsConfigDict(
-        env_file=".env",
-        env_file_encoding="utf-8",
-        extra="ignore",
         env_prefix="LIBERTATI_",
+        env_file=".env",
+        toml_file="settings.toml",
+        extra="ignore",
     )
 
-    # --- Telegram -----------------------------------------------------------
-    telegram_mode: TelegramMode = "bot"
-    bot_token: str = ""
-    tg_api_id: int = 0
-    tg_api_hash: str = ""
-    tg_session: str = "libertati"  # session name (account mode)
+    # ==========================================================
+    #                         Secrets
+    # ==========================================================
 
-    # --- OpenAI -------------------------------------------------------------
-    openai_api_key: str = ""
-    openai_base_url: str | None = None
-    openai_model: str = "gpt-4o-mini"
-    openai_temperature: float = 1.0
-    openai_max_tool_iterations: int = 6
+    bot_token: str
+    api_key: str
 
-    # --- Storage ------------------------------------------------------------
-    db_path: Path = Path("data/libertati.db")
-    memory_dir: Path = Path("memory")
-    max_thread_chars: int = 5000
-    # On top of the reply thread, include a small window of recent chat messages so the
-    # bot also sees what's happening *now*, not only the (possibly old) thread it replies to.
-    recent_context_messages: int = 20
-    recent_context_chars: int = 1200
-    # Hard cap per memory file on disk; oldest lines are trimmed past this.
-    memory_max_file_chars: int = 4000
-    # Per-file budget when a memory file is injected into the prompt (keeps the tail).
-    memory_context_file_chars: int = 700
+    # ==========================================================
+    #                         Runtime
+    # ==========================================================
 
-    # --- Behaviour ----------------------------------------------------------
-    respond_to_all: bool = True
-    # In group chats, always reply when addressed (mentioned / replied-to); for other
-    # ("ambient") group messages reply only with this small probability — it lurks like a
-    # person and speaks up mostly when spoken to, not on every message.
-    group_reply_chance: float = 0.05
-    # Human-like pause before sending, scaled by reply length (seconds/char), capped.
-    typing_delay_enabled: bool = True
-    typing_delay_max_seconds: float = 5.0
-    heartbeat_enabled: bool = True
-    dream_enabled: bool = True
-    news_refresh_hours: int = 6
-    news_feeds: Annotated[list[str], NoDecode] = Field(
-        default_factory=lambda: list(DEFAULT_NEWS_FEEDS)
-    )
-
-    # Chats the bot is allowed to talk in (ids and/or @usernames). Empty = everywhere.
-    allowed_chats: Annotated[list[str], NoDecode] = Field(default_factory=list)
-
-    # --- Browsing (reading other chats/channels; account mode only) ---------
-    browse_enabled: bool = False
-    browse_channels: Annotated[list[str], NoDecode] = Field(default_factory=list)
-    browse_public_only: bool = True
-    browse_times_per_day: int = 3
-    browse_read_limit: int = 15
-
-    # --- Persona ------------------------------------------------------------
-    bot_full_name: str = "Ana Tati"
-    bot_handle: str = "@libertati"
-    bot_username: str = "@libertati_bot"
-
-    # --- Logging / observability --------------------------------------------
     log_level: str = "INFO"
-    event_log_enabled: bool = True
-    event_log_path: Path = Path("data/events.jsonl")
-    log_message_content: bool = True
-    log_content_max_chars: int = 300
+    # Timezone the agent lives in (event timestamps, wakeup scheduling).
+    timezone: str = "UTC"
 
-    @field_validator("news_feeds", "allowed_chats", "browse_channels", mode="before")
+    # ==========================================================
+    #                         Storage
+    # ==========================================================
+
+    db_path: Path = Path("data/libertati.db")
+    # Directory holding SOUL.md / MEMORY.md / INBOX.md / DREAMS.md.
+    memory_dir: Path = Path("data/memory")
+
+    # ==========================================================
+    #                     Model & reasoning
+    # ==========================================================
+
+    # Any OpenAI-compatible endpoint (OpenRouter, local, …); None = OpenAI.
+    base_url: str | None = None
+    model: str
+    # For reasoning models: none/minimal/low/medium/high/xhigh/max
+    # (model-dependent); None sends no preference.
+    reasoning_effort: str | None = None
+    # Which prior reasoning OpenAI may render into a new sample. "omit"
+    # sends no context parameter for providers that do not support it.
+    reasoning_context: Literal["auto", "current_turn", "all_turns", "omit"] = (
+        "current_turn"
+    )
+    # Remove reasoning and assistant output envelopes from the live
+    # window after each turn. Full history remains in SQLite; enabling
+    # this can reduce prompt-cache reuse for the completed-turn suffix.
+    prune_completed_reasoning: bool = False
+    # Model for the one-shot recall extraction behind `recall` and
+    # `summarize_memory`; None = main model.
+    recall_model: str | None = None
+    # Reasoning effort for that extraction call. It is a lookup, not a
+    # problem to think about, so "none" is the sensible setting where the
+    # model supports it; None sends no preference.
+    recall_reasoning_effort: str | None = None
+    # Model used while dreaming; None = main model.
+    dream_model: str | None = None
+
+    # ==========================================================
+    #                      Context window
+    # ==========================================================
+
+    # Cut back to context_trim_items once the window grows past
+    # context_max_items. Trimming in chunks keeps the prompt prefix
+    # byte-stable between trims instead of rewriting it on every append.
+    context_max_items: int = 300
+    context_trim_items: int = 200
+    # Max model/tool rounds per agent turn (one turn per event batch).
+    max_rounds: int = 8
+
+    # ==========================================================
+    #                         Persona
+    # ==========================================================
+
+    # User-editable agent and memory prompts.
+    prompts_path: Path = Path("prompts.toml")
+    # Harden the persona: never break character, never admit to being a
+    # bot/assistant, never discuss internals, no free assistant labor.
+    roleplay: bool = False
+    # Enable OpenAI's built-in web search tool (server-side; most
+    # OpenAI-compatible endpoints don't support it).
+    web_search: bool = False
+
+    # ==========================================================
+    #                    Chats & presence
+    # ==========================================================
+
+    # Approval mode: when on, only chats marked true in chats_path reach
+    # the agent; new chats are appended there as false for review.
+    chat_approval: bool = True
+    # Chat approval registry (user-editable TOML, re-read live).
+    chats_path: Path = Path("data/chats.toml")
+    # Minutes between heartbeat status events (0 disables, ±20% jitter).
+    heartbeat_minutes: int = 180
+    # Simulated typing speed for outgoing messages, chars/second
+    # (0 disables the typing emulation).
+    typing_chars_per_second: float = 15.0
+
+    # ==========================================================
+    #                         Dreaming
+    # ==========================================================
+
+    # Dreams allowed in a rolling 24 hours (0 disables dreaming, which
+    # also hides the `dream` tool from the waking agent).
+    dream_daily_budget: int = 4
+    # Quiet minutes before the agent falls asleep on its own. Heartbeat
+    # turns count as quiet unless the agent reached out during one.
+    dream_idle_minutes: int = 300
+    # Minimum gap between the end of one dream and the start of the next.
+    dream_cooldown_minutes: int = 120
+    # Tool calls a dream must take (wake_up included) before wake_up is
+    # accepted — a dream is meant to wander, not to tidy up and leave.
+    dream_min_steps: int = 12
+    # Hard cap on model/tool rounds in one dream.
+    dream_max_rounds: int = 25
+
+    @model_validator(mode="after")
+    def _validate_context_window(self) -> "Settings":
+        """Reject inconsistent context-management settings."""
+        if not 0 < self.context_trim_items < self.context_max_items:
+            raise ValueError(
+                "context_trim_items must be positive and smaller than context_max_items"
+            )
+        if self.prune_completed_reasoning and self.reasoning_context != "current_turn":
+            raise ValueError(
+                "prune_completed_reasoning requires reasoning_context='current_turn'"
+            )
+        return self
+
+    @model_validator(mode="after")
+    def _validate_dreaming(self) -> "Settings":
+        """Reject dream settings that could never produce a dream."""
+        if self.dream_daily_budget < 0:
+            raise ValueError("dream_daily_budget must not be negative")
+        if self.dream_max_rounds < 1:
+            raise ValueError("dream_max_rounds must be positive")
+        if self.dream_min_steps > self.dream_max_rounds:
+            raise ValueError(
+                "dream_min_steps must not exceed dream_max_rounds,"
+                " or no dream could ever wake up on its own"
+            )
+        return self
+
     @classmethod
-    def _split_csv(cls, v: object) -> object:
-        # allow comma-separated env value
-        if isinstance(v, str):
-            return [item.strip() for item in v.split(",") if item.strip()]
-        return v
-
-    def is_chat_allowed(self, chat_id: int, username: str | None) -> bool:
-        """Whether the bot may proactively talk in this chat."""
-        if not self.allowed_chats:
-            return True
-        allowed = {entry.lstrip("@").lower() for entry in self.allowed_chats}
-        if str(chat_id) in allowed:
-            return True
-        return bool(username and username.lstrip("@").lower() in allowed)
-
-    def validate_runtime(self) -> None:
-        """Assert the settings required for the chosen mode are present."""
-        if not self.openai_api_key:
-            raise ValueError("LIBERTATI_OPENAI_API_KEY is required")
-        if self.telegram_mode == "bot":
-            if not self.bot_token:
-                raise ValueError("LIBERTATI_BOT_TOKEN is required in bot mode")
-        elif self.telegram_mode == "account":
-            if not (self.tg_api_id and self.tg_api_hash):
-                raise ValueError(
-                    "LIBERTATI_TG_API_ID and LIBERTATI_TG_API_HASH are required in account mode"
-                )
-
-
-def load_settings() -> Settings:
-    return Settings()
+    def settings_customise_sources(
+        cls,
+        settings_cls: type[BaseSettings],
+        init_settings: PydanticBaseSettingsSource,
+        env_settings: PydanticBaseSettingsSource,
+        dotenv_settings: PydanticBaseSettingsSource,
+        file_secret_settings: PydanticBaseSettingsSource,
+    ) -> tuple[PydanticBaseSettingsSource, ...]:
+        """Insert the TOML source below env/.env in the priority order."""
+        return (
+            init_settings,
+            env_settings,
+            dotenv_settings,
+            TomlConfigSettingsSource(settings_cls),
+            file_secret_settings,
+        )

@@ -1,97 +1,200 @@
-from __future__ import annotations
+"""Tests for the file-based mind (SOUL.md / MEMORY.md / INBOX.md / DREAMS.md)."""
+
+import stat
+from pathlib import Path
 
 import pytest
 
-from libertati.storage.memory import slugify
+from libertati.memory import (
+    DEFAULT_SOUL,
+    MEMORY_MAX_CHARS,
+    SOUL_MAX_CHARS,
+    Mind,
+)
 
 
-def test_slugify():
-    assert slugify("@Alice") == "alice"
-    assert slugify("Cool Group!") == "cool-group"
-    assert slugify("Тест") == "unknown"  # non-ascii stripped -> fallback
+def make_mind(tmp_path: Path) -> Mind:
+    """Build an ensured Mind in a temporary directory."""
+    mind = Mind(tmp_path / "mind")
+    mind.ensure()
+    return mind
 
 
-def test_read_write_overwrite(memory):
-    assert memory.read("self.md") == ""
-    memory.overwrite("self.md", "I am Ana")
-    assert memory.read("self.md").strip() == "I am Ana"
-    memory.overwrite("self.md", "new content")
-    assert memory.read("self.md").strip() == "new content"
+def test_ensure_creates_and_seeds(tmp_path: Path) -> None:
+    """First run creates the directory, seeds SOUL.md, touches the rest."""
+    mind = make_mind(tmp_path)
+    assert mind.soul_path.read_text(encoding="utf-8") == DEFAULT_SOUL
+    assert mind.memory_path.read_text(encoding="utf-8") == ""
+    assert mind.inbox_path.read_text(encoding="utf-8") == ""
+    assert mind.dreams_path.read_text(encoding="utf-8") == ""
 
 
-def test_append(memory):
-    memory.append("todo.md", "- first")
-    memory.append("todo.md", "- second")
-    content = memory.read("todo.md")
-    assert "first" in content and "second" in content
-    assert content.index("first") < content.index("second")
+def test_mind_files_are_private_to_their_owner(tmp_path: Path) -> None:
+    """Long-term memory is not readable by other local users."""
+    mind = make_mind(tmp_path)
+    assert stat.S_IMODE(mind.path.stat().st_mode) == 0o700
+    for file in (
+        mind.soul_path,
+        mind.memory_path,
+        mind.inbox_path,
+        mind.dreams_path,
+    ):
+        assert stat.S_IMODE(file.stat().st_mode) == 0o600
 
 
-def test_user_and_group_paths(memory):
-    memory.append(memory.user_path("@Bob"), "- likes rust")
-    assert "rust" in memory.read_user("@Bob")
-    memory.append(memory.group_path("Fun Chat"), "- meme central")
-    assert "meme" in memory.read_group("Fun Chat")
-    assert "bob" in memory.list_users()
+def test_ensure_is_idempotent(tmp_path: Path) -> None:
+    """Re-running ensure never overwrites edited files."""
+    mind = make_mind(tmp_path)
+    mind.soul_path.write_text("custom soul", encoding="utf-8")
+    mind.append_inbox("a fact", "Sun 2026-08-02 12:00")
+    mind.ensure()
+    assert mind.soul() == "custom soul"
+    assert "a fact" in mind.notes()
 
 
-def test_path_traversal_rejected(memory):
-    with pytest.raises(ValueError):
-        memory.read("../secret.md")
-    with pytest.raises(ValueError):
-        memory.overwrite("/etc/passwd.md", "x")
+def test_ensure_migrates_legacy_diary(tmp_path: Path) -> None:
+    """A DIARY.md from before the rename becomes the dream journal."""
+    mind = Mind(tmp_path / "mind")
+    mind.path.mkdir(parents=True)
+    (mind.path / "DIARY.md").write_text("old entry\n", encoding="utf-8")
+
+    mind.ensure()
+
+    assert not (mind.path / "DIARY.md").exists()
+    assert mind.read("dreams") == "old entry"
 
 
-def test_non_md_rejected(memory):
-    with pytest.raises(ValueError):
-        memory.read("self.txt")
+def test_ensure_keeps_existing_dreams_over_legacy_diary(tmp_path: Path) -> None:
+    """A real journal is never clobbered by a stale DIARY.md."""
+    mind = Mind(tmp_path / "mind")
+    mind.path.mkdir(parents=True)
+    (mind.path / "DIARY.md").write_text("old entry\n", encoding="utf-8")
+    mind.dreams_path.write_text("real journal\n", encoding="utf-8")
+
+    mind.ensure()
+
+    assert mind.read("dreams") == "real journal"
 
 
-def test_memory_write_emits_event(tmp_path):
-    import json
-
-    from libertati.observability import EventLogger
-    from libertati.storage.memory import MemoryStore
-
-    ev = EventLogger(path=tmp_path / "e.jsonl", enabled=True)
-    mem = MemoryStore(tmp_path / "mem", events=ev)
-    mem.append("todo.md", "- one")
-    mem.append("todo.md", "- two")
-    ev.close()
-    rows = [json.loads(x) for x in (tmp_path / "e.jsonl").read_text().splitlines()]
-    writes = [r for r in rows if r["type"] == "memory_write"]
-    assert len(writes) == 2
-    assert writes[0]["path"] == "todo.md"
-    assert writes[0]["mode"] == "append"
-    assert writes[1]["delta"] > 0
+def test_append_inbox_format(tmp_path: Path) -> None:
+    """Entries are appended as dated markdown sections, in order."""
+    mind = make_mind(tmp_path)
+    mind.append_inbox("first", "Sun 2026-08-02 12:00")
+    mind.append_inbox("second", "Sun 2026-08-02 13:00")
+    assert mind.inbox_path.read_text(encoding="utf-8") == (
+        "## [Sun 2026-08-02 12:00]\nfirst\n\n## [Sun 2026-08-02 13:00]\nsecond\n\n"
+    )
 
 
-def test_max_file_chars_trims_oldest_keeping_header(tmp_path):
-    from libertati.storage.memory import MemoryStore
-
-    mem = MemoryStore(tmp_path / "mem", max_file_chars=120)
-    mem.overwrite("world.md", "# Світ")
-    for i in range(50):
-        mem.append("world.md", f"- подія номер {i}")
-    content = mem.read("world.md")
-    assert len(content) <= 120
-    assert content.startswith("# Світ")  # header preserved
-    assert "подія номер 49" in content   # most recent kept
-    assert "подія номер 0" not in content  # oldest trimmed away
+def test_notes_combines_memory_and_inbox(tmp_path: Path) -> None:
+    """notes() concatenates the non-empty files under section headers."""
+    mind = make_mind(tmp_path)
+    assert mind.notes() == ""
+    mind.append_inbox("fresh fact", "Sun 2026-08-02 12:00")
+    assert mind.notes() == "# Inbox\n## [Sun 2026-08-02 12:00]\nfresh fact"
+    mind.memory_path.write_text("curated fact\n", encoding="utf-8")
+    assert mind.notes() == (
+        "# Memory\ncurated fact\n\n# Inbox\n## [Sun 2026-08-02 12:00]\nfresh fact"
+    )
 
 
-def test_no_cap_keeps_everything(tmp_path):
-    from libertati.storage.memory import MemoryStore
+def test_append_dreams_format(tmp_path: Path) -> None:
+    """Journal entries mirror the inbox's dated-section shape."""
+    mind = make_mind(tmp_path)
+    mind.append_dreams("slept well", "Sun 2026-08-02 04:00")
+    assert mind.dreams_path.read_text(encoding="utf-8") == (
+        "## [Sun 2026-08-02 04:00]\nslept well\n\n"
+    )
 
-    mem = MemoryStore(tmp_path / "mem")  # no cap
-    for i in range(200):
-        mem.append("world.md", f"- line {i}")
-    assert "line 0" in mem.read("world.md")
-    assert "line 199" in mem.read("world.md")
+
+def test_read_rejects_unknown_file(tmp_path: Path) -> None:
+    """An unknown mind file name names the valid ones."""
+    mind = make_mind(tmp_path)
+    with pytest.raises(ValueError, match="unknown mind file"):
+        mind.read("secrets")
 
 
-def test_snapshot(memory):
-    memory.overwrite("world.md", "news")
-    snap = memory.snapshot()
-    assert set(snap) == {"self.md", "world.md", "social.md", "todo.md", "reading.md"}
-    assert snap["world.md"].strip() == "news"
+def test_dreams_tail_keeps_the_recent_end(tmp_path: Path) -> None:
+    """Only the trailing slice of a long journal is handed to a dream."""
+    mind = make_mind(tmp_path)
+    mind.dreams_path.write_text("x" * 100 + "recent", encoding="utf-8")
+
+    tail = mind.dreams_tail(20)
+
+    assert tail.endswith("recent")
+    assert tail.startswith("[…earlier entries elided…]")
+    assert mind.dreams_tail(1000) == "x" * 100 + "recent"
+
+
+def test_fold_inbox_rewrites_memory_and_clears_inbox(tmp_path: Path) -> None:
+    """Consolidation replaces memory and empties the inbox in one step."""
+    mind = make_mind(tmp_path)
+    mind.memory_path.write_text("stale\n", encoding="utf-8")
+    mind.append_inbox("fresh fact", "Sun 2026-08-02 12:00")
+
+    mind.fold_inbox("consolidated")
+
+    assert mind.read("memory") == "consolidated"
+    assert mind.read("inbox") == ""
+
+
+def test_fold_inbox_over_cap_touches_nothing(tmp_path: Path) -> None:
+    """An oversized rewrite is refused before either file is written."""
+    mind = make_mind(tmp_path)
+    mind.memory_path.write_text("keep me\n", encoding="utf-8")
+    mind.append_inbox("fresh fact", "Sun 2026-08-02 12:00")
+
+    with pytest.raises(ValueError, match="over the"):
+        mind.fold_inbox("x" * (MEMORY_MAX_CHARS + 1))
+
+    assert mind.read("memory") == "keep me"
+    assert "fresh fact" in mind.read("inbox")
+
+
+def test_fold_inbox_failed_encoding_preserves_both_files(tmp_path: Path) -> None:
+    """A failed replacement cannot truncate curated or pending memory."""
+    mind = make_mind(tmp_path)
+    mind.memory_path.write_text("keep me\n", encoding="utf-8")
+    mind.append_inbox("fresh fact", "Sun 2026-08-02 12:00")
+
+    with pytest.raises(UnicodeEncodeError):
+        mind.fold_inbox("\ud800")
+
+    assert mind.read("memory") == "keep me"
+    assert "fresh fact" in mind.read("inbox")
+
+
+def test_write_soul_snapshots_the_previous_version(tmp_path: Path) -> None:
+    """The old soul survives as a dated file next to the new one."""
+    mind = make_mind(tmp_path)
+
+    snapshot = mind.write_soul("a new person", "20260802T040000Z")
+
+    assert mind.soul() == "a new person"
+    assert snapshot.read_text(encoding="utf-8") == DEFAULT_SOUL
+    assert snapshot.parent == mind.soul_dir
+
+
+def test_write_soul_never_overwrites_same_stamp_snapshot(tmp_path: Path) -> None:
+    """Rapid revisions preserve every rollback point."""
+    mind = make_mind(tmp_path)
+    first = mind.write_soul("second soul", "20260802T040000Z")
+    second = mind.write_soul("third soul", "20260802T040000Z")
+
+    assert first.name == "20260802T040000Z.md"
+    assert second.name == "20260802T040000Z-1.md"
+    assert first.read_text(encoding="utf-8") == DEFAULT_SOUL
+    assert second.read_text(encoding="utf-8") == "second soul\n"
+
+
+def test_write_soul_rejects_oversized_and_empty(tmp_path: Path) -> None:
+    """Neither an empty nor a bloated soul replaces the current one."""
+    mind = make_mind(tmp_path)
+
+    with pytest.raises(ValueError, match="over the"):
+        mind.write_soul("x" * (SOUL_MAX_CHARS + 1), "20260802T040000Z")
+    with pytest.raises(ValueError, match="must not be empty"):
+        mind.write_soul("   ", "20260802T040000Z")
+
+    assert mind.soul_path.read_text(encoding="utf-8") == DEFAULT_SOUL
+    assert not mind.soul_dir.exists()

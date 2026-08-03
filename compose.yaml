@@ -1,0 +1,30 @@
+services:
+  libertati:
+    build: .
+    image: libertati
+    env_file: .env
+    volumes:
+      - ./settings.toml:/app/settings.toml:ro
+      - ./prompts.toml:/app/prompts.toml:ro
+      - ./data:/app/data
+    restart: unless-stopped
+    init: true
+
+    # Isolation hardening
+    read_only: true
+    tmpfs:
+      - /tmp:size=64m,mode=1777
+    cap_drop:
+      - ALL
+    security_opt:
+      - no-new-privileges:true
+    pids_limit: 256
+    mem_limit: 512m
+    cpus: 1.0
+
+    networks:
+      - libertati
+
+networks:
+  libertati:
+    driver: bridge

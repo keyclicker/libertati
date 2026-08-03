@@ -1,248 +1,99 @@
 # libertati
 
-An **agentic Telegram bot** that role-plays a persona ("Ana Tati"), remembers the people and
-groups it talks to, reads the news, and lives a little life of its own — messaging people on a
-randomized **heartbeat** and **dreaming** once a day to reflect and update its memory.
+An agentic Telegram bot: one LLM brain living across all chats.
 
-It's a full rewrite of the original 2023 GPT-3.5 bot: modern async stack, `uv`-managed,
-Docker + GitHub Actions, dual Telegram backends, and a test suite.
+Unlike a classic request/response bot, libertati runs a single persistent
+agent loop. Every incoming message from every chat (plus timers and
+heartbeats) is appended to one shared context timeline, and the model
+decides — deliberately, via a `send_message` tool — whether, where and
+when to reply. Plain assistant output is ignored and sends nothing.
 
-## Features
+## How it works
 
-- **Two Telegram backends** behind one interface:
-  - `bot` mode — the HTTP Bot API via [aiogram](https://aiogram.dev).
-  - `account` mode — the standard MTProto protocol as a real user account via
-    [Telethon](https://docs.telethon.dev).
-- **OpenAI-driven agent** (SDK v1+, function calling). Model and `base_url` are configurable, so
-  any OpenAI-compatible endpoint works.
-- **Persistent, indexed history** in SQLite with an FTS5 full-text index and reply-thread
-  reconstruction.
-- **Self-maintained markdown memory** the bot reads and writes via tools:
-  - `user/<handle>.md` — per-user facts, tone, running summary.
-  - `group/<slug>.md` — per-group dynamics, in-jokes, topics.
-  - `self.md` — the bot's evolving self-concept / persona journal.
-  - `world.md` — a running digest of news it has read.
-  - `social.md` — relationship graph and open threads.
-  - `todo.md` — follow-ups to raise with people on the next heartbeat.
-  - `diary/<date>.md` — nightly dream reflections.
-- **News reading** from configurable RSS/Atom feeds (a tool + a scheduled refresh).
-- **Random Telegram browsing** (account mode) — a few times a day it reads other chats/channels,
-  notes interesting things to `reading.md`, and may bring them up in conversation. The model can
-  also read a channel on demand via the `read_telegram` tool.
-- **Heartbeat** twice a day at randomized times — the bot may proactively message someone.
-- **Dreaming** once a day — it reviews history, reflects, and updates its memory.
-- **Human-like replying** — in groups it always answers when addressed (mentioned or replied-to)
-  but stays out of most ambient chatter, and pauses briefly (scaled by reply length) before
-  sending, so it reads like a person rather than an always-on bot.
-- **Bounded memory & context** — memory files are capped on disk (oldest lines trimmed) and
-  clipped per-file in the prompt; each reply mixes the focused reply thread with a small window
-  of recent messages, so token cost stays predictable as history and notes grow.
-- **Responds to all messages** by default, or only in an **allowlist of groups** you specify.
-- **Structured event log** (JSONL) tracing every turn — LLM calls (tokens/latency), tool calls,
-  memory writes and messages, correlated by turn id — so its real behavior can be analyzed and tuned.
-
-## Architecture
-
-```
-src/libertati/
-  config.py            pydantic-settings configuration
-  main.py              entrypoint: wires everything, runs the client + scheduler
-  telegram/            backend-agnostic client (base) + aiogram & telethon adapters + factory
-  storage/             SQLite db + history store (FTS5) + markdown memory store
-  llm/                 OpenAI client, tool schemas/dispatch, prompts, the Agent
-  news/                RSS reader
-  scheduler/           APScheduler jobs (heartbeat, dream, news, browse) + runner
-  observability.py     structured JSONL event log (per-turn behavioral telemetry)
-```
-
-The app depends only on the `TelegramClient` abstraction, so the two backends are
-interchangeable. The `Agent` runs a bounded tool-call loop over the tools in `llm/tools.py`.
-
-## Requirements
-
-- Python 3.12+
-- [uv](https://docs.astral.sh/uv/)
+- **Single brain** (`agent.py`): events queue up and are processed one
+  batch at a time on the OpenAI Responses API; the full context history
+  is persisted append-only in SQLite, with a capped tail window sent to
+  the model. The model/tool round engine itself lives in `loop.py` and
+  is shared with the dreaming loop.
+- **Tools** (`tools.py`): `send_message`, `get_recent_messages`, and
+  `schedule_wakeup` — the agent can set alarms for its future self.
+- **Dreaming** (`dream.py`): after a stretch of idleness — or when the
+  agent calls `dream` itself — the waking loop pauses and a
+  differently-prompted loop runs one long offline session. It wanders
+  with read-only and web tools, writes a reflection into `DREAMS.md`,
+  folds `INBOX.md` into a rewritten `MEMORY.md`, and may revise
+  `SOUL.md`. Its context is recorded in `dream_context` for the viewer
+  but never read back — the agent wakes to a `[dream ended …]` event
+  carrying its summary, and nothing else carries over. Budgeted per 24h.
+- **Wiring** (`bot.py`): aiogram handlers persist every message and push
+  it as an event; background loops deliver due wakeups, periodic
+  heartbeat status digests, and hand the agent over to a dream.
+- **Storage** (`db.py`): SQLite (WAL) with full raw Telegram payloads,
+  append-only model context (waking and dreaming kept apart), and exact
+  API token/cache usage per turn or dream.
+- **Mind** (`memory.py`): four markdown files under `data/memory/`,
+  editable by hand at any time. `SOUL.md` is the personality, re-read
+  and attached to the instructions every turn. `INBOX.md` is where the
+  `remember` tool drops raw dated facts. `MEMORY.md` is the curated
+  long-term store the `recall` tool answers questions from with a
+  one-shot extraction call (it is never inlined into the agent's
+  context) — only a dream rewrites it. `DREAMS.md` is the dream
+  journal. Every soul rewrite is snapshotted under `soul/` first.
+- **Prompts** (`prompts.toml`): user-editable agent, roleplay,
+  web-search, dream and memory-helper instructions loaded at startup.
 
 ## Setup
 
-```bash
-uv sync                 # create the venv and install deps
-cp .env.example .env    # then fill in your keys
+Requires [uv](https://docs.astral.sh/uv/) and Python 3.12+.
+
+```sh
+cp .env.example .env      # fill in bot token + API key
+$EDITOR settings.toml     # model, timezone, heartbeat, persona
+uv run libertati
 ```
 
-Configuration is entirely via environment variables (prefix `LIBERTATI_`), loaded from `.env`.
-See `.env.example` for every option.
+Chat approval defaults on. First message from a chat creates a `false`
+entry in `data/chats.toml`; review it, flip that entry to `true`, then
+send another message. Disable `chat_approval` only when every Telegram
+user who can reach the bot belongs to one trusted group.
 
-### Bot API mode
-
-1. Create a bot with [@BotFather](https://t.me/BotFather), get the token.
-2. Set in `.env`:
-   ```
-   LIBERTATI_TELEGRAM_MODE=bot
-   LIBERTATI_BOT_TOKEN=123456:your-token
-   LIBERTATI_OPENAI_API_KEY=sk-...
-   ```
-3. Run: `uv run libertati`
-
-> Note: to receive all group messages in bot mode, disable privacy mode for the bot in BotFather
-> (`/setprivacy` → Disable).
-
-### Account (MTProto) mode
-
-1. Get `api_id` / `api_hash` from <https://my.telegram.org/apps>.
-2. Set in `.env`:
-   ```
-   LIBERTATI_TELEGRAM_MODE=account
-   LIBERTATI_TG_API_ID=12345
-   LIBERTATI_TG_API_HASH=your-hash
-   LIBERTATI_TG_SESSION=libertati
-   LIBERTATI_OPENAI_API_KEY=sk-...
-   ```
-3. Authorize once to create the session file (interactive login):
-   ```bash
-   uv run python -m libertati.login
-   ```
-4. Run: `uv run libertati`
-
-## Restricting which groups it talks in
-
-By default the bot replies everywhere it can see messages. To limit *proactive replies* to
-specific chats, set an allowlist (chat ids and/or public `@usernames`):
-
-```
-LIBERTATI_ALLOWED_CHATS=@mygroup,-1001234567890
-```
-
-It still quietly logs messages it sees elsewhere (needed for memory/history) — it just won't talk
-there. An empty allowlist means "everywhere", the default.
-
-## Random browsing (account mode)
-
-When running as a user account, the bot can periodically read other Telegram chats/channels and
-discuss what it finds:
-
-```
-LIBERTATI_TELEGRAM_MODE=account
-LIBERTATI_BROWSE_ENABLED=true
-LIBERTATI_BROWSE_CHANNELS=@somechannel,@another   # optional; else samples your own chats
-LIBERTATI_BROWSE_PUBLIC_ONLY=true                 # never surface private-group content elsewhere
-LIBERTATI_BROWSE_TIMES_PER_DAY=3
-```
-
-It reads a source, appends anything interesting to `memory/reading.md` (which is part of its
-prompt, so it can reference it in normal chats), and — if there's something worth saying — posts
-into one of its allowed/active chats. Browsing is **account-mode only**; in bot mode it's ignored
-with a warning, because the HTTP Bot API can't fetch channel history.
-
-## Triggering routines manually
-
-Run any background routine once without waiting for the scheduler:
-
-```bash
-uv run python -m libertati.trigger heartbeat   # think, maybe message someone
-uv run python -m libertati.trigger dream       # reflect + update memory + write diary
-uv run python -m libertati.trigger browse      # read a channel + maybe discuss it
-uv run python -m libertati.trigger news        # refresh world.md from feeds
-```
-
-(`libertati-trigger <routine>` is installed as a console script too.)
-
-## Observability — the event log
-
-To understand (and fix) how the bot actually behaves, every turn is traced to a JSONL event log
-(`data/events.jsonl` by default). Each line is one event, and everything within a decision shares a
-`turn` id, so a single `grep` reconstructs the whole thing:
-
-```json
-{"ts":…,"turn":"t1","type":"turn_start","kind":"respond","chat_id":555,"thread_len":2,"memory_bytes":180}
-{"ts":…,"turn":"t1","type":"llm_call","model":"gpt-4o-mini","total_tokens":812,"latency_ms":430,"n_tool_calls":1}
-{"ts":…,"turn":"t1","type":"tool_call","name":"read_memory","ok":true,"latency_ms":1,"result_len":60}
-{"ts":…,"turn":"t1","type":"reply","preview":"та нічо, живу","reply_len":13}
-{"ts":…,"turn":"t1","type":"turn_end","kind":"respond","llm_calls":1,"tool_calls":1,"turn_tokens":812}
-```
-
-Event types include `inbound` / `skip` / `outbound` (message flow), `llm_call` / `llm_error`
-(model, token usage, latency), `tool_call` (name, args, timing, result size), `memory_write`
-(path, mode, size delta — the signal for memory growth/poisoning), `tool_loop_cap`, and the
-`heartbeat_result` / `dream_result` / `browse_result` outcomes.
-
-Handy queries:
-
-```bash
-# everything that happened in one decision
-grep '"turn":"t42"' data/events.jsonl | jq .
-# token spend per turn
-jq 'select(.type=="turn_end") | {turn, kind, turn_tokens}' data/events.jsonl
-# how memory is changing over time
-jq 'select(.type=="memory_write") | {path, mode, delta}' data/events.jsonl
-# tool usage frequency
-jq -r 'select(.type=="tool_call") | .name' data/events.jsonl | sort | uniq -c
-```
-
-Set `LIBERTATI_LOG_MESSAGE_CONTENT=false` to record only lengths/shapes (no message text) for
-privacy, or `LIBERTATI_EVENT_LOG_ENABLED=false` to turn it off. Run with `LIBERTATI_LOG_LEVEL=DEBUG`
-to also see the per-iteration tool decisions on stdout.
-
-## Running the checks
-
-```bash
-uv run ruff check .     # lint
-uv run mypy src         # type check
-uv run pytest           # tests (no network / no real API calls)
-```
+`settings.toml` carries every non-secret setting explicitly, grouped by
+area — nothing is hidden in code defaults. Any OpenAI-compatible endpoint
+works (OpenAI, OpenRouter, local); set `base_url`/`model` there. All
+settings can be overridden with `LIBERTATI_*` environment variables.
 
 ## Docker
 
-```bash
-docker compose up --build
+```sh
+docker compose up -d --build
 ```
 
-`./data` (SQLite) and `./memory` (markdown) are mounted as volumes so state survives restarts.
-In account mode the `libertati.session` file is mounted too.
+The compose file bind-mounts `./settings.toml` (read-only) and `./data`
+(SQLite), and runs hardened: read-only rootfs, no capabilities, non-root.
 
-## CI/CD
+## Development
 
-- **`.github/workflows/ci.yml`** — runs ruff, mypy and pytest on every push/PR.
-- **`.github/workflows/docker.yml`** — on push to `main` and on `v*` tags, builds the image and
-  pushes it to `ghcr.io/<owner>/libertati` using the built-in `GITHUB_TOKEN`.
+```sh
+uv run ruff check .       # lint (incl. docstring rules)
+uv run ty check           # type check
+uv run pytest             # tests
+uv run libertati-spy      # live full-screen view of the agent's context
+```
 
-See [`DEPLOYMENT.md`](DEPLOYMENT.md) for how to configure and run it on a server.
+`libertati-spy` tails the context table as it is written. Navigation is
+vim-like: `j`/`k` and `ctrl+e`/`ctrl+y` by line, `ctrl+d`/`ctrl+u` by
+half a screen, `ctrl+f`/`ctrl+b` by screen, `g`/`G` for the ends,
+`/`, `?`, `n`, `N` to search (smartcase, highlighted), `f` to un-truncate
+long bodies, `q` to quit. Older history pages in as you scroll up.
 
-## Configuration reference
+`d` switches to a dream's context and back. While you are at the bottom
+and have not pressed `d`, a starting dream is followed on its own and let
+go again on waking, so leaving the viewer open shows the dream as it
+happens. `uv run libertati-spy --dream 3` reopens a past dream.
 
-| Variable | Default | Description |
-| --- | --- | --- |
-| `LIBERTATI_TELEGRAM_MODE` | `bot` | `bot` or `account` |
-| `LIBERTATI_BOT_TOKEN` | – | Bot API token (bot mode) |
-| `LIBERTATI_TG_API_ID` / `_TG_API_HASH` | – | MTProto credentials (account mode) |
-| `LIBERTATI_TG_SESSION` | `libertati` | Telethon session name |
-| `LIBERTATI_OPENAI_API_KEY` | – | OpenAI key (required) |
-| `LIBERTATI_OPENAI_BASE_URL` | – | Override for OpenAI-compatible endpoints |
-| `LIBERTATI_OPENAI_MODEL` | `gpt-4o-mini` | Chat model |
-| `LIBERTATI_DB_PATH` | `data/libertati.db` | SQLite path |
-| `LIBERTATI_MEMORY_DIR` | `memory` | Markdown memory root |
-| `LIBERTATI_MAX_THREAD_CHARS` | `5000` | Reply-thread budget (chars) |
-| `LIBERTATI_RECENT_CONTEXT_MESSAGES` | `20` | Recent messages scanned for extra context |
-| `LIBERTATI_RECENT_CONTEXT_CHARS` | `1200` | Budget for recent messages added beyond the thread |
-| `LIBERTATI_MEMORY_MAX_FILE_CHARS` | `4000` | Disk cap per memory file (oldest lines trimmed) |
-| `LIBERTATI_MEMORY_CONTEXT_FILE_CHARS` | `700` | Per-file clip when injecting memory into the prompt |
-| `LIBERTATI_RESPOND_TO_ALL` | `true` | Master switch for replying at all |
-| `LIBERTATI_GROUP_REPLY_CHANCE` | `0.05` | Chance of replying to *ambient* group messages (always replies when addressed) |
-| `LIBERTATI_TYPING_DELAY_ENABLED` | `true` | Human-like pause before sending |
-| `LIBERTATI_TYPING_DELAY_MAX_SECONDS` | `5.0` | Cap on that pause |
-| `LIBERTATI_ALLOWED_CHATS` | (empty = all) | Chats it may proactively talk in (ids/`@usernames`) |
-| `LIBERTATI_HEARTBEAT_ENABLED` | `true` | Enable the twice-daily heartbeat |
-| `LIBERTATI_DREAM_ENABLED` | `true` | Enable daily dreaming |
-| `LIBERTATI_NEWS_REFRESH_HOURS` | `6` | News refresh interval |
-| `LIBERTATI_NEWS_FEEDS` | (built-in list) | Comma-separated RSS/Atom feeds |
-| `LIBERTATI_BROWSE_ENABLED` | `false` | Randomly read other chats/channels (account mode) |
-| `LIBERTATI_BROWSE_CHANNELS` | (empty) | Channels to read; empty = sample own dialogs |
-| `LIBERTATI_BROWSE_PUBLIC_ONLY` | `true` | Only read/discuss public `@channels` |
-| `LIBERTATI_BROWSE_TIMES_PER_DAY` | `3` | How many random browses per day |
-| `LIBERTATI_EVENT_LOG_ENABLED` | `true` | Write the structured JSONL event log |
-| `LIBERTATI_EVENT_LOG_PATH` | `data/events.jsonl` | Where the event log goes |
-| `LIBERTATI_LOG_MESSAGE_CONTENT` | `true` | Include (truncated) text in the event log |
-
-## License
-
-MIT
+The status shows authoritative input/cache counts from the latest API
+call next to the projected size of the next one — that projection is the
+last measured input plus an estimate of everything appended since, so
+the instructions/tool overhead comes from real numbers rather than a
+guess. Per-item counts are estimated from byte length (scaled for JSON
+framing, multi-byte text and base64 reasoning blobs), not tokenized.

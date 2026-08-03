@@ -2,31 +2,31 @@ name: CI
 
 on:
   push:
-    branches: ["**"]
+    branches: [main]
   pull_request:
 
 jobs:
-  test:
+  checks:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
 
       - name: Install uv
-        uses: astral-sh/setup-uv@v6
+        uses: astral-sh/setup-uv@v5
         with:
           enable-cache: true
 
-      - name: Set up Python
-        run: uv python install 3.12
+      - name: Install dependencies
+        run: uv sync --locked
 
-      - name: Sync dependencies
-        run: uv sync --frozen
-
-      - name: Lint (ruff)
+      - name: Lint
         run: uv run ruff check .
 
-      - name: Type check (mypy)
-        run: uv run mypy src
+      - name: Format check
+        run: uv run ruff format --check .
 
-      - name: Tests (pytest)
+      - name: Type check
+        run: uv run ty check
+
+      - name: Tests
         run: uv run pytest
