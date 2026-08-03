@@ -2,9 +2,9 @@
 
 Two modes, chosen by the ``chat_approval`` setting:
 
-- Off (default): every chat is allowed; the file is never touched.
-- On: only chats marked ``true`` in the file reach the agent. Any chat
-  seen for the first time is appended as ``false`` (with a name
+- Off: every chat is allowed; the file is never touched.
+- On (default): only chats marked ``true`` in the file reach the agent.
+  Any chat seen for the first time is appended as ``false`` (with a name
   comment), so approving is just flipping the value to ``true``. The
   file is re-read on every check — edits apply live, no restart.
 """
@@ -76,5 +76,8 @@ class ChatRegistry:
         )
         with self.path.open("a", encoding="utf-8") as file:
             file.write(f"{header}{chat_id} = false  # {comment}\n")
-        log.info("new chat %s (%s) awaiting approval in %s", chat_id, label, self.path)
+        self.path.chmod(0o600)
+        log.info(
+            "new chat %s (%s) awaiting approval in %s", chat_id, comment, self.path
+        )
         return False

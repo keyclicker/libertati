@@ -52,6 +52,11 @@ $EDITOR settings.toml     # model, timezone, heartbeat, persona
 uv run libertati
 ```
 
+Chat approval defaults on. First message from a chat creates a `false`
+entry in `data/chats.toml`; review it, flip that entry to `true`, then
+send another message. Disable `chat_approval` only when every Telegram
+user who can reach the bot belongs to one trusted group.
+
 `settings.toml` carries every non-secret setting explicitly, grouped by
 area — nothing is hidden in code defaults. Any OpenAI-compatible endpoint
 works (OpenAI, OpenRouter, local); set `base_url`/`model` there. All

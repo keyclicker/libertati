@@ -1,5 +1,6 @@
 """Tests for the chat approval registry."""
 
+import stat
 from pathlib import Path
 
 from libertati.chats import ChatRegistry
@@ -25,6 +26,7 @@ def test_new_chat_lands_unapproved(tmp_path: Path) -> None:
     content = registry.path.read_text(encoding="utf-8")
     assert content.startswith("# Chat approvals")
     assert "-500 = false  # friends (group)\n" in content
+    assert stat.S_IMODE(registry.path.stat().st_mode) == 0o600
 
 
 def test_register_does_not_duplicate(tmp_path: Path) -> None:

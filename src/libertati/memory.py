@@ -16,6 +16,7 @@ edit directly:
 """
 
 from pathlib import Path
+from tempfile import NamedTemporaryFile
 
 #: Personality seed written to SOUL.md on first run.
 DEFAULT_SOUL = """\
@@ -37,6 +38,22 @@ MEMORY_MAX_CHARS = 20000
 
 #: Mind files addressable by name from the dreaming loop.
 MIND_FILES = ("soul", "memory", "inbox", "dreams")
+
+
+def _atomic_write(path: Path, text: str) -> None:
+    """Replace one text file without exposing a truncated intermediate."""
+    temporary: Path | None = None
+    try:
+        with NamedTemporaryFile(
+            "w", encoding="utf-8", dir=path.parent, delete=False
+        ) as file:
+            temporary = Path(file.name)
+            file.write(text)
+        temporary.replace(path)
+    except Exception:
+        if temporary is not None:
+            temporary.unlink(missing_ok=True)
+        raise
 
 
 class Mind:
@@ -62,15 +79,21 @@ class Mind:
         untouched. A ``DIARY.md`` left by an older version is renamed —
         it was reserved for exactly this journal.
         """
-        self.path.mkdir(parents=True, exist_ok=True)
+        self.path.mkdir(parents=True, exist_ok=True, mode=0o700)
+        self.path.chmod(0o700)
         legacy_diary = self.path / "DIARY.md"
         if legacy_diary.exists() and not self.dreams_path.exists():
             legacy_diary.rename(self.dreams_path)
         if not self.soul_path.exists():
-            self.soul_path.write_text(DEFAULT_SOUL, encoding="utf-8")
-        self.memory_path.touch(exist_ok=True)
-        self.inbox_path.touch(exist_ok=True)
-        self.dreams_path.touch(exist_ok=True)
+            _atomic_write(self.soul_path, DEFAULT_SOUL)
+        for file in (
+            self.soul_path,
+            self.memory_path,
+            self.inbox_path,
+            self.dreams_path,
+        ):
+            file.touch(mode=0o600, exist_ok=True)
+            file.chmod(0o600)
 
     def soul(self) -> str:
         """Return the current personality text."""
@@ -132,20 +155,19 @@ class Mind:
         return "[…earlier entries elided…]\n" + text[-limit:]
 
     def fold_inbox(self, memory: str) -> None:
-        """Replace MEMORY.md and clear INBOX.md in one step.
+        """Replace MEMORY.md, then clear INBOX.md safely.
 
-        Deliberately one operation: a dream that died between a separate
-        write and clear would drop every unfolded memory on the floor.
-        Raises when the new memory exceeds :data:`MEMORY_MAX_CHARS`, in
-        which case neither file is touched.
+        Each replacement is atomic. A crash after MEMORY.md changes but
+        before INBOX.md clears leaves duplicate pending facts for a later
+        fold, never a truncated file. Oversized input touches neither file.
         """
         if len(memory) > MEMORY_MAX_CHARS:
             raise ValueError(
                 f"memory is {len(memory)} chars, over the "
                 f"{MEMORY_MAX_CHARS} limit — consolidate harder"
             )
-        self.memory_path.write_text(memory.strip() + "\n", encoding="utf-8")
-        self.inbox_path.write_text("", encoding="utf-8")
+        _atomic_write(self.memory_path, memory.strip() + "\n")
+        _atomic_write(self.inbox_path, "")
 
     def write_soul(self, text: str, stamp: str) -> Path:
         """Snapshot the current soul, then replace it; return the snapshot.
@@ -160,10 +182,13 @@ class Mind:
             raise ValueError(
                 f"soul is {len(text)} chars, over the {SOUL_MAX_CHARS} limit"
             )
-        self.soul_dir.mkdir(parents=True, exist_ok=True)
+        self.soul_dir.mkdir(parents=True, exist_ok=True, mode=0o700)
+        self.soul_dir.chmod(0o700)
         snapshot = self.soul_dir / f"{stamp}.md"
-        snapshot.write_text(
-            self.soul_path.read_text(encoding="utf-8"), encoding="utf-8"
-        )
-        self.soul_path.write_text(text.strip() + "\n", encoding="utf-8")
+        suffix = 1
+        while snapshot.exists():
+            snapshot = self.soul_dir / f"{stamp}-{suffix}.md"
+            suffix += 1
+        _atomic_write(snapshot, self.soul_path.read_text(encoding="utf-8"))
+        _atomic_write(self.soul_path, text.strip() + "\n")
         return snapshot

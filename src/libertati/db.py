@@ -128,6 +128,16 @@ CREATE INDEX IF NOT EXISTS idx_wakeups_due ON wakeups (done, due_at);
 """
 
 
+def _dump_context(item: dict) -> str:
+    """Serialize context readably, escaping only invalid Unicode."""
+    text = json.dumps(item, ensure_ascii=False)
+    try:
+        text.encode("utf-8")
+    except UnicodeEncodeError:
+        return json.dumps(item)
+    return text
+
+
 class Database:
     """Async wrapper around the bot's SQLite database.
 
@@ -151,6 +161,9 @@ class Database:
         """Open the database, enable WAL and foreign keys, create schema."""
         self.path.parent.mkdir(parents=True, exist_ok=True)
         self._conn = await aiosqlite.connect(self.path)
+        # Full message payloads and model context are private even on a
+        # multi-user host; do not leave the database world-readable.
+        self.path.chmod(0o600)
         self._conn.row_factory = aiosqlite.Row
         await self._conn.execute("PRAGMA journal_mode = WAL")
         await self._conn.execute("PRAGMA foreign_keys = ON")
@@ -245,7 +258,7 @@ class Database:
         """Append one agent context item (as JSON) to the full history."""
         await self.conn.execute(
             "INSERT INTO context (item) VALUES (?)",
-            (json.dumps(item, ensure_ascii=False),),
+            (_dump_context(item),),
         )
         await self.conn.commit()
 
@@ -261,7 +274,7 @@ class Database:
         """Append one dreaming context item (as JSON) to a dream's trace."""
         await self.conn.execute(
             "INSERT INTO dream_context (dream_id, item) VALUES (?, ?)",
-            (dream_id, json.dumps(item, ensure_ascii=False)),
+            (dream_id, _dump_context(item)),
         )
         await self.conn.commit()
 
@@ -605,25 +618,65 @@ class Database:
         async with self.conn.execute(query, (chat_id,)) as cursor:
             return [dict(row) for row in await cursor.fetchall()]
 
-    async def known_stickers(self, limit: int) -> list[dict]:
-        """Return distinct stickers seen anywhere, most recently seen first.
+    async def known_stickers(
+        self, limit: int, chat_ids: list[int] | None = None
+    ) -> list[dict]:
+        """Return distinct stickers from selected chats, newest first.
 
         Extracted from raw payloads; deduplicated by the sticker's stable
         ``file_unique_id``, returning a ``file_id`` the bot can resend.
+        ``None`` selects every chat; an empty list selects none.
         """
-        query = """
+        if chat_ids == []:
+            return []
+        chat_filter = ""
+        params: list[object] = []
+        if chat_ids is not None:
+            placeholders = ", ".join("?" for _ in chat_ids)
+            chat_filter = f" AND chat_id IN ({placeholders})"
+            params.extend(chat_ids)
+        query = (
+            """
             SELECT json_extract(raw, '$.sticker.file_id') AS file_id,
                    json_extract(raw, '$.sticker.emoji') AS emoji,
                    json_extract(raw, '$.sticker.set_name') AS set_name,
                    MAX(date) AS last_date
             FROM messages
             WHERE content_type = 'sticker'
+            """
+            + chat_filter
+            + """
             GROUP BY json_extract(raw, '$.sticker.file_unique_id')
             ORDER BY last_date DESC
             LIMIT ?
         """
-        async with self.conn.execute(query, (limit,)) as cursor:
+        )
+        params.append(limit)
+        async with self.conn.execute(query, params) as cursor:
             return [dict(row) for row in await cursor.fetchall()]
+
+    async def sticker_is_known(self, file_id: str, chat_ids: list[int]) -> bool:
+        """Whether a sticker file id was observed in selected chats."""
+        if not chat_ids:
+            return False
+        placeholders = ", ".join("?" for _ in chat_ids)
+        query = f"""
+            SELECT 1 FROM messages
+            WHERE content_type = 'sticker'
+              AND json_extract(raw, '$.sticker.file_id') = ?
+              AND chat_id IN ({placeholders})
+            LIMIT 1
+        """
+        async with self.conn.execute(query, [file_id, *chat_ids]) as cursor:
+            return await cursor.fetchone() is not None
+
+    async def message_exists(self, chat_id: int, message_id: int) -> bool:
+        """Whether a message was observed and stored in one chat."""
+        async with self.conn.execute(
+            "SELECT 1 FROM messages WHERE chat_id = ? AND message_id = ?",
+            (chat_id, message_id),
+        ) as cursor:
+            return await cursor.fetchone() is not None
 
     async def message_is_outgoing(self, chat_id: int, message_id: int) -> bool:
         """Whether a stored message was sent by the bot itself.

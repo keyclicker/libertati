@@ -93,7 +93,10 @@ class ModelLoop:
         calls = [item for item in response.output if item.type == "function_call"]
         if not calls:
             if response.output_text:
-                log.info("model final output: %s", response.output_text)
+                log.info(
+                    "model produced private final output (%d chars)",
+                    len(response.output_text),
+                )
             return False
         for call in calls:
             result = await self.tools.run(call.name, call.arguments)

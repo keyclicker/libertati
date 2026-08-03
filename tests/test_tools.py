@@ -52,6 +52,8 @@ class FakeDB:
         self.chats: list[dict] = []
         self.members: list[dict] = []
         self.stickers: list[dict] = []
+        self.known_sticker_ids: set[str] = set()
+        self.stored_rows: set[tuple[int, int]] = set()
         self.deleted: list[tuple[int, int]] = []
         self.outgoing_rows: set[tuple[int, int]] = set()
 
@@ -84,9 +86,19 @@ class FakeDB:
         """Return the canned member list."""
         return self.members
 
-    async def known_stickers(self, limit: int) -> list[dict]:
+    async def known_stickers(
+        self, limit: int, chat_ids: list[int] | None = None
+    ) -> list[dict]:
         """Return the canned sticker list."""
         return self.stickers
+
+    async def sticker_is_known(self, file_id: str, chat_ids: list[int]) -> bool:
+        """Report whether a sticker is in the canned approved set."""
+        return bool(chat_ids) and file_id in self.known_sticker_ids
+
+    async def message_exists(self, chat_id: int, message_id: int) -> bool:
+        """Report whether a message is in the canned stored set."""
+        return (chat_id, message_id) in self.stored_rows
 
     async def save_message(self, message: Any, outgoing: bool = False) -> None:
         """Accept saved messages silently."""
@@ -279,6 +291,44 @@ async def test_invalid_arguments() -> None:
     assert result == "error: invalid tool arguments"
 
 
+@pytest.mark.parametrize(
+    "arguments",
+    [
+        "null",
+        "[]",
+        json.dumps(
+            {"chat_id": "@unguarded", "text": "hi", "reply_to_message_id": None}
+        ),
+        json.dumps({"chat_id": True, "text": "hi", "reply_to_message_id": None}),
+        json.dumps({"chat_id": 1, "text": "hi"}),
+        json.dumps(
+            {
+                "chat_id": 1,
+                "text": "hi",
+                "reply_to_message_id": None,
+                "extra": "field",
+            }
+        ),
+    ],
+)
+async def test_arguments_are_validated_locally(arguments: str) -> None:
+    """Provider schema violations fail closed before reaching handlers."""
+    bot = RecordingBot()
+    result = await make_toolbox(bot=bot).run("send_message", arguments)
+    assert result == "error: invalid tool arguments"
+    assert bot.sent_messages == []
+
+
+async def test_invalid_utf8_is_refused_before_file_writes(tmp_path: Path) -> None:
+    """A lone JSON surrogate cannot truncate a model-managed file."""
+    mind = make_mind(tmp_path)
+    before = mind.soul()
+    toolbox = make_dream_toolbox(mind)
+    result = await toolbox.run("write_soul", '{"text": "\\ud800"}')
+    assert result == "error: invalid tool arguments"
+    assert mind.soul() == before
+
+
 async def test_handler_exception_is_wrapped(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -286,7 +336,7 @@ async def test_handler_exception_is_wrapped(
     monkeypatch.setattr("libertati.tools.typing_delay", lambda text, cps: 0.0)
     args = json.dumps({"chat_id": 1, "text": "hi", "reply_to_message_id": None})
     result = await make_toolbox().run("send_message", args)
-    assert result == "error: boom"
+    assert result == "error: send_message failed"
 
 
 async def test_send_message_falls_back_to_plain_text(
@@ -321,10 +371,21 @@ async def test_send_message_preserves_username_underscores(
     assert sent["parse_mode"] == ParseMode.MARKDOWN
 
 
+async def test_send_message_refuses_unobserved_reply_target() -> None:
+    """Replying cannot target a message hidden from local history."""
+    bot = RecordingBot()
+    args = {"chat_id": 1, "text": "hi", "reply_to_message_id": 99}
+    result = await make_toolbox(bot=bot).run("send_message", json.dumps(args))
+    assert result == "error: message 99 in chat 1 was not observed"
+    assert bot.sent_messages == []
+
+
 async def test_react_sets_and_removes() -> None:
     """An emoji sets a reaction; null clears it."""
     bot = RecordingBot()
-    toolbox = make_toolbox(bot=bot)
+    db = FakeDB()
+    db.stored_rows = {(1, 2)}
+    toolbox = make_toolbox(db=db, bot=bot)
     args = {"chat_id": 1, "message_id": 2, "emoji": "👍"}
     result = await toolbox.run("react", json.dumps(args))
     assert result == "reacted 👍 to message 2 in chat 1"
@@ -335,15 +396,35 @@ async def test_react_sets_and_removes() -> None:
     assert clear_call[2] == []
 
 
+async def test_react_refuses_unobserved_message() -> None:
+    """A reaction cannot probe or target a message absent from history."""
+    bot = RecordingBot()
+    args = {"chat_id": 1, "message_id": 2, "emoji": "👍"}
+    result = await make_toolbox(bot=bot).run("react", json.dumps(args))
+    assert result == "error: message 2 in chat 1 was not observed"
+    assert bot.reactions == []
+
+
 async def test_edit_message() -> None:
     """Edits go out with markdown and are confirmed."""
     bot = RecordingBot()
+    db = FakeDB()
+    db.outgoing_rows = {(1, 2)}
     args = {"chat_id": 1, "message_id": 2, "text": "fixed"}
-    result = await make_toolbox(bot=bot).run("edit_message", json.dumps(args))
+    result = await make_toolbox(db=db, bot=bot).run("edit_message", json.dumps(args))
     assert result == "edited message 2 in chat 1"
     (edit,) = bot.edits
     assert edit["text"] == "fixed"
     assert edit["parse_mode"] == ParseMode.MARKDOWN
+
+
+async def test_edit_message_refuses_other_peoples_messages() -> None:
+    """An edit must target a stored outgoing message."""
+    bot = RecordingBot()
+    args = {"chat_id": 1, "message_id": 2, "text": "hijack"}
+    result = await make_toolbox(bot=bot).run("edit_message", json.dumps(args))
+    assert result.startswith("error:")
+    assert bot.edits == []
 
 
 async def test_delete_message() -> None:
@@ -372,15 +453,31 @@ async def test_delete_message_refuses_other_peoples_messages() -> None:
 async def test_send_sticker() -> None:
     """Stickers go out by file_id and are confirmed with the message id."""
     bot = RecordingBot()
+    db = FakeDB()
+    db.chats = [{"chat_id": 1}]
+    db.known_sticker_ids = {"AAA"}
     args = {"chat_id": 1, "file_id": "AAA"}
-    result = await make_toolbox(bot=bot).run("send_sticker", json.dumps(args))
+    result = await make_toolbox(db=db, bot=bot).run("send_sticker", json.dumps(args))
     assert result == "sent sticker as message 6 to chat 1"
     assert bot.sent_stickers == [(1, "AAA")]
+
+
+async def test_send_sticker_refuses_unknown_file_id() -> None:
+    """Description-only sticker restriction is enforced locally."""
+    bot = RecordingBot()
+    db = FakeDB()
+    db.chats = [{"chat_id": 1}]
+    result = await make_toolbox(db=db, bot=bot).run(
+        "send_sticker", json.dumps({"chat_id": 1, "file_id": "UNKNOWN"})
+    )
+    assert result == "error: sticker was not observed in an approved chat"
+    assert bot.sent_stickers == []
 
 
 async def test_list_stickers() -> None:
     """Known stickers come back as JSON; none seen yet says so."""
     db = FakeDB()
+    db.chats = [{"chat_id": 1}]
     toolbox = make_toolbox(db=db)
     result = await toolbox.run("list_stickers", "{}")
     assert result.startswith("no stickers seen yet")
@@ -392,10 +489,21 @@ async def test_list_stickers() -> None:
 async def test_forward_message() -> None:
     """Forwards reach the bot with the right chats and are confirmed."""
     bot = RecordingBot()
+    db = FakeDB()
+    db.stored_rows = {(1, 42)}
     args = {"to_chat_id": 2, "from_chat_id": 1, "message_id": 42}
-    result = await make_toolbox(bot=bot).run("forward_message", json.dumps(args))
+    result = await make_toolbox(db=db, bot=bot).run("forward_message", json.dumps(args))
     assert result == "forwarded message 42 from chat 1 to chat 2 as message 9"
     assert bot.forwards == [(2, 1, 42)]
+
+
+async def test_forward_message_refuses_unobserved_source_message() -> None:
+    """Forwarding cannot retrieve a guessed message id from Telegram."""
+    bot = RecordingBot()
+    args = {"to_chat_id": 2, "from_chat_id": 1, "message_id": 42}
+    result = await make_toolbox(bot=bot).run("forward_message", json.dumps(args))
+    assert result == "error: message 42 in chat 1 was not observed"
+    assert bot.forwards == []
 
 
 async def test_get_chat_info_private() -> None:
@@ -635,6 +743,29 @@ async def test_list_chats_hides_unapproved_chats(tmp_path: Path) -> None:
     assert json.loads(result) == [{"chat_id": 100, "name": "Alice"}]
 
 
+async def test_list_stickers_uses_only_approved_chat_ids(tmp_path: Path) -> None:
+    """Sticker discovery cannot expose unapproved chat contents."""
+
+    class RecordingStickerDB(FakeDB):
+        def __init__(self) -> None:
+            super().__init__()
+            self.requested_chat_ids: list[int] | None = None
+
+        async def known_stickers(
+            self, limit: int, chat_ids: list[int] | None = None
+        ) -> list[dict]:
+            self.requested_chat_ids = chat_ids
+            return []
+
+    db = RecordingStickerDB()
+    db.chats = [{"chat_id": 100}, {"chat_id": 200}]
+    toolbox = make_toolbox(
+        db=db, registry=make_approving_registry(tmp_path, approved=100)
+    )
+    await toolbox.run("list_stickers", "{}")
+    assert db.requested_chat_ids == [100]
+
+
 def test_every_chat_targeting_tool_is_gated() -> None:
     """Any schema parameter naming a chat id must be in the gate map.
 
@@ -834,6 +965,17 @@ async def test_dream_toolbox_refuses_messaging_by_name(tmp_path: Path) -> None:
     )
 
     assert result == "error: unknown tool 'send_message'"
+
+
+async def test_waking_toolbox_refuses_dream_writers(tmp_path: Path) -> None:
+    """Undeclared dream-only calls cannot alter waking identity or memory."""
+    mind = make_mind(tmp_path)
+    toolbox = make_toolbox(mind=mind)
+
+    result = await toolbox.run("write_soul", json.dumps({"text": "hijacked"}))
+
+    assert result == "error: unknown tool 'write_soul'"
+    assert mind.soul() == DEFAULT_SOUL.strip()
 
 
 async def test_read_mind_returns_each_file(tmp_path: Path) -> None:

@@ -116,7 +116,7 @@ class Settings(BaseSettings):
 
     # Approval mode: when on, only chats marked true in chats_path reach
     # the agent; new chats are appended there as false for review.
-    chat_approval: bool = False
+    chat_approval: bool = True
     # Chat approval registry (user-editable TOML, re-read live).
     chats_path: Path = Path("data/chats.toml")
     # Minutes between heartbeat status events (0 disables, ±20% jitter).

@@ -36,6 +36,7 @@ def test_context_window_defaults_valid() -> None:
     assert settings.reasoning_context == "current_turn"
     assert settings.prune_completed_reasoning is False
     assert settings.prompts_path == Path("prompts.toml")
+    assert settings.chat_approval is True
 
 
 def test_context_trim_must_be_below_max() -> None:

@@ -143,7 +143,7 @@ MESSAGING_TOOLS: list[ToolParam] = [
         "type": "function",
         "name": "list_stickers",
         "description": (
-            "List stickers you can send: every sticker seen in any chat, "
+            "List stickers you can send: every sticker seen in an approved chat, "
             "with its emoji, set name and file_id for send_sticker."
         ),
         "parameters": {
@@ -748,6 +748,20 @@ def function_names(tools: list[ToolParam]) -> frozenset[str]:
 #: ``send_message`` call would otherwise still reach its handler.
 DREAM_TOOL_NAMES: frozenset[str] = function_names(DREAM_API_TOOLS)
 
+#: Everything a waking toolbox may dispatch. Dream-only file writers
+#: stay unreachable even if a provider returns an undeclared tool call.
+WAKING_TOOL_NAMES: frozenset[str] = function_names([*TOOLS, *SLEEP_TOOLS])
+
+#: Local copies of every function's parameter schema. Provider-side
+#: strict mode is not an authorization boundary: compatible endpoints
+#: may ignore it, and malformed arguments must fail before any handler.
+TOOL_PARAMETER_SCHEMAS: dict[str, dict[str, Any]] = {
+    schema["name"]: schema["parameters"]
+    for tool in [*TOOLS, *SLEEP_TOOLS, *DREAM_TOOLS]
+    if tool["type"] == "function"
+    for schema in [cast(dict[str, Any], tool)]
+}
+
 #: Tools that visibly act on Telegram. Dispatching one counts as real
 #: activity for the dream idle clock, unlike read-only lookups.
 OUTWARD_TOOL_NAMES: frozenset[str] = function_names(MESSAGING_TOOLS)
@@ -771,6 +785,49 @@ GATED_CHAT_ARGS: dict[str, tuple[str, ...]] = {
     "get_message_thread": ("chat_id",),
     "search_messages": ("chat_id",),
 }
+
+
+def valid_tool_arguments(name: str, args: object) -> bool:
+    """Validate one decoded argument object against its tool schema.
+
+    The schemas currently use a deliberately small JSON Schema subset:
+    objects with required properties, primitive types, nullable unions,
+    enums and no additional properties. Strings must also be valid UTF-8
+    so a lone JSON surrogate cannot corrupt a file during a write tool.
+    """
+    if not isinstance(args, dict):
+        return False
+    schema = TOOL_PARAMETER_SCHEMAS.get(name)
+    if schema is None:
+        return False
+    properties = schema["properties"]
+    if not set(schema["required"]).issubset(args):
+        return False
+    if schema.get("additionalProperties") is False and not set(args) <= set(properties):
+        return False
+    for key, value in args.items():
+        parameter = properties[key]
+        expected = parameter["type"]
+        types = [expected] if isinstance(expected, str) else expected
+        valid_type = any(
+            expected_type == "null"
+            and value is None
+            or expected_type == "integer"
+            and type(value) is int
+            or expected_type == "string"
+            and isinstance(value, str)
+            for expected_type in types
+        )
+        if not valid_type:
+            return False
+        if isinstance(value, str):
+            try:
+                value.encode("utf-8")
+            except UnicodeEncodeError:
+                return False
+        if "enum" in parameter and value not in parameter["enum"]:
+            return False
+    return True
 
 
 def build_tools(web_search: bool, *, dreaming: bool = False) -> list[ToolParam]:
@@ -799,9 +856,9 @@ class Toolbox:
     """Executes the agent's tool calls against application resources.
 
     One instance serves one loop; tools that target a chat take an
-    explicit ``chat_id`` argument from the model. The dreaming loop gets
-    a second instance restricted with ``allowed`` — sharing handlers but
-    not the ability to reach out to anyone.
+    explicit ``chat_id`` argument from the model. Default dispatch is
+    restricted to waking tools; the dreaming loop passes its narrower
+    ``allowed`` set, sharing handlers but no messaging capability.
     """
 
     def __init__(
@@ -877,12 +934,12 @@ class Toolbox:
             "write_soul": self._write_soul,
             "wake_up": self._wake_up,
         }
-        if allowed is not None:
-            self._handlers = {
-                name: handler
-                for name, handler in self._handlers.items()
-                if name in allowed
-            }
+        allowed_names = WAKING_TOOL_NAMES if allowed is None else allowed
+        self._handlers = {
+            name: handler
+            for name, handler in self._handlers.items()
+            if name in allowed_names
+        }
 
     async def run(self, name: str, arguments: str | None) -> str:
         """Execute one tool call and return its result as a string.
@@ -897,21 +954,23 @@ class Toolbox:
             return f"error: unknown tool {name!r}"
         try:
             args = json.loads(arguments or "{}")
-        except json.JSONDecodeError:
+        except (json.JSONDecodeError, RecursionError):
+            return "error: invalid tool arguments"
+        if not valid_tool_arguments(name, args):
             return "error: invalid tool arguments"
         for key in GATED_CHAT_ARGS.get(name, ()):
-            chat_id = args.get(key)
-            if isinstance(chat_id, int) and not self.registry.check(chat_id):
+            chat_id = args[key]
+            if not self.registry.check(chat_id):
                 return f"error: chat {chat_id} is not approved"
         self.steps += 1
         if name in OUTWARD_TOOL_NAMES:
             self.outward_calls += 1
-        log.info("tool call: %s(%s)", name, args)
+        log.info("tool call: %s", name)
         try:
             return await handler(args)
-        except Exception as exc:
+        except Exception:
             log.exception("tool %s failed", name)
-            return f"error: {exc}"
+            return f"error: {name} failed"
 
     # ==========================================================
     #                        Messaging
@@ -927,6 +986,12 @@ class Toolbox:
         is resent as plain text rather than lost.
         """
         reply_to = args.get("reply_to_message_id")
+        if reply_to is not None and not await self.db.message_exists(
+            args["chat_id"], reply_to
+        ):
+            return (
+                f"error: message {reply_to} in chat {args['chat_id']} was not observed"
+            )
         delay = typing_delay(args["text"], self.typing_chars_per_second)
         if delay > 0:
             async with ChatActionSender.typing(chat_id=args["chat_id"], bot=self.bot):
@@ -951,19 +1016,27 @@ class Toolbox:
 
     async def _send_sticker(self, args: dict[str, Any]) -> str:
         """Send a known sticker by file_id and persist it as outgoing."""
+        chat_ids = await self._approved_chat_ids()
+        if not await self.db.sticker_is_known(args["file_id"], chat_ids):
+            return "error: sticker was not observed in an approved chat"
         sent = await self.bot.send_sticker(args["chat_id"], args["file_id"])
         await self.db.save_message(sent, outgoing=True)
         return f"sent sticker as message {sent.message_id} to chat {sent.chat.id}"
 
     async def _list_stickers(self, args: dict[str, Any]) -> str:
-        """Return every sticker seen so far (sendable file_ids) as JSON."""
-        rows = await self.db.known_stickers(50)
+        """Return stickers observed in approved chats as JSON."""
+        rows = await self.db.known_stickers(50, await self._approved_chat_ids())
         if not rows:
             return "no stickers seen yet — stickers people send you land here"
         return json.dumps(rows, ensure_ascii=False)
 
     async def _forward_message(self, args: dict[str, Any]) -> str:
         """Forward a message between chats and persist the copy as outgoing."""
+        if not await self.db.message_exists(args["from_chat_id"], args["message_id"]):
+            return (
+                f"error: message {args['message_id']} in chat "
+                f"{args['from_chat_id']} was not observed"
+            )
         sent = await self.bot.forward_message(
             args["to_chat_id"], args["from_chat_id"], args["message_id"]
         )
@@ -988,6 +1061,11 @@ class Toolbox:
 
     async def _react(self, args: dict[str, Any]) -> str:
         """Set or remove an emoji reaction on a message."""
+        if not await self.db.message_exists(args["chat_id"], args["message_id"]):
+            return (
+                f"error: message {args['message_id']} in chat "
+                f"{args['chat_id']} was not observed"
+            )
         emoji = args["emoji"]
         reaction = [ReactionTypeEmoji(emoji=emoji)] if emoji else []
         await self.bot.set_message_reaction(
@@ -1000,6 +1078,11 @@ class Toolbox:
 
     async def _edit_message(self, args: dict[str, Any]) -> str:
         """Rewrite one of the bot's own messages and persist the new text."""
+        if not await self.db.message_is_outgoing(args["chat_id"], args["message_id"]):
+            return (
+                f"error: message {args['message_id']} in chat "
+                f"{args['chat_id']} is not one of your own messages"
+            )
         markdown_text = escape_markdown_mentions(args["text"])
         edited = await self._markdown_send(
             lambda parse_mode: self.bot.edit_message_text(
@@ -1081,14 +1164,22 @@ class Toolbox:
         Unapproved chats are persisted too, so the raw list would name
         chats the agent isn't allowed to see (let alone act on).
         """
-        chats = [
+        chats = await self._approved_chats()
+        if not chats:
+            return "no chats yet"
+        return json.dumps(chats, ensure_ascii=False)
+
+    async def _approved_chats(self) -> list[dict]:
+        """Return stored chat rows allowed by the live registry."""
+        return [
             chat
             for chat in await self.db.list_chats()
             if self.registry.check(chat["chat_id"])
         ]
-        if not chats:
-            return "no chats yet"
-        return json.dumps(chats, ensure_ascii=False)
+
+    async def _approved_chat_ids(self) -> list[int]:
+        """Return ids of stored chats allowed by the live registry."""
+        return [chat["chat_id"] for chat in await self._approved_chats()]
 
     async def _get_chat_info(self, args: dict[str, Any]) -> str:
         """Return a chat's live Telegram profile as JSON.
@@ -1237,7 +1328,10 @@ class Toolbox:
 
     async def _fold_inbox(self, args: dict[str, Any]) -> str:
         """Rewrite long-term memory and clear the inbox in one step."""
-        self.mind.fold_inbox(args["memory"])
+        try:
+            self.mind.fold_inbox(args["memory"])
+        except ValueError as exc:
+            return f"error: {exc}"
         return (
             f"MEMORY.md rewritten ({len(args['memory'].strip())} chars),"
             " INBOX.md cleared"
@@ -1245,9 +1339,12 @@ class Toolbox:
 
     async def _write_soul(self, args: dict[str, Any]) -> str:
         """Snapshot the current soul and replace it."""
-        snapshot = self.mind.write_soul(
-            args["text"], clock.file_stamp(datetime.now(UTC))
-        )
+        try:
+            snapshot = self.mind.write_soul(
+                args["text"], clock.file_stamp(datetime.now(UTC))
+            )
+        except ValueError as exc:
+            return f"error: {exc}"
         return f"soul updated; the previous one is kept as soul/{snapshot.name}"
 
     async def _wake_up(self, args: dict[str, Any]) -> str:

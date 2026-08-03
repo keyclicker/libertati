@@ -1,5 +1,6 @@
 """Tests for the file-based mind (SOUL.md / MEMORY.md / INBOX.md / DREAMS.md)."""
 
+import stat
 from pathlib import Path
 
 import pytest
@@ -26,6 +27,19 @@ def test_ensure_creates_and_seeds(tmp_path: Path) -> None:
     assert mind.memory_path.read_text(encoding="utf-8") == ""
     assert mind.inbox_path.read_text(encoding="utf-8") == ""
     assert mind.dreams_path.read_text(encoding="utf-8") == ""
+
+
+def test_mind_files_are_private_to_their_owner(tmp_path: Path) -> None:
+    """Long-term memory is not readable by other local users."""
+    mind = make_mind(tmp_path)
+    assert stat.S_IMODE(mind.path.stat().st_mode) == 0o700
+    for file in (
+        mind.soul_path,
+        mind.memory_path,
+        mind.inbox_path,
+        mind.dreams_path,
+    ):
+        assert stat.S_IMODE(file.stat().st_mode) == 0o600
 
 
 def test_ensure_is_idempotent(tmp_path: Path) -> None:
@@ -137,6 +151,19 @@ def test_fold_inbox_over_cap_touches_nothing(tmp_path: Path) -> None:
     assert "fresh fact" in mind.read("inbox")
 
 
+def test_fold_inbox_failed_encoding_preserves_both_files(tmp_path: Path) -> None:
+    """A failed replacement cannot truncate curated or pending memory."""
+    mind = make_mind(tmp_path)
+    mind.memory_path.write_text("keep me\n", encoding="utf-8")
+    mind.append_inbox("fresh fact", "Sun 2026-08-02 12:00")
+
+    with pytest.raises(UnicodeEncodeError):
+        mind.fold_inbox("\ud800")
+
+    assert mind.read("memory") == "keep me"
+    assert "fresh fact" in mind.read("inbox")
+
+
 def test_write_soul_snapshots_the_previous_version(tmp_path: Path) -> None:
     """The old soul survives as a dated file next to the new one."""
     mind = make_mind(tmp_path)
@@ -146,6 +173,18 @@ def test_write_soul_snapshots_the_previous_version(tmp_path: Path) -> None:
     assert mind.soul() == "a new person"
     assert snapshot.read_text(encoding="utf-8") == DEFAULT_SOUL
     assert snapshot.parent == mind.soul_dir
+
+
+def test_write_soul_never_overwrites_same_stamp_snapshot(tmp_path: Path) -> None:
+    """Rapid revisions preserve every rollback point."""
+    mind = make_mind(tmp_path)
+    first = mind.write_soul("second soul", "20260802T040000Z")
+    second = mind.write_soul("third soul", "20260802T040000Z")
+
+    assert first.name == "20260802T040000Z.md"
+    assert second.name == "20260802T040000Z-1.md"
+    assert first.read_text(encoding="utf-8") == DEFAULT_SOUL
+    assert second.read_text(encoding="utf-8") == "second soul\n"
 
 
 def test_write_soul_rejects_oversized_and_empty(tmp_path: Path) -> None:

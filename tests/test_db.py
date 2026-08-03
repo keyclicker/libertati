@@ -2,6 +2,7 @@
 
 import json
 import sqlite3
+import stat
 from pathlib import Path
 from typing import Any
 
@@ -36,6 +37,11 @@ async def test_save_and_recent_messages(db: Database) -> None:
     assert [row["text"] for row in rows] == ["first", "second"]
     assert rows[0]["username"] == "alice"
     assert rows[0]["outgoing"] == 0
+
+
+async def test_database_is_private_to_its_owner(db: Database) -> None:
+    """Stored chats and model context are not world-readable."""
+    assert stat.S_IMODE(db.path.stat().st_mode) == 0o600
 
 
 async def test_resave_updates_in_place(db: Database) -> None:
@@ -160,7 +166,11 @@ async def test_chat_members(db: Database) -> None:
 
 
 def make_sticker_message(
-    message_id: int, file_id: str, unique_id: str, date: int
+    message_id: int,
+    file_id: str,
+    unique_id: str,
+    date: int,
+    chat_id: int = 100,
 ) -> Message:
     """Build a sticker message for the known-sticker tests."""
     sticker = {
@@ -174,7 +184,8 @@ def make_sticker_message(
         "emoji": "😀",
         "set_name": "pack",
     }
-    return make_message(message_id, None, date=date, sticker=sticker)
+    chat = {"id": chat_id, "type": "private", "first_name": "Alice"}
+    return make_message(message_id, None, date=date, sticker=sticker, chat=chat)
 
 
 async def test_known_stickers(db: Database) -> None:
@@ -187,6 +198,24 @@ async def test_known_stickers(db: Database) -> None:
     assert [row["file_id"] for row in stickers] == ["BBB", "AAA2"]
     assert stickers[0]["emoji"] == "😀"
     assert stickers[0]["set_name"] == "pack"
+
+
+async def test_known_stickers_can_be_scoped_to_chats(db: Database) -> None:
+    """Sticker discovery excludes every chat outside its allowlist."""
+    await db.save_message(make_sticker_message(1, "AAA", "u1", STAMP))
+    await db.save_message(make_sticker_message(2, "BBB", "u2", STAMP + 60, chat_id=200))
+    assert [row["file_id"] for row in await db.known_stickers(10, [100])] == ["AAA"]
+    assert await db.known_stickers(10, []) == []
+    assert await db.sticker_is_known("AAA", [100]) is True
+    assert await db.sticker_is_known("BBB", [100]) is False
+
+
+async def test_message_exists(db: Database) -> None:
+    """Message presence is scoped by both chat and message id."""
+    await db.save_message(make_message(1, "hi"))
+    assert await db.message_exists(100, 1) is True
+    assert await db.message_exists(100, 2) is False
+    assert await db.message_exists(200, 1) is False
 
 
 async def test_unanswered_chats(db: Database) -> None:
@@ -232,6 +261,13 @@ async def test_context_roundtrip(db: Database) -> None:
         await db.append_context({"role": "user", "content": f"event {i}"})
     tail = await db.load_context(3)
     assert [item["content"] for item in tail] == ["event 2", "event 3", "event 4"]
+
+
+async def test_context_accepts_unpaired_provider_surrogate(db: Database) -> None:
+    """Broken provider Unicode cannot wedge append-only persistence."""
+    item = {"type": "function_call", "arguments": "\ud800"}
+    await db.append_context(item)
+    assert await db.load_context(1) == [item]
 
 
 async def test_context_load_excludes_ephemeral_types_before_limit(

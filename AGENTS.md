@@ -74,8 +74,10 @@ Three places, all in `tools.py`: a strict-mode JSON schema in the right
 entry in `self._handlers`. A tool that reads or acts on a specific chat
 must also list its chat-id argument(s) in `GATED_CHAT_ARGS` so the
 approval registry is enforced before the handler runs (a test asserts
-this for every schema parameter named like a chat id). Strict schemas mean handlers can trust
-argument types; optional parameters are `["type", "null"]` and still
+this for every schema parameter named like a chat id). Provider-side
+strict schemas are not a security boundary: `Toolbox.run` validates the
+same schemas locally before dispatch, so keep new schemas within its
+supported subset. Optional parameters are `["type", "null"]` and still
 listed in `required`. Handlers return plain strings (JSON for lists)
 and never raise — `Toolbox.run` converts exceptions to `error: …`
 strings. Decide whether the dreaming loop may use it: dream tools come
