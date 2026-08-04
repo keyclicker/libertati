@@ -840,14 +840,14 @@ async def test_get_chat_info_group_adds_members_and_admins() -> None:
     assert info["description"] == "the gang"
 
 
-async def test_list_chat_members() -> None:
-    """Seen members come back as JSON; an empty chat says so."""
+async def test_list_chat_speakers() -> None:
+    """Seen speakers come back as JSON; an empty chat says so."""
     db = FakeDB()
     toolbox = make_toolbox(db=db)
-    result = await toolbox.run("list_chat_members", json.dumps({"chat_id": 1}))
-    assert result == "nobody seen talking in this chat yet"
+    result = await toolbox.run("list_chat_speakers", json.dumps({"chat_id": 1}))
+    assert result == "no speakers observed in stored chat history yet"
     db.members = [{"user_id": 7, "first_name": "Alice", "messages": 3}]
-    result = await toolbox.run("list_chat_members", json.dumps({"chat_id": 1}))
+    result = await toolbox.run("list_chat_speakers", json.dumps({"chat_id": 1}))
     assert json.loads(result) == db.members
 
 
