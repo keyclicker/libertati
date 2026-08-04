@@ -3,6 +3,7 @@ name = "libertati"
 version = "0.1.0"
 description = "Agentic Telegram bot: one LLM brain living across all chats"
 readme = "README.md"
+license = "AGPL-3.0-only"
 authors = [
     { name = "keyclicker", email = "nick@keyclicker.dev" }
 ]
