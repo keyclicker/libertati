@@ -10,6 +10,7 @@ from libertati.bot import (
     EVENT_TEXT_LIMIT,
     deliver_wakeups,
     format_event,
+    heartbeat_digest,
     is_addressed,
     on_message,
 )
@@ -39,6 +40,35 @@ def make_message(**overrides: Any) -> Message:
     }
     data.update(overrides)
     return Message.model_validate(data)
+
+
+#: The forum supergroup used by topic tests.
+FORUM_CHAT = {"id": -1001, "type": "supergroup", "title": "Hub", "is_forum": True}
+
+
+def topic_pseudo_reply(
+    thread_id: int, name: str = "Ideas", from_id: int = 7
+) -> dict[str, Any]:
+    """Build the topic-creation service message topic messages "reply" to."""
+    return {
+        "message_id": thread_id,
+        "date": STAMP,
+        "chat": FORUM_CHAT,
+        "from": {"id": from_id, "is_bot": from_id == ME.id, "first_name": "creator"},
+        "forum_topic_created": {"name": name, "icon_color": 0x6FB9F0},
+    }
+
+
+def make_topic_message(**overrides: Any) -> Message:
+    """Build a forum-topic message carrying Telegram's pseudo-reply."""
+    data: dict[str, Any] = {
+        "chat": FORUM_CHAT,
+        "message_thread_id": 12,
+        "is_topic_message": True,
+        "reply_to_message": topic_pseudo_reply(12),
+    }
+    data.update(overrides)
+    return make_message(**data)
 
 
 def test_format_event_private_text() -> None:
@@ -106,6 +136,47 @@ def test_format_event_caption_fallback() -> None:
     assert "a photo caption" in format_event(message, UTC_TZ)
 
 
+def test_format_event_topic() -> None:
+    """Forum topic messages name their topic after the chat."""
+    event = format_event(make_topic_message(), UTC_TZ, topic_name="Ideas")
+    assert event == (
+        "[Sun 2026-08-02 12:00] chat -1001 (supergroup “Hub”, topic 12 “Ideas”)"
+        " | Alice (msg 42): hello"
+    )
+    assert "topic 12)" in format_event(make_topic_message(), UTC_TZ)
+
+
+def test_format_event_topic_name_is_one_line() -> None:
+    """A newline in a topic name cannot forge extra event lines."""
+    event = format_event(make_topic_message(), UTC_TZ, topic_name="Id\neas")
+    assert "\n" not in event
+    assert "“Id eas”" in event
+
+
+def test_format_event_suppresses_topic_pseudo_reply() -> None:
+    """The pseudo-reply every topic message carries is not a reply."""
+    assert "replying" not in format_event(make_topic_message(), UTC_TZ)
+    real_reply = make_topic_message(
+        reply_to_message={
+            "message_id": 41,
+            "date": STAMP,
+            "chat": FORUM_CHAT,
+            "text": "earlier",
+        }
+    )
+    assert "(msg 42, replying to msg 41)" in format_event(real_reply, UTC_TZ)
+
+
+def test_format_event_topic_created_service() -> None:
+    """A topic-creation service message shows the new topic's name."""
+    message = make_topic_message(
+        text=None,
+        reply_to_message=None,
+        forum_topic_created={"name": "Plans", "icon_color": 0x6FB9F0},
+    )
+    assert "<forum_topic_created “Plans”>" in format_event(message, UTC_TZ)
+
+
 class FakeAgent:
     """Records events pushed by the message handler."""
 
@@ -158,21 +229,54 @@ def test_is_addressed_reply_to_bot() -> None:
     assert is_addressed(message, ME)
 
 
+def test_is_addressed_ignores_bot_created_topic_pseudo_reply() -> None:
+    """A bot-created topic's pseudo-replies do not address the bot."""
+    message = make_topic_message(reply_to_message=topic_pseudo_reply(12, from_id=ME.id))
+    assert not is_addressed(message, ME)
+
+
+class FakeTopicDB:
+    """Resolves topic names from a fixed mapping, recording lookups."""
+
+    def __init__(self, names: dict[tuple[int, int], str] | None = None) -> None:
+        """Store the (chat_id, thread_id) to name mapping."""
+        self.names = names or {}
+        self.calls: list[tuple[int, int]] = []
+
+    async def topic_name(self, chat_id: int, thread_id: int) -> str | None:
+        """Return the mapped name, if any."""
+        self.calls.append((chat_id, thread_id))
+        return self.names.get((chat_id, thread_id))
+
+
 async def test_on_message_private_always_pushed() -> None:
     """Private messages always become events."""
     agent = FakeAgent()
-    await on_message(make_message(), agent, UTC_TZ, ME, OPEN_REGISTRY)  # type: ignore[arg-type]
+    await on_message(make_message(), agent, UTC_TZ, ME, OPEN_REGISTRY, FakeTopicDB())  # type: ignore[arg-type]
     assert len(agent.events) == 1
 
 
 async def test_on_message_group_needs_address() -> None:
     """Group messages are dropped unless the bot is addressed."""
     agent = FakeAgent()
-    await on_message(make_group_message(), agent, UTC_TZ, ME, OPEN_REGISTRY)  # type: ignore[arg-type]
+    await on_message(
+        make_group_message(), agent, UTC_TZ, ME, OPEN_REGISTRY, FakeTopicDB()
+    )  # type: ignore[arg-type]
     assert agent.events == []
     mention = make_group_message(text="ping @libertati_bot")
-    await on_message(mention, agent, UTC_TZ, ME, OPEN_REGISTRY)  # type: ignore[arg-type]
+    await on_message(mention, agent, UTC_TZ, ME, OPEN_REGISTRY, FakeTopicDB())  # type: ignore[arg-type]
     assert len(agent.events) == 1
+
+
+async def test_on_message_resolves_topic_name() -> None:
+    """Topic messages resolve their topic name for the event line."""
+    agent = FakeAgent()
+    fake_db = FakeTopicDB({(-1001, 12): "Ideas"})
+    message = make_topic_message(text="ping @libertati_bot")
+    await on_message(message, agent, UTC_TZ, ME, OPEN_REGISTRY, fake_db)  # type: ignore[arg-type]
+    assert len(agent.events) == 1
+    assert "topic 12 “Ideas”" in agent.events[0]
+    assert fake_db.calls == [(-1001, 12)]
 
 
 async def test_deliver_wakeups_pushes_due_and_completes(db: Database) -> None:
@@ -189,10 +293,35 @@ async def test_on_message_approval_gate(tmp_path: Path) -> None:
     """In approval mode a new chat is registered and its events dropped."""
     registry = ChatRegistry(tmp_path / "chats.toml", enabled=True)
     agent = FakeAgent()
-    await on_message(make_message(), agent, UTC_TZ, ME, registry)  # type: ignore[arg-type]
+    await on_message(make_message(), agent, UTC_TZ, ME, registry, FakeTopicDB())  # type: ignore[arg-type]
     assert agent.events == []
     assert "100 = false  # Alice (private)" in registry.path.read_text(encoding="utf-8")
     text = registry.path.read_text(encoding="utf-8")
     registry.path.write_text(text.replace("false", "true"), encoding="utf-8")
-    await on_message(make_message(), agent, UTC_TZ, ME, registry)  # type: ignore[arg-type]
+    await on_message(make_message(), agent, UTC_TZ, ME, registry, FakeTopicDB())  # type: ignore[arg-type]
     assert len(agent.events) == 1
+
+
+async def test_heartbeat_digest_names_unanswered_topics(db: Database) -> None:
+    """Unanswered forum topics are reported per topic with their name."""
+    creation = make_topic_message(
+        message_id=12,
+        message_thread_id=12,
+        text=None,
+        reply_to_message=None,
+        forum_topic_created={"name": "Ideas", "icon_color": 0x6FB9F0},
+    )
+    await db.save_message(creation)
+    question = make_topic_message(message_id=43, text="anyone?")
+    await db.save_message(question)
+    # A newer bot reply in another topic must not answer topic 12.
+    other = make_topic_message(
+        message_id=44,
+        message_thread_id=13,
+        date=STAMP + 60,
+        reply_to_message=topic_pseudo_reply(13, name="Chatter"),
+    )
+    await db.save_message(other, outgoing=True)
+    digest = await heartbeat_digest(db, UTC_TZ, OPEN_REGISTRY)
+    assert "topic 12 “Ideas”" in digest
+    assert "topic 13" not in digest

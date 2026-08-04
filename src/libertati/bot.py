@@ -24,7 +24,7 @@ from libertati import clock
 from libertati.agent import Agent
 from libertati.chats import ChatRegistry
 from libertati.config import Settings
-from libertati.db import Database
+from libertati.db import Database, effective_reply_to
 from libertati.dream import Dreamer, DreamGate
 
 log = logging.getLogger(__name__)
@@ -69,17 +69,25 @@ class PersistMiddleware(BaseMiddleware):
         return await handler(event, data)
 
 
-def format_event(message: Message, tz: ZoneInfo) -> str:
+def format_event(message: Message, tz: ZoneInfo, topic_name: str | None = None) -> str:
     """Format an incoming message as a one-line event for the agent.
 
     Strictly one line: every interpolated field is sender-controlled, and
     a body (or name) containing a newline could otherwise forge extra
     event lines — a fake wakeup, a fake message from another chat — and
     steer the agent. Newlines in the body survive as a literal backslash-n.
+    Forum topic messages name their topic after the chat; the caller
+    resolves ``topic_name`` (this function stays sync and DB-free).
     """
     chat = message.chat
     title = f" “{one_line(chat.title)}”" if chat.title else ""
-    where = f"chat {chat.id} ({chat.type}{title})"
+    if message.is_topic_message and message.message_thread_id:
+        topic = f"topic {message.message_thread_id}"
+        if topic_name:
+            topic += f" “{one_line(topic_name)}”"
+        where = f"chat {chat.id} ({chat.type}{title}, {topic})"
+    else:
+        where = f"chat {chat.id} ({chat.type}{title})"
     user = message.from_user
     if user is None:
         sender = "unknown"
@@ -88,9 +96,13 @@ def format_event(message: Message, tz: ZoneInfo) -> str:
             f"{user.full_name} @{user.username}" if user.username else user.full_name
         )
     ref = f"msg {message.message_id}"
-    if message.reply_to_message is not None:
-        ref += f", replying to msg {message.reply_to_message.message_id}"
-    body = message.text or message.caption or f"<{message.content_type}>"
+    reply_to = effective_reply_to(message)
+    if reply_to is not None:
+        ref += f", replying to msg {reply_to}"
+    if message.forum_topic_created is not None:
+        body = f"<forum_topic_created “{one_line(message.forum_topic_created.name)}”>"
+    else:
+        body = message.text or message.caption or f"<{message.content_type}>"
     body = "\\n".join(body.splitlines())
     if len(body) > EVENT_TEXT_LIMIT:
         body = body[:EVENT_TEXT_LIMIT] + f" […{len(body) - EVENT_TEXT_LIMIT} chars]"
@@ -107,6 +119,10 @@ def is_addressed(message: Message, me: User) -> bool:
         reply is not None
         and reply.from_user is not None
         and reply.from_user.id == me.id
+        # A topic's creation service message is "from" whoever created the
+        # topic; the pseudo-reply to it every topic message carries must
+        # not make a bot-created topic address the bot wholesale.
+        and reply.forum_topic_created is None
     ):
         return True
     if me.username:
@@ -132,6 +148,7 @@ async def on_message(
     tz: ZoneInfo,
     me: User,
     registry: ChatRegistry,
+    db: Database,
 ) -> None:
     """Push an incoming message to the agent loop as an event.
 
@@ -139,13 +156,18 @@ async def on_message(
     events (in approval mode the chat lands in chats.toml for review).
     Group messages become events only when the bot is mentioned or
     replied to — the agent catches up on the rest via history tools on
-    heartbeats.
+    heartbeats. Forum topic messages resolve their topic name here
+    (PersistMiddleware has already saved the message, so even the first
+    message seen in a topic can name itself from its own payload).
     """
     if not registry.register(message.chat.id, chat_label(message)):
         return
     if message.chat.type != "private" and not is_addressed(message, me):
         return
-    await agent.push(format_event(message, tz))
+    topic_name = None
+    if message.is_topic_message and message.message_thread_id:
+        topic_name = await db.topic_name(message.chat.id, message.message_thread_id)
+    await agent.push(format_event(message, tz, topic_name=topic_name))
 
 
 async def deliver_wakeups(agent: Agent, db: Database, tz: ZoneInfo) -> None:
@@ -182,7 +204,8 @@ async def heartbeat_digest(db: Database, tz: ZoneInfo, registry: ChatRegistry) -
     """Build the status text attached to a heartbeat event.
 
     Unapproved chats are left out — the agent shouldn't be nudged
-    towards chats it isn't allowed to see.
+    towards chats it isn't allowed to see. Forum chats report per topic,
+    so an answered topic can't hide an unanswered one.
     """
     parts = []
     unanswered = [
@@ -193,9 +216,14 @@ async def heartbeat_digest(db: Database, tz: ZoneInfo, registry: ChatRegistry) -
         for row in unanswered:
             name = row["title"] or row["first_name"] or "?"
             when = clock.format_local(datetime.fromisoformat(row["date"]), tz)
-            chats.append(
-                f"“{name}” (chat {row['chat_id']}, {row['type']}, last {when})"
-            )
+            where = f"chat {row['chat_id']}, {row['type']}"
+            thread_id = row["message_thread_id"]
+            if thread_id:
+                topic_name = await db.topic_name(row["chat_id"], thread_id)
+                where += f", topic {thread_id}"
+                if topic_name:
+                    where += f" “{one_line(topic_name)}”"
+            chats.append(f"“{name}” ({where}, last {when})")
         parts.append("chats with unanswered last message: " + "; ".join(chats))
     else:
         parts.append("no unanswered chats")
@@ -282,7 +310,9 @@ async def run() -> None:
         asyncio.create_task(dream_loop(dreamer)),
     ]
 
-    dispatcher = Dispatcher(agent=agent, tz=tz, me=await bot.me(), registry=registry)
+    dispatcher = Dispatcher(
+        agent=agent, tz=tz, me=await bot.me(), registry=registry, db=db
+    )
     persist_middleware = PersistMiddleware(db)
     dispatcher.message.outer_middleware(persist_middleware)
     # Edits are persisted (updating the stored row) but deliberately not
