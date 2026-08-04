@@ -48,6 +48,9 @@ TYPING_MAX_SECONDS = 8.0
 # @username as italic delimiters.  Protect mentions before enabling Markdown;
 # Telegram removes the escapes and still creates the mention entity.
 USERNAME_MENTION_RE = re.compile(r"(?<![\w@])@[A-Za-z0-9_]{5,32}(?![A-Za-z0-9_])")
+CITATION_ARTIFACT_RE = re.compile(
+    r"[ \t]*(?:<cite(?:\|[^>\r\n]+)?>|\ue200cite\ue202[^\ue201\r\n]*\ue201)"
+)
 
 
 def escape_markdown_mentions(text: str) -> str:
@@ -55,6 +58,11 @@ def escape_markdown_mentions(text: str) -> str:
     return USERNAME_MENTION_RE.sub(
         lambda match: match.group(0).replace("_", r"\_"), text
     )
+
+
+def strip_citation_artifacts(text: str) -> str:
+    """Remove internal web-search citation markers from outward text."""
+    return CITATION_ARTIFACT_RE.sub("", text)
 
 
 def typing_delay(text: str, chars_per_second: float) -> float:
@@ -1064,6 +1072,7 @@ class Toolbox:
         output with stray ``*``/``_`` is easy to unbalance), the message
         is resent as plain text rather than lost.
         """
+        text = strip_citation_artifacts(args["text"])
         reply_to = args.get("reply_to_message_id")
         if reply_to is not None and not await self.db.message_exists(
             args["chat_id"], reply_to
@@ -1075,7 +1084,7 @@ class Toolbox:
         error = await self._check_topic(args["chat_id"], thread_id)
         if error:
             return error
-        delay = typing_delay(args["text"], self.typing_chars_per_second)
+        delay = typing_delay(text, self.typing_chars_per_second)
         if delay > 0:
             async with ChatActionSender.typing(
                 chat_id=args["chat_id"],
@@ -1086,11 +1095,11 @@ class Toolbox:
         reply_parameters = (
             ReplyParameters(message_id=reply_to) if reply_to is not None else None
         )
-        markdown_text = escape_markdown_mentions(args["text"])
+        markdown_text = escape_markdown_mentions(text)
         sent = await self._markdown_send(
             lambda parse_mode: self.bot.send_message(
                 args["chat_id"],
-                markdown_text if parse_mode else args["text"],
+                markdown_text if parse_mode else text,
                 parse_mode=parse_mode,
                 reply_parameters=reply_parameters,
                 message_thread_id=thread_id,
@@ -1198,10 +1207,11 @@ class Toolbox:
                 f"error: message {args['message_id']} in chat "
                 f"{args['chat_id']} is not one of your own messages"
             )
-        markdown_text = escape_markdown_mentions(args["text"])
+        text = strip_citation_artifacts(args["text"])
+        markdown_text = escape_markdown_mentions(text)
         edited = await self._markdown_send(
             lambda parse_mode: self.bot.edit_message_text(
-                text=markdown_text if parse_mode else args["text"],
+                text=markdown_text if parse_mode else text,
                 chat_id=args["chat_id"],
                 message_id=args["message_id"],
                 parse_mode=parse_mode,

@@ -28,6 +28,7 @@ from libertati.tools import (
     build_dream_tools,
     build_tools,
     function_names,
+    strip_citation_artifacts,
     typing_delay,
 )
 
@@ -423,6 +424,33 @@ async def test_send_message_preserves_username_underscores(
     assert sent["parse_mode"] == ParseMode.MARKDOWN
 
 
+def test_strip_citation_artifacts_handles_search_marker_formats() -> None:
+    """Internal search references never become visible Telegram text."""
+    text = (
+        "Ukraine <cite|turn0search1|turn0search5> and Crimea "
+        "\ue200cite\ue202turn1search2\ue201."
+    )
+    assert strip_citation_artifacts(text) == "Ukraine and Crimea."
+
+
+async def test_send_message_strips_citation_artifacts(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Search markers are removed at the outward-message boundary."""
+    monkeypatch.setattr("libertati.tools.typing_delay", lambda text, cps: 0.0)
+    bot = RecordingBot()
+    args = json.dumps(
+        {
+            "chat_id": 1,
+            "text": "Claim.<cite|turn0search1|turn0search5>",
+            "reply_to_message_id": None,
+            "message_thread_id": None,
+        }
+    )
+    await make_toolbox(bot=bot).run("send_message", args)
+    assert bot.sent_messages[0]["text"] == "Claim."
+
+
 async def test_send_message_refuses_unobserved_reply_target() -> None:
     """Replying cannot target a message hidden from local history."""
     bot = RecordingBot()
@@ -467,7 +495,11 @@ async def test_edit_message() -> None:
     bot = RecordingBot()
     db = FakeDB()
     db.outgoing_rows = {(1, 2)}
-    args = {"chat_id": 1, "message_id": 2, "text": "fixed"}
+    args = {
+        "chat_id": 1,
+        "message_id": 2,
+        "text": "fixed<cite|turn0search1>",
+    }
     result = await make_toolbox(db=db, bot=bot).run("edit_message", json.dumps(args))
     assert result == "edited message 2 in chat 1"
     (edit,) = bot.edits
