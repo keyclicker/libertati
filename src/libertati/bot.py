@@ -18,7 +18,15 @@ from typing import Any
 from zoneinfo import ZoneInfo
 
 from aiogram import BaseMiddleware, Bot, Dispatcher, Router
-from aiogram.types import Message, TelegramObject, User
+from aiogram.types import (
+    Message,
+    MessageReactionUpdated,
+    ReactionType,
+    ReactionTypeCustomEmoji,
+    ReactionTypeEmoji,
+    TelegramObject,
+    User,
+)
 
 from libertati import clock
 from libertati.agent import Agent
@@ -141,6 +149,44 @@ def chat_label(message: Message) -> str:
     return f"{name} ({chat.type})"
 
 
+def format_reaction(reaction: ReactionType) -> str:
+    """Format one Telegram reaction for an agent event."""
+    if isinstance(reaction, ReactionTypeEmoji):
+        return reaction.emoji
+    if isinstance(reaction, ReactionTypeCustomEmoji):
+        return f"custom emoji {reaction.custom_emoji_id}"
+    return "paid reaction"
+
+
+def format_reaction_event(update: MessageReactionUpdated, tz: ZoneInfo) -> str:
+    """Format a reaction change as a one-line event for the agent."""
+    chat = update.chat
+    title = f" “{one_line(chat.title)}”" if chat.title else ""
+    where = f"chat {chat.id} ({chat.type}{title})"
+    if update.user is not None:
+        actor = (
+            f"{update.user.full_name} @{update.user.username}"
+            if update.user.username
+            else update.user.full_name
+        )
+    elif update.actor_chat is not None:
+        actor = update.actor_chat.title or update.actor_chat.full_name or "unknown chat"
+    else:
+        actor = "unknown"
+    old = {format_reaction(item) for item in update.old_reaction}
+    new = {format_reaction(item) for item in update.new_reaction}
+    changes = []
+    if added := sorted(new - old):
+        changes.append("added " + ", ".join(added))
+    if removed := sorted(old - new):
+        changes.append("removed " + ", ".join(removed))
+    change = "; ".join(changes) or "reaction unchanged"
+    return (
+        f"[{clock.format_local(update.date, tz)}] {where} | "
+        f"{one_line(actor)} reacted to your msg {update.message_id}: {change}"
+    )
+
+
 @router.message()
 async def on_message(
     message: Message,
@@ -168,6 +214,26 @@ async def on_message(
     if message.is_topic_message and message.message_thread_id:
         topic_name = await db.topic_name(message.chat.id, message.message_thread_id)
     await agent.push(format_event(message, tz, topic_name=topic_name))
+
+
+@router.message_reaction()
+async def on_message_reaction(
+    event: MessageReactionUpdated,
+    agent: Agent,
+    tz: ZoneInfo,
+    me: User,
+    registry: ChatRegistry,
+    db: Database,
+) -> None:
+    """Push human reactions to the bot's stored messages as events."""
+    name = event.chat.title or event.chat.full_name or event.chat.username or "?"
+    if not registry.register(event.chat.id, f"{name} ({event.chat.type})"):
+        return
+    if event.user is not None and event.user.id == me.id:
+        return
+    if not await db.message_is_outgoing(event.chat.id, event.message_id):
+        return
+    await agent.push(format_reaction_event(event, tz))
 
 
 async def deliver_wakeups(agent: Agent, db: Database, tz: ZoneInfo) -> None:

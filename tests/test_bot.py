@@ -4,15 +4,17 @@ from pathlib import Path
 from typing import Any, cast
 from zoneinfo import ZoneInfo
 
-from aiogram.types import Message, User
+from aiogram.types import Message, MessageReactionUpdated, User
 
 from libertati.bot import (
     EVENT_TEXT_LIMIT,
     deliver_wakeups,
     format_event,
+    format_reaction_event,
     heartbeat_digest,
     is_addressed,
     on_message,
+    on_message_reaction,
 )
 from libertati.chats import ChatRegistry
 from libertati.db import Database
@@ -247,6 +249,76 @@ class FakeTopicDB:
         """Return the mapped name, if any."""
         self.calls.append((chat_id, thread_id))
         return self.names.get((chat_id, thread_id))
+
+    async def message_is_outgoing(self, chat_id: int, message_id: int) -> bool:
+        """Treat message 42 as the bot's own stored message."""
+        return (chat_id, message_id) == (100, 42)
+
+
+def make_reaction(**overrides: Any) -> MessageReactionUpdated:
+    """Build a minimal reaction update, with field overrides."""
+    data: dict[str, Any] = {
+        "chat": {"id": 100, "type": "private", "first_name": "Alice"},
+        "message_id": 42,
+        "date": STAMP,
+        "user": {
+            "id": 7,
+            "is_bot": False,
+            "first_name": "Alice",
+            "username": "alice",
+        },
+        "old_reaction": [],
+        "new_reaction": [{"type": "emoji", "emoji": "❤️"}],
+    }
+    data.update(overrides)
+    return MessageReactionUpdated.model_validate(data)
+
+
+def test_format_reaction_event() -> None:
+    """Reaction events identify actor, target message and change."""
+    event = format_reaction_event(make_reaction(), UTC_TZ)
+    assert event == (
+        "[Sun 2026-08-02 12:00] chat 100 (private) | Alice @alice "
+        "reacted to your msg 42: added ❤️"
+    )
+
+
+async def test_on_message_reaction_only_pushes_for_bot_message() -> None:
+    """Reactions become events only when target message is outgoing."""
+    agent = FakeAgent()
+    db = FakeTopicDB()
+    await on_message_reaction(
+        make_reaction(),
+        agent,
+        UTC_TZ,
+        ME,
+        OPEN_REGISTRY,
+        db,  # type: ignore[arg-type]
+    )
+    await on_message_reaction(
+        make_reaction(message_id=41),
+        agent,
+        UTC_TZ,
+        ME,
+        OPEN_REGISTRY,
+        db,  # type: ignore[arg-type]
+    )
+    assert len(agent.events) == 1
+
+
+async def test_on_message_reaction_ignores_bot_actor() -> None:
+    """The bot's own reaction changes do not wake the agent."""
+    agent = FakeAgent()
+    event = make_reaction(user={"id": ME.id, "is_bot": True, "first_name": "libertati"})
+    await on_message_reaction(
+        event,
+        agent,
+        UTC_TZ,
+        ME,
+        OPEN_REGISTRY,
+        FakeTopicDB(),  # type: ignore[arg-type]
+    )
+    assert agent.events == []
 
 
 async def test_on_message_private_always_pushed() -> None:
