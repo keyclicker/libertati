@@ -10,6 +10,7 @@ lives here.
 """
 
 import logging
+from collections import defaultdict, deque
 from typing import TYPE_CHECKING, Any, cast
 
 from openai import AsyncOpenAI, BadRequestError, Omit
@@ -68,6 +69,42 @@ class ModelLoop:
         """
         return await self.db.latest_context_id()
 
+    @staticmethod
+    def _unique_call_ids(items: list[dict[str, Any]]) -> list[dict[str, Any]]:
+        """Rename repeated tool-call ids while preserving call/output pairs.
+
+        Some compatible providers reuse short ids across turns while others
+        require every id in the full input to be unique. Persistence keeps the
+        provider's original values; only the request view is normalized.
+        """
+        counts: dict[str, int] = defaultdict(int)
+        pending: dict[str, deque[str]] = defaultdict(deque)
+        used: set[str] = set()
+        normalized: list[dict[str, Any]] = []
+        for item in items:
+            kind = item.get("type")
+            call_id = item.get("call_id")
+            replacement = call_id
+            if kind == "function_call" and isinstance(call_id, str):
+                counts[call_id] += 1
+                replacement = call_id
+                suffix = counts[call_id]
+                while replacement in used:
+                    replacement = f"{call_id}__libertati_{suffix}"
+                    suffix += 1
+                used.add(replacement)
+                pending[call_id].append(replacement)
+            elif (
+                kind == "function_call_output"
+                and isinstance(call_id, str)
+                and pending[call_id]
+            ):
+                replacement = pending[call_id].popleft()
+            if replacement != call_id:
+                item = {**item, "call_id": replacement}
+            normalized.append(item)
+        return normalized
+
     async def _round(self, instructions: str, turn_id: int | None) -> bool:
         """Call the model once and run whatever tools it asked for.
 
@@ -77,12 +114,13 @@ class ModelLoop:
         :attr:`dream_id` instead.
         """
         input_context_id = await self._anchor_id()
+        request_context = self._unique_call_ids(self._context)
 
         async def create(tools: list[ToolParam]) -> Any:
             return await self.client.responses.create(
                 model=self.model,
                 instructions=instructions,
-                input=cast(ResponseInputParam, self._context),
+                input=cast(ResponseInputParam, request_context),
                 tools=tools,
                 # Nothing is stored server-side; encrypted reasoning must
                 # ride along in the context for multi-round tool turns.
