@@ -398,6 +398,48 @@ async def test_turn_retries_without_failed_server_tool() -> None:
     assert agent._api_tools == [function_tool]
 
 
+async def test_turn_retries_duplicate_tool_ids_with_events_only() -> None:
+    """Mistral duplicate-id errors fall back to external event context."""
+    request = httpx.Request("POST", "https://openrouter.ai/api/v1/responses")
+    failure = BadRequestError(
+        "Duplicate tool call id in assistant message",
+        response=httpx.Response(400, request=request),
+        body={"error": {"message": "Duplicate tool call id in assistant message"}},
+    )
+    response = SimpleNamespace(
+        id="resp_1", model="mistral-test", output=[], output_text="", usage=None
+    )
+    responses = iter([failure, response])
+    calls: list[dict[str, Any]] = []
+
+    async def create(**kwargs: Any) -> Any:
+        calls.append(kwargs)
+        result = next(responses)
+        if isinstance(result, Exception):
+            raise result
+        return result
+
+    db = FakeContextDB()
+    agent = Agent.__new__(Agent)
+    agent.client = cast(Any, SimpleNamespace(responses=SimpleNamespace(create=create)))
+    agent.model = "mistral-test"
+    agent.mind = cast(Any, SimpleNamespace(soul=lambda: "soul"))
+    agent.base_prompt = "base"
+    agent.max_rounds = 1
+    agent.max_context_items = MAX_CONTEXT_ITEMS
+    agent.trim_context_items = TRIM_CONTEXT_ITEMS
+    agent._context = [EVENT, CALL, CALL_OUTPUT, MESSAGE, EVENT]
+    agent._api_tools = []
+    agent.reasoning = {}
+    agent.prune_completed_reasoning = False
+    agent.db = cast(Database, db)
+
+    await agent._turn()
+
+    assert len(calls) == 2
+    assert calls[1]["input"] == [EVENT, EVENT]
+
+
 async def test_record_usage_maps_all_authoritative_counts() -> None:
     """Response usage fields map into persistent records unchanged."""
     db = FakeContextDB()

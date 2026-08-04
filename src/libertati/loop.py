@@ -116,11 +116,11 @@ class ModelLoop:
         input_context_id = await self._anchor_id()
         request_context = self._unique_call_ids(self._context)
 
-        async def create(tools: list[ToolParam]) -> Any:
+        async def create(tools: list[ToolParam], context: list[dict[str, Any]]) -> Any:
             return await self.client.responses.create(
                 model=self.model,
                 instructions=instructions,
-                input=cast(ResponseInputParam, request_context),
+                input=cast(ResponseInputParam, context),
                 tools=tools,
                 # Nothing is stored server-side; encrypted reasoning must
                 # ride along in the context for multi-round tool turns.
@@ -130,18 +130,20 @@ class ModelLoop:
             )
 
         try:
-            response = await create(self._api_tools)
+            response = await create(self._api_tools, request_context)
         except BadRequestError as exc:
-            local_tools = [
-                tool for tool in self._api_tools if tool["type"] == "function"
-            ]
-            if "Server tool request failed" not in str(exc) or len(local_tools) == len(
-                self._api_tools
-            ):
-                raise
-            log.warning("server tool failed; disabling built-in tools and retrying")
-            self._api_tools = local_tools
-            response = await create(local_tools)
+            if "Duplicate tool call id in assistant message" in str(exc):
+                event_context = [
+                    item
+                    for item in self._context
+                    if item.get("role") == "user" and "type" not in item
+                ]
+                log.warning(
+                    "provider rejected historical tool ids; retrying with events only"
+                )
+                response = await create(self._api_tools, event_context)
+            else:
+                response = await self._retry_without_server_tools(exc, create)
         self._last_output_text = response.output_text or ""
         await self._record_usage(response, turn_id, input_context_id)
         for item in response.output:
@@ -164,6 +166,19 @@ class ModelLoop:
                 }
             )
         return True
+
+    async def _retry_without_server_tools(
+        self, exc: BadRequestError, create: Any
+    ) -> Any:
+        """Retry a failed built-in server tool with local functions only."""
+        local_tools = [tool for tool in self._api_tools if tool["type"] == "function"]
+        if "Server tool request failed" not in str(exc) or len(local_tools) == len(
+            self._api_tools
+        ):
+            raise exc
+        log.warning("server tool failed; disabling built-in tools and retrying")
+        self._api_tools = local_tools
+        return await create(local_tools, self._unique_call_ids(self._context))
 
     async def _record_usage(
         self,
