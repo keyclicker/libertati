@@ -5,6 +5,9 @@ from datetime import UTC, datetime
 from types import SimpleNamespace
 from typing import Any, cast
 
+import httpx
+from openai import BadRequestError
+
 from libertati.agent import Agent
 from libertati.db import Database
 
@@ -331,6 +334,51 @@ async def test_turn_retries_private_final_output_once() -> None:
     assert db.turns == [
         {"start_context_id": 0, "end_context_id": 2, "status": "completed"}
     ]
+
+
+async def test_turn_retries_without_failed_server_tool() -> None:
+    """An unsupported built-in tool is removed while local tools remain."""
+    request = httpx.Request("POST", "https://openrouter.ai/api/v1/responses")
+    failure = BadRequestError(
+        "Server tool request failed",
+        response=httpx.Response(400, request=request),
+        body={"error": {"message": "Server tool request failed"}},
+    )
+    response = SimpleNamespace(
+        id="resp_1", model="gpt-test", output=[], output_text="", usage=None
+    )
+    responses = iter([failure, response])
+    calls: list[dict[str, Any]] = []
+
+    async def create(**kwargs: Any) -> Any:
+        calls.append(kwargs)
+        result = next(responses)
+        if isinstance(result, Exception):
+            raise result
+        return result
+
+    db = FakeContextDB()
+    agent = Agent.__new__(Agent)
+    agent.client = cast(Any, SimpleNamespace(responses=SimpleNamespace(create=create)))
+    agent.model = "gpt-test"
+    agent.mind = cast(Any, SimpleNamespace(soul=lambda: "soul"))
+    agent.base_prompt = "base"
+    agent.max_rounds = 1
+    agent.max_context_items = MAX_CONTEXT_ITEMS
+    agent.trim_context_items = TRIM_CONTEXT_ITEMS
+    agent._context = [EVENT]
+    function_tool = cast(Any, {"type": "function", "name": "send_message"})
+    agent._api_tools = [function_tool, cast(Any, {"type": "web_search"})]
+    agent.reasoning = {}
+    agent.prune_completed_reasoning = False
+    agent.db = cast(Database, db)
+
+    await agent._turn()
+
+    assert len(calls) == 2
+    assert calls[0]["tools"] == [function_tool, {"type": "web_search"}]
+    assert calls[1]["tools"] == [function_tool]
+    assert agent._api_tools == [function_tool]
 
 
 async def test_record_usage_maps_all_authoritative_counts() -> None:
