@@ -108,8 +108,24 @@ MESSAGING_TOOLS: list[ToolParam] = [
                         "every message reads robotic."
                     ),
                 },
+                "message_thread_id": {
+                    "type": ["integer", "null"],
+                    "description": (
+                        "Forum topic id to post into (topics show as "
+                        "`topic N` in events; see list_topics). Null outside "
+                        "forums, for the General topic, or when "
+                        "reply_to_message_id already points into the right "
+                        "topic — a reply lands in its target's topic "
+                        "automatically."
+                    ),
+                },
             },
-            "required": ["chat_id", "text", "reply_to_message_id"],
+            "required": [
+                "chat_id",
+                "text",
+                "reply_to_message_id",
+                "message_thread_id",
+            ],
             "additionalProperties": False,
         },
         "strict": True,
@@ -133,8 +149,15 @@ MESSAGING_TOOLS: list[ToolParam] = [
                     "type": "string",
                     "description": "Sticker file_id (from list_stickers).",
                 },
+                "message_thread_id": {
+                    "type": ["integer", "null"],
+                    "description": (
+                        "Forum topic id to post into; null outside forums "
+                        "and for the General topic."
+                    ),
+                },
             },
-            "required": ["chat_id", "file_id"],
+            "required": ["chat_id", "file_id", "message_thread_id"],
             "additionalProperties": False,
         },
         "strict": True,
@@ -177,8 +200,21 @@ MESSAGING_TOOLS: list[ToolParam] = [
                     "type": "integer",
                     "description": "Id of the message to forward.",
                 },
+                "message_thread_id": {
+                    "type": ["integer", "null"],
+                    "description": (
+                        "Forum topic in the DESTINATION chat to forward "
+                        "into; null outside forums and for the General "
+                        "topic."
+                    ),
+                },
             },
-            "required": ["to_chat_id", "from_chat_id", "message_id"],
+            "required": [
+                "to_chat_id",
+                "from_chat_id",
+                "message_id",
+                "message_thread_id",
+            ],
             "additionalProperties": False,
         },
         "strict": True,
@@ -402,6 +438,30 @@ HISTORY_TOOLS: list[ToolParam] = [
     },
     {
         "type": "function",
+        "name": "list_topics",
+        "description": (
+            "List the forum topics seen in a supergroup: topic id, name, "
+            "message count, last activity and whether it's closed. Only "
+            "forum chats have topics (get_chat_info shows is_forum); "
+            "messages outside any topic are in the General topic, which "
+            "is not listed and needs no topic id. Not the same as "
+            "get_message_thread, which follows reply chains."
+        ),
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "chat_id": {
+                    "type": "integer",
+                    "description": "Forum chat id.",
+                },
+            },
+            "required": ["chat_id"],
+            "additionalProperties": False,
+        },
+        "strict": True,
+    },
+    {
+        "type": "function",
         "name": "get_recent_messages",
         "description": (
             "Fetch messages stored for a chat, newest last. Use to recall "
@@ -427,8 +487,19 @@ HISTORY_TOOLS: list[ToolParam] = [
                         "message_id of the previous batch."
                     ),
                 },
+                "message_thread_id": {
+                    "type": ["integer", "null"],
+                    "description": (
+                        "Restrict to one forum topic by id; null = the whole chat."
+                    ),
+                },
             },
-            "required": ["chat_id", "limit", "before_message_id"],
+            "required": [
+                "chat_id",
+                "limit",
+                "before_message_id",
+                "message_thread_id",
+            ],
             "additionalProperties": False,
         },
         "strict": True,
@@ -489,8 +560,14 @@ HISTORY_TOOLS: list[ToolParam] = [
                     "type": ["integer", "null"],
                     "description": "How many matches to return (max 50); null = 20.",
                 },
+                "message_thread_id": {
+                    "type": ["integer", "null"],
+                    "description": (
+                        "Restrict to one forum topic by id; null = the whole chat."
+                    ),
+                },
             },
-            "required": ["chat_id", "query", "limit"],
+            "required": ["chat_id", "query", "limit", "message_thread_id"],
             "additionalProperties": False,
         },
         "strict": True,
@@ -781,6 +858,7 @@ GATED_CHAT_ARGS: dict[str, tuple[str, ...]] = {
     "delete_message": ("chat_id",),
     "get_chat_info": ("chat_id",),
     "list_chat_members": ("chat_id",),
+    "list_topics": ("chat_id",),
     "get_recent_messages": ("chat_id",),
     "get_message_thread": ("chat_id",),
     "search_messages": ("chat_id",),
@@ -918,6 +996,7 @@ class Toolbox:
             "list_chats": self._list_chats,
             "get_chat_info": self._get_chat_info,
             "list_chat_members": self._list_chat_members,
+            "list_topics": self._list_topics,
             "get_recent_messages": self._get_recent_messages,
             "get_message_thread": self._get_message_thread,
             "search_messages": self._search_messages,
@@ -992,9 +1071,17 @@ class Toolbox:
             return (
                 f"error: message {reply_to} in chat {args['chat_id']} was not observed"
             )
+        thread_id = args.get("message_thread_id")
+        error = await self._check_topic(args["chat_id"], thread_id)
+        if error:
+            return error
         delay = typing_delay(args["text"], self.typing_chars_per_second)
         if delay > 0:
-            async with ChatActionSender.typing(chat_id=args["chat_id"], bot=self.bot):
+            async with ChatActionSender.typing(
+                chat_id=args["chat_id"],
+                bot=self.bot,
+                message_thread_id=thread_id,
+            ):
                 await asyncio.sleep(delay)
         reply_parameters = (
             ReplyParameters(message_id=reply_to) if reply_to is not None else None
@@ -1006,20 +1093,41 @@ class Toolbox:
                 markdown_text if parse_mode else args["text"],
                 parse_mode=parse_mode,
                 reply_parameters=reply_parameters,
+                message_thread_id=thread_id,
             )
         )
         await self.db.save_message(sent, outgoing=True)
+        topic = f" (topic {thread_id})" if thread_id is not None else ""
         return (
-            f"sent message {sent.message_id} to chat {sent.chat.id}"
+            f"sent message {sent.message_id} to chat {sent.chat.id}{topic}"
             f" at {clock.format_now(self.tz)}"
         )
+
+    async def _check_topic(self, chat_id: int, thread_id: int | None) -> str | None:
+        """Refuse a send into a forum topic the bot has never seen.
+
+        Fail-closed like the reply pre-check: a hallucinated topic id
+        must fail with a useful message here instead of an opaque
+        Telegram error (or a message landing in the wrong place).
+        """
+        if thread_id is not None and not await self.db.topic_observed(
+            chat_id, thread_id
+        ):
+            return f"error: topic {thread_id} in chat {chat_id} was not observed"
+        return None
 
     async def _send_sticker(self, args: dict[str, Any]) -> str:
         """Send a known sticker by file_id and persist it as outgoing."""
         chat_ids = await self._approved_chat_ids()
         if not await self.db.sticker_is_known(args["file_id"], chat_ids):
             return "error: sticker was not observed in an approved chat"
-        sent = await self.bot.send_sticker(args["chat_id"], args["file_id"])
+        thread_id = args.get("message_thread_id")
+        error = await self._check_topic(args["chat_id"], thread_id)
+        if error:
+            return error
+        sent = await self.bot.send_sticker(
+            args["chat_id"], args["file_id"], message_thread_id=thread_id
+        )
         await self.db.save_message(sent, outgoing=True)
         return f"sent sticker as message {sent.message_id} to chat {sent.chat.id}"
 
@@ -1037,8 +1145,15 @@ class Toolbox:
                 f"error: message {args['message_id']} in chat "
                 f"{args['from_chat_id']} was not observed"
             )
+        thread_id = args.get("message_thread_id")
+        error = await self._check_topic(args["to_chat_id"], thread_id)
+        if error:
+            return error
         sent = await self.bot.forward_message(
-            args["to_chat_id"], args["from_chat_id"], args["message_id"]
+            args["to_chat_id"],
+            args["from_chat_id"],
+            args["message_id"],
+            message_thread_id=thread_id,
         )
         await self.db.save_message(sent, outgoing=True)
         return (
@@ -1197,6 +1312,8 @@ class Toolbox:
             "username": chat.username,
             "bio": chat.bio,
             "description": chat.description,
+            # None for non-forums, so the drop-Nones filter below hides it.
+            "is_forum": chat.is_forum,
         }
         if chat.type != "private":
             info["member_count"] = await self.bot.get_chat_member_count(chat.id)
@@ -1218,11 +1335,24 @@ class Toolbox:
             return "nobody seen talking in this chat yet"
         return json.dumps(rows, ensure_ascii=False)
 
+    async def _list_topics(self, args: dict[str, Any]) -> str:
+        """Return the forum topics seen in a chat as JSON, most recent first."""
+        rows = await self.db.list_topics(args["chat_id"])
+        if not rows:
+            return (
+                "no topics seen in this chat — either not a forum, "
+                "or nothing observed yet"
+            )
+        return json.dumps(rows, ensure_ascii=False)
+
     async def _get_recent_messages(self, args: dict[str, Any]) -> str:
         """Return a page of a chat's messages as JSON, oldest first."""
         limit = max(1, min(args.get("limit") or 20, 50))
         rows = await self.db.recent_messages(
-            args["chat_id"], limit, args.get("before_message_id")
+            args["chat_id"],
+            limit,
+            args.get("before_message_id"),
+            args.get("message_thread_id"),
         )
         return json.dumps(rows, ensure_ascii=False)
 
@@ -1237,7 +1367,12 @@ class Toolbox:
     async def _search_messages(self, args: dict[str, Any]) -> str:
         """Return a chat's messages matching a substring as JSON."""
         limit = max(1, min(args.get("limit") or 20, 50))
-        rows = await self.db.search_messages(args["chat_id"], args["query"], limit)
+        rows = await self.db.search_messages(
+            args["chat_id"],
+            args["query"],
+            limit,
+            args.get("message_thread_id"),
+        )
         if not rows:
             return "no matches"
         return json.dumps(rows, ensure_ascii=False)
