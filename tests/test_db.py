@@ -78,6 +78,19 @@ async def test_recent_messages_pagination(db: Database) -> None:
     assert [row["message_id"] for row in page] == [2, 3]
 
 
+async def test_unread_count_tracks_whole_chat_and_topic_reads(db: Database) -> None:
+    """Read cursors persist independently for a whole chat and each topic."""
+    await db.save_message(make_topic_message(12, None))
+    await db.save_message(make_topic_message(13, "one", date=STAMP + 1))
+    await db.save_message(make_topic_message(14, "two", date=STAMP + 2))
+    assert await db.unread_messages_count(-1001, 12) == 3
+    await db.mark_messages_read(-1001, 14, 12)
+    assert await db.unread_messages_count(-1001, 12) == 0
+    assert await db.unread_messages_count(-1001) == 3
+    await db.save_message(make_topic_message(15, "three", date=STAMP + 3))
+    assert await db.unread_messages_count(-1001, 12) == 1
+
+
 async def test_search_messages(db: Database) -> None:
     """Substring search is case-insensitive, newest first, wildcards literal."""
     await db.save_message(make_message(1, "my Cat is grumpy", date=STAMP))

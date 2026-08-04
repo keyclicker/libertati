@@ -60,6 +60,15 @@ CREATE INDEX IF NOT EXISTS idx_messages_chat_date
 CREATE INDEX IF NOT EXISTS idx_messages_from_user
     ON messages (from_user_id);
 
+-- Last message exposed through get_recent_messages, per chat/topic.  Zero
+-- represents a whole-chat cursor; Telegram topic ids are positive.
+CREATE TABLE IF NOT EXISTS message_read_cursors (
+    chat_id           INTEGER NOT NULL REFERENCES chats(id),
+    message_thread_id INTEGER NOT NULL DEFAULT 0,
+    message_id        INTEGER NOT NULL,
+    PRIMARY KEY (chat_id, message_thread_id)
+);
+
 CREATE TABLE IF NOT EXISTS context (
     id         INTEGER PRIMARY KEY AUTOINCREMENT,
     item       TEXT NOT NULL,
@@ -589,6 +598,47 @@ class Database:
         async with self.conn.execute(query, params) as cursor:
             rows = list(await cursor.fetchall())
         return [dict(row) for row in reversed(rows)]
+
+    async def unread_messages_count(
+        self, chat_id: int, message_thread_id: int | None = None
+    ) -> int:
+        """Count messages newer than the last history read for a chat/topic."""
+        thread_key = message_thread_id or 0
+        query = """
+            SELECT COUNT(*)
+            FROM messages m
+            WHERE m.chat_id = ?
+              AND (? IS NULL OR m.message_thread_id = ?)
+              AND m.message_id > COALESCE((
+                  SELECT message_id FROM message_read_cursors
+                  WHERE chat_id = ? AND message_thread_id = ?
+              ), 0)
+        """
+        params = (chat_id, message_thread_id, message_thread_id, chat_id, thread_key)
+        async with self.conn.execute(query, params) as cursor:
+            row = await cursor.fetchone()
+        return int(row[0]) if row else 0
+
+    async def mark_messages_read(
+        self,
+        chat_id: int,
+        message_id: int,
+        message_thread_id: int | None = None,
+    ) -> None:
+        """Advance a chat/topic history cursor through one exposed message."""
+        thread_key = message_thread_id or 0
+        await self.conn.execute(
+            """
+            INSERT INTO message_read_cursors
+                (chat_id, message_thread_id, message_id)
+            VALUES (?, ?, ?)
+            ON CONFLICT(chat_id, message_thread_id) DO UPDATE SET
+                message_id = MAX(message_read_cursors.message_id,
+                                 excluded.message_id)
+            """,
+            (chat_id, thread_key, message_id),
+        )
+        await self.conn.commit()
 
     async def search_messages(
         self,

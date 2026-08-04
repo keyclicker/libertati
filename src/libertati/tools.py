@@ -514,6 +514,33 @@ HISTORY_TOOLS: list[ToolParam] = [
     },
     {
         "type": "function",
+        "name": "get_unread_messages_count",
+        "description": (
+            "Count stored messages added since you last fetched recent "
+            "messages from a chat or forum topic. Call this before "
+            "get_recent_messages to choose the smallest useful limit."
+        ),
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "chat_id": {
+                    "type": "integer",
+                    "description": "Chat id whose unread history to count.",
+                },
+                "message_thread_id": {
+                    "type": ["integer", "null"],
+                    "description": (
+                        "Restrict to one forum topic; null = the whole chat."
+                    ),
+                },
+            },
+            "required": ["chat_id", "message_thread_id"],
+            "additionalProperties": False,
+        },
+        "strict": True,
+    },
+    {
+        "type": "function",
         "name": "get_message_thread",
         "description": (
             "Fetch the reply thread a message belongs to: what it "
@@ -868,6 +895,7 @@ GATED_CHAT_ARGS: dict[str, tuple[str, ...]] = {
     "list_chat_members": ("chat_id",),
     "list_topics": ("chat_id",),
     "get_recent_messages": ("chat_id",),
+    "get_unread_messages_count": ("chat_id",),
     "get_message_thread": ("chat_id",),
     "search_messages": ("chat_id",),
 }
@@ -1006,6 +1034,7 @@ class Toolbox:
             "list_chat_members": self._list_chat_members,
             "list_topics": self._list_topics,
             "get_recent_messages": self._get_recent_messages,
+            "get_unread_messages_count": self._get_unread_messages_count,
             "get_message_thread": self._get_message_thread,
             "search_messages": self._search_messages,
             # memory
@@ -1364,7 +1393,20 @@ class Toolbox:
             args.get("before_message_id"),
             args.get("message_thread_id"),
         )
+        if args.get("before_message_id") is None and rows:
+            await self.db.mark_messages_read(
+                args["chat_id"],
+                max(row["message_id"] for row in rows),
+                args.get("message_thread_id"),
+            )
         return json.dumps(rows, ensure_ascii=False)
+
+    async def _get_unread_messages_count(self, args: dict[str, Any]) -> str:
+        """Return unread stored-message count for a chat or topic."""
+        count = await self.db.unread_messages_count(
+            args["chat_id"], args.get("message_thread_id")
+        )
+        return str(count)
 
     async def _get_message_thread(self, args: dict[str, Any]) -> str:
         """Return the reply thread around a message as JSON, oldest first."""
