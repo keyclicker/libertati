@@ -109,7 +109,11 @@ def test_legacy_delivery_nudge_is_not_an_external_event() -> None:
     """Old untyped correction messages never become event boundaries."""
     nudge = {"role": "user", "content": "[delivery correction]\nretry"}
     assert not Agent._is_external_event(nudge)
-    assert Agent._normalize_internal_nudge(nudge) == {**nudge, "type": "message"}
+    assert Agent._normalize_internal_nudge(nudge) == {
+        "role": "user",
+        "type": "message",
+        "content": [{"type": "input_text", "text": "[delivery correction]\nretry"}],
+    }
 
 
 def test_provider_fallback_keeps_active_turn_suffix() -> None:
@@ -373,8 +377,10 @@ async def test_turn_retries_private_final_output_once() -> None:
     assert len(calls) == 2
     assert calls[1]["input"][-1]["role"] == "user"
     assert calls[1]["input"][-1]["type"] == "message"
-    assert "call send_message now" in calls[1]["input"][-1]["content"]
-    assert "This should have been sent" in calls[1]["input"][-1]["content"]
+    nudge = calls[1]["input"][-1]["content"][0]
+    assert nudge["type"] == "input_text"
+    assert "call send_message now" in nudge["text"]
+    assert "This should have been sent" in nudge["text"]
     assert db.turns == [
         {"start_context_id": 0, "end_context_id": 2, "status": "completed"}
     ]
