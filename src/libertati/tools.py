@@ -926,7 +926,13 @@ def valid_tool_arguments(name: str, args: object) -> bool:
         parameter = properties.get(key)
         if parameter is None:
             return False
-        expected = parameter["type"]
+        # A property outside the supported subset (no declared type) is
+        # refused rather than raised over: run() promises never to raise.
+        # test_every_schema_stays_within_the_validated_subset keeps such a
+        # schema from reaching a release unnoticed.
+        expected = parameter.get("type")
+        if expected is None:
+            return False
         types = [expected] if isinstance(expected, str) else expected
         valid_type = any(
             expected_type == "null"

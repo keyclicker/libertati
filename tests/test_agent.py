@@ -796,3 +796,114 @@ async def test_record_usage_maps_all_authoritative_counts() -> None:
             "total_tokens": 130,
         }
     ]
+
+
+def test_unique_call_ids_renames_repeats_and_keeps_pairs() -> None:
+    """Repeated ids are renamed in order; each output follows its call."""
+    items = [
+        EVENT,
+        CALL,
+        CALL_OUTPUT,
+        {**CALL, "name": "recall"},
+        {**CALL_OUTPUT, "output": "recalled"},
+    ]
+
+    normalized = Agent._unique_call_ids(items)
+
+    assert [item.get("call_id") for item in normalized] == [
+        None,
+        "call_1",
+        "call_1",
+        "call_1__libertati_2",
+        "call_1__libertati_2",
+    ]
+    # Only the request view changes; the window itself is untouched.
+    assert items[3]["call_id"] == "call_1"
+
+
+def test_unique_call_ids_leaves_distinct_ids_alone() -> None:
+    """A well-behaved context is passed through unchanged."""
+    items = [EVENT, CALL, CALL_OUTPUT, EVENT]
+    assert Agent._unique_call_ids(items) == items
+
+
+def test_unique_call_ids_keeps_an_orphaned_output() -> None:
+    """An output whose call was trimmed away keeps the provider's id."""
+    items = [EVENT, CALL_OUTPUT]
+    assert Agent._unique_call_ids(items) == items
+
+
+async def test_turn_survives_duplicate_ids_within_one_turn() -> None:
+    """Ids reused across the rounds of one turn are renamed, not shed.
+
+    Shedding history cannot fix this: the collision is inside the active
+    turn, whose calls still need their outputs.
+    """
+    request = httpx.Request("POST", "https://openrouter.ai/api/v1/responses")
+    failure = BadRequestError(
+        "Duplicate tool call id in assistant message",
+        response=httpx.Response(400, request=request),
+        body={"error": {"message": "Duplicate tool call id in assistant message"}},
+    )
+    calling = SimpleNamespace(
+        id="resp_1",
+        model="mistral-test",
+        output=[FakeOutputItem(CALL)],
+        output_text="",
+        usage=None,
+    )
+    settled = SimpleNamespace(
+        id="resp_3", model="mistral-test", output=[], output_text="", usage=None
+    )
+    responses = iter([calling, calling, settled])
+    calls: list[dict[str, Any]] = []
+
+    async def create(**kwargs: Any) -> Any:
+        """Reject any input carrying one call id twice, as Mistral does."""
+        calls.append(kwargs)
+        ids = [
+            item["call_id"]
+            for item in kwargs["input"]
+            if item.get("type") == "function_call"
+        ]
+        if len(ids) != len(set(ids)):
+            raise failure
+        return next(responses)
+
+    class FakeTools:
+        """Answer every call with a fixed result."""
+
+        async def run(self, name: str, arguments: str) -> str:
+            """Return a stable tool result."""
+            return "sent"
+
+    db = FakeContextDB()
+    agent = Agent.__new__(Agent)
+    agent.client = cast(Any, SimpleNamespace(responses=SimpleNamespace(create=create)))
+    agent.model = "mistral-test"
+    agent.mind = cast(Any, SimpleNamespace(soul=lambda: "soul"))
+    agent.base_prompt = "base"
+    agent.max_rounds = 3
+    agent.max_context_items = MAX_CONTEXT_ITEMS
+    agent.trim_context_items = TRIM_CONTEXT_ITEMS
+    agent._context = [EVENT]
+    agent._active_turn_start = 0
+    agent._api_tools = []
+    agent.reasoning = {}
+    agent.prune_completed_reasoning = False
+    agent.db = cast(Database, db)
+    agent.tools = cast(Any, FakeTools())
+
+    await agent._turn()
+
+    assert db.turns[-1]["status"] == "completed"
+    assert [item["call_id"] for item in calls[-1]["input"] if "call_id" in item] == [
+        "call_1",
+        "call_1",
+        "call_1__libertati_2",
+        "call_1__libertati_2",
+    ]
+    # The window keeps the provider's own ids; only the request is renamed.
+    assert [item["call_id"] for item in agent._context if "call_id" in item] == [
+        "call_1"
+    ] * 4

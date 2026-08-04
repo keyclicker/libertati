@@ -10,6 +10,7 @@ lives here.
 """
 
 import logging
+from collections import defaultdict, deque
 from typing import TYPE_CHECKING, Any, cast
 
 from openai import AsyncOpenAI, BadRequestError, Omit
@@ -82,6 +83,46 @@ class ModelLoop:
         return self._context
 
     @staticmethod
+    def _unique_call_ids(items: list[dict[str, Any]]) -> list[dict[str, Any]]:
+        """Rename repeated tool-call ids, keeping each call/output pair.
+
+        Some compatible providers hand out short ids and reuse them across
+        the rounds of one turn, then reject the very context they produced
+        ("Duplicate tool call id in assistant message"). Shedding history
+        cannot help there — the collision sits inside the active turn — so
+        the request view is renamed instead. Only the outgoing view: the
+        provider's own ids stay in the window and in SQLite.
+        """
+        counts: dict[str, int] = defaultdict(int)
+        pending: dict[str, deque[str]] = defaultdict(deque)
+        used: set[str] = set()
+        normalized: list[dict[str, Any]] = []
+        for item in items:
+            kind = item.get("type")
+            call_id = item.get("call_id")
+            replacement = call_id
+            if kind == "function_call" and isinstance(call_id, str):
+                counts[call_id] += 1
+                suffix = counts[call_id]
+                candidate = call_id
+                while candidate in used:
+                    candidate = f"{call_id}__libertati_{suffix}"
+                    suffix += 1
+                used.add(candidate)
+                pending[call_id].append(candidate)
+                replacement = candidate
+            elif (
+                kind == "function_call_output"
+                and isinstance(call_id, str)
+                and pending[call_id]
+            ):
+                replacement = pending[call_id].popleft()
+            if replacement != call_id:
+                item = {**item, "call_id": replacement}
+            normalized.append(item)
+        return normalized
+
+    @staticmethod
     def _local_tools(tools: list[ToolParam]) -> list[ToolParam]:
         """Return only the function tools this process executes itself."""
         return [tool for tool in tools if tool["type"] == "function"]
@@ -95,7 +136,11 @@ class ModelLoop:
         :attr:`dream_id` instead.
         """
         input_context_id = await self._anchor_id()
-        request_context = self._context
+        # The window as the fallbacks see it, and the renamed view actually
+        # sent; keeping both apart is what lets the fallback compare like
+        # with like when it decides whether it has anything left to shed.
+        window = self._context
+        request_context = self._unique_call_ids(window)
 
         async def create(tools: list[ToolParam], context: list[dict[str, Any]]) -> Any:
             return await self.client.responses.create(
@@ -129,7 +174,7 @@ class ModelLoop:
                     or "Could not decrypt the provided encrypted_content" in error
                 ):
                     fallback_context = self._provider_fallback_context()
-                    if request_context == fallback_context:
+                    if window == fallback_context:
                         raise
                     log.warning(
                         "provider rejected historical context; "
@@ -138,7 +183,8 @@ class ModelLoop:
                     # Keep the compatible view for later model/tool rounds.
                     # Full append-only history remains untouched in SQLite.
                     self._context = fallback_context
-                    request_context = fallback_context
+                    window = fallback_context
+                    request_context = self._unique_call_ids(window)
                     continue
                 local_tools = self._local_tools(request_tools)
                 if (

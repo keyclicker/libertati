@@ -70,7 +70,17 @@ One package, `src/libertati/`, no sub-packages:
 - **Read cursors are the waking agent's.** `message_read_cursors` tracks
   what the *awake* agent has been shown; the dreaming toolbox is built
   with `track_reads=False` so browsing old chats in a dream doesn't zero
-  the unread counts it wakes up to.
+  the unread counts it wakes up to. A read writes the cursor of the
+  topic it was scoped to (`0` = whole chat), but every count measures
+  against the *newer* of that topic's cursor and the whole-chat one —
+  either alone leaves counts that can never reach zero.
+- **Provider fallbacks are layered.** `_unique_call_ids` renames
+  duplicate tool-call ids in the outgoing request view (some providers
+  reuse ids across the rounds of one turn, then reject their own
+  context); only if the provider still refuses does `_round` shed
+  history through `_provider_fallback_context`. Shedding cannot fix a
+  collision inside the active turn, whose calls still need their
+  outputs, so the renaming must stay in front of it.
 
 ## Adding an agent tool
 
@@ -82,7 +92,10 @@ approval registry is enforced before the handler runs (a test asserts
 this for every schema parameter named like a chat id). Provider-side
 strict schemas are not a security boundary: `Toolbox.run` validates the
 same schemas locally before dispatch, so keep new schemas within its
-supported subset. Optional parameters are `["type", "null"]` and still
+supported subset — every property declares a `string`/`integer`/`null`
+type (a test enforces this), because a property the local validator
+can't check is refused rather than raised over, which would make the
+tool unusable. Optional parameters are `["type", "null"]` and still
 listed in `required`. Handlers return plain strings (JSON for lists)
 and never raise — `Toolbox.run` converts exceptions to `error: …`
 strings. Decide whether the dreaming loop may use it: dream tools come
@@ -101,7 +114,9 @@ from `DREAM_API_TOOLS`, and execution is gated by `DREAM_TOOL_NAMES`.
   in `prompts.py` (all keys required) and to the tests.
 - Schema changes: `SCHEMA` uses `CREATE TABLE IF NOT EXISTS`, which
   never alters existing tables — add columns for existing DBs via
-  `Database._ensure_column` in `connect()`.
+  `Database._ensure_column` in `connect()`. An index over such a column
+  has to be created after that call, not in `SCHEMA`: on an older
+  database the column isn't there yet when `SCHEMA` runs.
 - Tests are plain functions with plain asserts; async tests need no
   decorator (asyncio_mode = auto). Real SQLite via the `db` fixture in
   `conftest.py`; minimal hand-rolled fakes (`SimpleNamespace`, small
@@ -122,6 +137,12 @@ from `DREAM_API_TOOLS`, and execution is gated by `DREAM_TOOL_NAMES`.
   search uses the custom `casefold` SQL function registered in
   `Database.connect`.
 - Same-second message bursts are real: any query ordering by `date`
-  needs `message_id` as a tiebreaker.
+  needs `message_id` as a tiebreaker — and a query that compares
+  `(date, message_id)` pairs row by row degrades badly on such a burst;
+  rank once with a window function instead.
+- Per-chat/topic scans (topic names, per-topic history, the heartbeat's
+  `unanswered_chats`) rely on `idx_messages_chat_topic`; the heartbeat
+  reads the whole `messages` table every few minutes on one shared
+  connection, so everything else queues behind it.
 - The three background loops in `bot.py` must survive transient
   errors — log and continue, never let the loop die.

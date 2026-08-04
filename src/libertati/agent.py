@@ -335,10 +335,14 @@ class Agent(ModelLoop):
         """Drop everything up to the last reasoning item lacking content.
 
         Reasoning items persisted before ``store=False`` carry no
-        encrypted content, and the API rejects both such an item and any
-        function call whose paired reasoning item is missing — so the
-        window is cut just after the last one instead of filtering it
-        out in place.
+        encrypted content, so the API rejects them outright and the
+        window is cut just after the last one rather than filtering it
+        out in place. The cut is deliberately blunt: what goes with it
+        is the oldest end of a restored window, the cheapest thing to
+        lose. Note the asymmetry with :meth:`_finish_turn` — a reasoning
+        item needs the item it reasoned about, but a settled function
+        call does not need its reasoning, which is why pruning one
+        without the other is safe there and not here.
         """
         last = next(
             (

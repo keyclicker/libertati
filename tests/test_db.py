@@ -79,16 +79,34 @@ async def test_recent_messages_pagination(db: Database) -> None:
 
 
 async def test_unread_count_tracks_whole_chat_and_topic_reads(db: Database) -> None:
-    """Read cursors persist independently for a whole chat and each topic."""
+    """A topic read counts for the chat it is part of, and vice versa."""
     await db.save_message(make_topic_message(12, None))
     await db.save_message(make_topic_message(13, "one", date=STAMP + 1))
     await db.save_message(make_topic_message(14, "two", date=STAMP + 2))
     assert await db.unread_messages_count(-1001, 12) == 3
     await db.mark_messages_read(-1001, 14, 12)
     assert await db.unread_messages_count(-1001, 12) == 0
-    assert await db.unread_messages_count(-1001) == 3
+    # Reading the topic covered every message the chat had.
+    assert await db.unread_messages_count(-1001) == 0
     await db.save_message(make_topic_message(15, "three", date=STAMP + 3))
     assert await db.unread_messages_count(-1001, 12) == 1
+
+
+async def test_whole_chat_read_clears_its_topics(db: Database) -> None:
+    """A chat read without a topic filter shows — and covers — every topic."""
+    await db.save_message(make_topic_message(1, "in twelve", thread_id=12))
+    await db.save_message(
+        make_topic_message(2, "in twenty", thread_id=20, date=STAMP + 1)
+    )
+    assert await db.unread_messages_count(-1001, 12) == 1
+    await db.mark_messages_read(-1001, 2, None)
+    assert await db.unread_messages_count(-1001) == 0
+    assert await db.unread_messages_count(-1001, 12) == 0
+    assert await db.unread_messages_count(-1001, 20) == 0
+    # A later topic message is unread again, against the whole-chat cursor.
+    await db.save_message(make_topic_message(3, "newer", thread_id=12, date=STAMP + 2))
+    assert await db.unread_messages_count(-1001, 12) == 1
+    assert await db.unread_messages_count(-1001) == 1
 
 
 async def test_unread_count_ignores_own_messages(db: Database) -> None:
@@ -304,6 +322,23 @@ async def test_topic_observed(db: Database) -> None:
     assert await db.topic_observed(-1001, 12) is True
     assert await db.topic_observed(-1001, 13) is False
     assert await db.topic_observed(100, 12) is False
+
+
+async def test_topic_names_matches_the_single_topic_lookup(db: Database) -> None:
+    """The batch lookup list_topics uses answers exactly like topic_name."""
+    await db.save_message(make_topic_message(1, "hello", thread_id=12))
+    await db.save_message(make_topic_message(2, "hi", thread_id=20, date=STAMP + 1))
+    await db.save_message(
+        make_topic_service(
+            3, 20, date=STAMP + 2, forum_topic_edited={"name": "Renamed"}
+        )
+    )
+    names = await db.topic_names(-1001)
+    assert names == {
+        12: await db.topic_name(-1001, 12),
+        20: await db.topic_name(-1001, 20),
+    }
+    assert names[20] == "Renamed"
 
 
 async def test_list_topics(db: Database) -> None:
@@ -666,10 +701,17 @@ async def test_messages_schema_migrates_and_backfills(tmp_path: Path) -> None:
         "SELECT message_id, message_thread_id, reply_to_message_id FROM messages"
     ) as cursor:
         rows = {r[0]: (r[1], r[2]) for r in await cursor.fetchall()}
+    # The topic index has to be created after the column it covers, or
+    # connecting to a database this old fails outright.
+    async with database.conn.execute(
+        "SELECT name FROM sqlite_master WHERE type = 'index'"
+    ) as cursor:
+        indexes = {row[0] for row in await cursor.fetchall()}
     await database.close()
 
     assert rows[43] == (12, None)
     assert rows[44] == (None, 43)
+    assert "idx_messages_chat_topic" in indexes
 
 
 async def test_dream_ledger_round_trip(db: Database) -> None:

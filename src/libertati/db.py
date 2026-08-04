@@ -59,6 +59,11 @@ CREATE INDEX IF NOT EXISTS idx_messages_chat_date
     ON messages (chat_id, date);
 CREATE INDEX IF NOT EXISTS idx_messages_from_user
     ON messages (from_user_id);
+-- Topic-scoped reads (per-topic history, topic names, the heartbeat's
+-- per-topic unanswered scan) all filter on chat plus topic; without this
+-- every one of them degrades into a scan of the whole chat. Created in
+-- connect() rather than here: on databases predating the column, the
+-- index has to wait for _ensure_column to add it.
 
 -- Last message exposed through get_recent_messages, per chat/topic.  Zero
 -- represents a whole-chat cursor; Telegram topic ids are positive.
@@ -228,6 +233,11 @@ class Database:
               AND json_extract(raw, '$.reply_to_message.forum_topic_created')
                   IS NOT NULL
             """
+        )
+        # Only now that the column is guaranteed to exist (see SCHEMA).
+        await self._conn.execute(
+            "CREATE INDEX IF NOT EXISTS idx_messages_chat_topic"
+            " ON messages (chat_id, message_thread_id, date)"
         )
         await self._conn.commit()
 
@@ -529,29 +539,31 @@ class Database:
         messages never count as the awaiting message, so a freshly
         created topic doesn't nag forever.
         """
+        # Ranking each chat/topic in one pass rather than asking "is there
+        # a newer message?" per row: this runs on every heartbeat, and the
+        # per-row form re-reads the table once per stored message.
         query = """
-            SELECT c.id AS chat_id, c.type, c.title, m.message_thread_id,
-                   u.first_name, u.username, m.date
-            FROM messages m
-            JOIN chats c ON c.id = m.chat_id
-            LEFT JOIN users u ON u.id = m.from_user_id
-            WHERE m.outgoing = 0
-              AND m.content_type NOT IN ('forum_topic_created',
-                                         'forum_topic_edited',
-                                         'forum_topic_closed',
-                                         'forum_topic_reopened')
-              AND NOT EXISTS (
-                  SELECT 1 FROM messages n
-                  WHERE n.chat_id = m.chat_id
-                    AND COALESCE(n.message_thread_id, 0)
-                        = COALESCE(m.message_thread_id, 0)
-                    AND n.content_type NOT IN ('forum_topic_created',
-                                               'forum_topic_edited',
-                                               'forum_topic_closed',
-                                               'forum_topic_reopened')
-                    AND (n.date, n.message_id) > (m.date, m.message_id)
-              )
-            ORDER BY m.date
+            WITH latest AS (
+                SELECT m.chat_id, m.message_thread_id, m.outgoing, m.date,
+                       m.from_user_id,
+                       ROW_NUMBER() OVER (
+                           PARTITION BY m.chat_id,
+                                        COALESCE(m.message_thread_id, 0)
+                           ORDER BY m.date DESC, m.message_id DESC
+                       ) AS position
+                FROM messages m
+                WHERE m.content_type NOT IN ('forum_topic_created',
+                                             'forum_topic_edited',
+                                             'forum_topic_closed',
+                                             'forum_topic_reopened')
+            )
+            SELECT c.id AS chat_id, c.type, c.title, l.message_thread_id,
+                   u.first_name, u.username, l.date
+            FROM latest l
+            JOIN chats c ON c.id = l.chat_id
+            LEFT JOIN users u ON u.id = l.from_user_id
+            WHERE l.position = 1 AND l.outgoing = 0
+            ORDER BY l.date
         """
         async with self.conn.execute(query) as cursor:
             return [dict(row) for row in await cursor.fetchall()]
@@ -607,20 +619,31 @@ class Database:
         Only incoming messages count: the agent's own replies are newer
         than its last read by construction, and counting them would
         report "unread" for a conversation it just finished writing.
+
+        Every message is measured against the newer of two cursors: the
+        one for its own topic and the whole-chat one. Reading a chat
+        without a topic filter shows messages from every topic, and
+        reading one topic covers part of the chat — either cursor alone
+        would leave counts that can never reach zero.
         """
-        thread_key = message_thread_id or 0
         query = """
             SELECT COUNT(*)
             FROM messages m
+            LEFT JOIN message_read_cursors c
+              ON c.chat_id = m.chat_id
+             AND c.message_thread_id = COALESCE(m.message_thread_id, 0)
             WHERE m.chat_id = ?
               AND m.outgoing = 0
               AND (? IS NULL OR m.message_thread_id = ?)
-              AND m.message_id > COALESCE((
-                  SELECT message_id FROM message_read_cursors
-                  WHERE chat_id = ? AND message_thread_id = ?
-              ), 0)
+              AND m.message_id > MAX(
+                  COALESCE(c.message_id, 0),
+                  COALESCE((
+                      SELECT message_id FROM message_read_cursors
+                      WHERE chat_id = ? AND message_thread_id = 0
+                  ), 0)
+              )
         """
-        params = (chat_id, message_thread_id, message_thread_id, chat_id, thread_key)
+        params = (chat_id, message_thread_id, message_thread_id, chat_id)
         async with self.conn.execute(query, params) as cursor:
             row = await cursor.fetchone()
         return int(row[0]) if row else 0
@@ -711,37 +734,63 @@ class Database:
             rows = list(await cursor.fetchall())
         return [dict(row) for row in reversed(rows)]
 
-    async def topic_name(self, chat_id: int, thread_id: int) -> str | None:
-        """Return the latest known name of a forum topic, or ``None``.
+    #: Every name a chat's stored payloads can offer for a forum topic.
+    #: Three sources: rename service messages, the creation service
+    #: message (if the bot saw it), and the pseudo-reply payload every
+    #: non-reply topic message carries (which covers topics created
+    #: before the bot joined). ``renamed`` lets a rename outrank the
+    #: creation-time name pseudo-replies keep echoing forever; icon-only
+    #: edits carry no name and drop out as NULL.
+    _TOPIC_NAME_SOURCE = """
+        SELECT message_thread_id AS topic_id,
+               COALESCE(
+                   json_extract(raw, '$.forum_topic_edited.name'),
+                   json_extract(raw, '$.forum_topic_created.name'),
+                   json_extract(
+                       raw, '$.reply_to_message.forum_topic_created.name'
+                   )
+               ) AS name,
+               (content_type = 'forum_topic_edited') AS renamed,
+               date, message_id
+        FROM messages
+        WHERE chat_id = :chat_id
+    """
 
-        Three sources, all mined from stored raw payloads: the creation
-        service message (if the bot saw it), rename service messages, and
-        the pseudo-reply payload every non-reply topic message carries
-        (covers topics created before the bot joined). Renames win over
-        the creation-time name that pseudo-replies keep echoing forever;
-        icon-only edits carry no name and are skipped.
-        """
-        query = """
-            SELECT name FROM (
-                SELECT COALESCE(
-                           json_extract(raw, '$.forum_topic_edited.name'),
-                           json_extract(raw, '$.forum_topic_created.name'),
-                           json_extract(
-                               raw, '$.reply_to_message.forum_topic_created.name'
-                           )
-                       ) AS name,
-                       (content_type = 'forum_topic_edited') AS renamed,
-                       date, message_id
-                FROM messages
-                WHERE chat_id = ? AND message_thread_id = ?
-            )
-            WHERE name IS NOT NULL
-            ORDER BY renamed DESC, date DESC, message_id DESC
-            LIMIT 1
-        """
-        async with self.conn.execute(query, (chat_id, thread_id)) as cursor:
+    async def topic_name(self, chat_id: int, thread_id: int) -> str | None:
+        """Return the latest known name of one forum topic, or ``None``."""
+        query = (
+            f"SELECT name FROM ({self._TOPIC_NAME_SOURCE}"
+            "   AND message_thread_id = :thread_id)"
+            " WHERE name IS NOT NULL"
+            " ORDER BY renamed DESC, date DESC, message_id DESC"
+            " LIMIT 1"
+        )
+        params = {"chat_id": chat_id, "thread_id": thread_id}
+        async with self.conn.execute(query, params) as cursor:
             row = await cursor.fetchone()
         return row["name"] if row else None
+
+    async def topic_names(self, chat_id: int) -> dict[int, str]:
+        """Return the latest known name of every forum topic in a chat.
+
+        One query for the whole chat: resolving names topic by topic
+        re-reads the same rows once per topic, which a busy forum feels.
+        """
+        query = f"""
+            SELECT topic_id, name FROM (
+                SELECT topic_id, name,
+                       ROW_NUMBER() OVER (
+                           PARTITION BY topic_id
+                           ORDER BY renamed DESC, date DESC, message_id DESC
+                       ) AS position
+                FROM ({self._TOPIC_NAME_SOURCE}
+                    AND message_thread_id IS NOT NULL)
+                WHERE name IS NOT NULL
+            )
+            WHERE position = 1
+        """
+        async with self.conn.execute(query, {"chat_id": chat_id}) as cursor:
+            return {row["topic_id"]: row["name"] for row in await cursor.fetchall()}
 
     async def topic_observed(self, chat_id: int, thread_id: int) -> bool:
         """True when any stored message of the chat belongs to the topic."""
@@ -778,10 +827,9 @@ class Database:
         """
         async with self.conn.execute(query, (chat_id,)) as cursor:
             rows = [dict(row) for row in await cursor.fetchall()]
-        # Topic counts are tiny; a name lookup per row keeps the tricky
-        # name-resolution logic in one place.
+        names = await self.topic_names(chat_id)
         for row in rows:
-            row["name"] = await self.topic_name(chat_id, row["topic_id"])
+            row["name"] = names.get(row["topic_id"])
             row["closed"] = bool(row["closed"])
         return rows
 

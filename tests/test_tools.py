@@ -21,6 +21,7 @@ from libertati.tools import (
     GATED_CHAT_ARGS,
     MESSAGING_TOOLS,
     SLEEP_TOOLS,
+    TOOL_PARAMETER_SCHEMAS,
     TOOLS,
     TYPING_MAX_SECONDS,
     TYPING_MIN_SECONDS,
@@ -30,6 +31,7 @@ from libertati.tools import (
     function_names,
     strip_citation_artifacts,
     typing_delay,
+    valid_tool_arguments,
 )
 
 UTC_TZ = ZoneInfo("UTC")
@@ -1142,6 +1144,37 @@ def test_every_chat_targeting_tool_is_gated() -> None:
         )
         gated = GATED_CHAT_ARGS.get(schema["name"], ())
         assert set(gated) == set(expected), schema["name"]
+
+
+def test_every_schema_stays_within_the_validated_subset() -> None:
+    """Local validation only understands typed, primitive properties.
+
+    ``valid_tool_arguments`` refuses anything it cannot check rather than
+    raising out of ``Toolbox.run``, so an untyped property would make its
+    tool permanently unusable. Catch that here instead of in production.
+    """
+    supported = {"string", "integer", "null"}
+    for name, schema in TOOL_PARAMETER_SCHEMAS.items():
+        for key, parameter in schema["properties"].items():
+            declared = parameter.get("type")
+            types = [declared] if isinstance(declared, str) else declared
+            assert types, f"{name}.{key} declares no type"
+            assert set(types) <= supported, f"{name}.{key}: {declared}"
+
+
+def test_untyped_schema_property_is_refused_not_raised() -> None:
+    """An out-of-subset schema fails the call; it never escapes run()."""
+    schema = {
+        "type": "object",
+        "properties": {"file": {"enum": ["soul"]}},
+        "required": ["file"],
+        "additionalProperties": False,
+    }
+    TOOL_PARAMETER_SCHEMAS["_probe"] = schema
+    try:
+        assert valid_tool_arguments("_probe", {"file": "soul"}) is False
+    finally:
+        del TOOL_PARAMETER_SCHEMAS["_probe"]
 
 
 async def test_remember_appends_and_confirms(tmp_path: Path) -> None:
