@@ -129,21 +129,44 @@ class ModelLoop:
                 reasoning=self.reasoning,
             )
 
-        try:
-            response = await create(self._api_tools, request_context)
-        except BadRequestError as exc:
-            if "Duplicate tool call id in assistant message" in str(exc):
+        request_tools = self._api_tools
+        for _ in range(3):
+            try:
+                response = await create(request_tools, request_context)
+                break
+            except BadRequestError as exc:
+                error = str(exc)
                 event_context = [
                     item
                     for item in self._context
                     if item.get("role") == "user" and "type" not in item
                 ]
-                log.warning(
-                    "provider rejected historical tool ids; retrying with events only"
-                )
-                response = await create(self._api_tools, event_context)
-            else:
-                response = await self._retry_without_server_tools(exc, create)
+                if (
+                    "Duplicate tool call id in assistant message" in error
+                    and request_context != event_context
+                ):
+                    log.warning(
+                        "provider rejected historical tool ids; "
+                        "retrying with events only"
+                    )
+                    request_context = event_context
+                    continue
+                local_tools = [
+                    tool for tool in request_tools if tool["type"] == "function"
+                ]
+                if (
+                    "Server tool request failed" in error
+                    and local_tools != request_tools
+                ):
+                    log.warning(
+                        "server tool failed; disabling built-in tools and retrying"
+                    )
+                    self._api_tools = local_tools
+                    request_tools = local_tools
+                    continue
+                raise
+        else:  # pragma: no cover - each fallback can apply only once
+            raise RuntimeError("provider compatibility retries exhausted")
         self._last_output_text = response.output_text or ""
         await self._record_usage(response, turn_id, input_context_id)
         for item in response.output:
@@ -166,19 +189,6 @@ class ModelLoop:
                 }
             )
         return True
-
-    async def _retry_without_server_tools(
-        self, exc: BadRequestError, create: Any
-    ) -> Any:
-        """Retry a failed built-in server tool with local functions only."""
-        local_tools = [tool for tool in self._api_tools if tool["type"] == "function"]
-        if "Server tool request failed" not in str(exc) or len(local_tools) == len(
-            self._api_tools
-        ):
-            raise exc
-        log.warning("server tool failed; disabling built-in tools and retrying")
-        self._api_tools = local_tools
-        return await create(local_tools, self._unique_call_ids(self._context))
 
     async def _record_usage(
         self,

@@ -440,6 +440,57 @@ async def test_turn_retries_duplicate_tool_ids_with_events_only() -> None:
     assert calls[1]["input"] == [EVENT, EVENT]
 
 
+async def test_turn_chains_server_tool_and_duplicate_id_fallbacks() -> None:
+    """Sequential compatibility failures both transform the next retry."""
+    request = httpx.Request("POST", "https://openrouter.ai/api/v1/responses")
+    server_failure = BadRequestError(
+        "Server tool request failed",
+        response=httpx.Response(400, request=request),
+        body={"error": {"message": "Server tool request failed"}},
+    )
+    duplicate_failure = BadRequestError(
+        "Duplicate tool call id in assistant message",
+        response=httpx.Response(400, request=request),
+        body={"error": {"message": "Duplicate tool call id in assistant message"}},
+    )
+    response = SimpleNamespace(
+        id="resp_1", model="mistral-test", output=[], output_text="", usage=None
+    )
+    responses = iter([server_failure, duplicate_failure, response])
+    calls: list[dict[str, Any]] = []
+
+    async def create(**kwargs: Any) -> Any:
+        calls.append(kwargs)
+        result = next(responses)
+        if isinstance(result, Exception):
+            raise result
+        return result
+
+    db = FakeContextDB()
+    agent = Agent.__new__(Agent)
+    agent.client = cast(Any, SimpleNamespace(responses=SimpleNamespace(create=create)))
+    agent.model = "mistral-test"
+    agent.mind = cast(Any, SimpleNamespace(soul=lambda: "soul"))
+    agent.base_prompt = "base"
+    agent.max_rounds = 1
+    agent.max_context_items = MAX_CONTEXT_ITEMS
+    agent.trim_context_items = TRIM_CONTEXT_ITEMS
+    agent._context = [EVENT, CALL, CALL_OUTPUT, MESSAGE, EVENT]
+    function_tool = cast(Any, {"type": "function", "name": "send_message"})
+    agent._api_tools = [function_tool, cast(Any, {"type": "web_search"})]
+    agent.reasoning = {}
+    agent.prune_completed_reasoning = False
+    agent.db = cast(Database, db)
+
+    await agent._turn()
+
+    assert len(calls) == 3
+    assert calls[1]["tools"] == [function_tool]
+    assert calls[1]["input"] != [EVENT, EVENT]
+    assert calls[2]["tools"] == [function_tool]
+    assert calls[2]["input"] == [EVENT, EVENT]
+
+
 async def test_record_usage_maps_all_authoritative_counts() -> None:
     """Response usage fields map into persistent records unchanged."""
     db = FakeContextDB()
