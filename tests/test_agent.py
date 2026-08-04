@@ -105,6 +105,23 @@ def test_drop_legacy_reasoning_keeps_encrypted_items() -> None:
     assert Agent._drop_legacy_reasoning(items) == items
 
 
+def test_duplicate_call_ids_are_renamed_with_matching_outputs() -> None:
+    """Repeated provider ids become unique without changing persisted items."""
+    first_call = {**CALL, "name": "recall"}
+    first_output = {**CALL_OUTPUT, "output": "first"}
+    second_call = {**CALL, "name": "send_message"}
+    second_output = {**CALL_OUTPUT, "output": "second"}
+    items = [EVENT, first_call, first_output, EVENT, second_call, second_output]
+
+    normalized = Agent._unique_call_ids(items)
+
+    assert normalized[:4] == items[:4]
+    assert normalized[4]["call_id"] == "call_1__libertati_2"
+    assert normalized[5]["call_id"] == "call_1__libertati_2"
+    assert second_call["call_id"] == "call_1"
+    assert second_output["call_id"] == "call_1"
+
+
 def test_finish_turn_prunes_only_new_ephemeral_outputs() -> None:
     """Settling removes new reasoning/messages but keeps durable items."""
     old_message = dict(MESSAGE)
