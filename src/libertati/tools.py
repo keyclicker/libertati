@@ -424,19 +424,19 @@ HISTORY_TOOLS: list[ToolParam] = [
     },
     {
         "type": "function",
-        "name": "list_chat_members",
+        "name": "list_chat_speakers",
         "description": (
-            "List who you've seen talking in a chat (from stored "
-            "history), with message counts and last activity. Telegram "
-            "hides a group's full roster from bots, so silent members "
-            "don't appear."
+            "List people observed speaking in stored chat history, with "
+            "message counts and last activity. This is not the chat's "
+            "member roster: silent members never appear. Use get_chat_info "
+            "for the live member count and administrator list."
         ),
         "parameters": {
             "type": "object",
             "properties": {
                 "chat_id": {
                     "type": "integer",
-                    "description": "Chat id to list members of.",
+                    "description": "Chat id whose observed speakers to list.",
                 },
             },
             "required": ["chat_id"],
@@ -892,7 +892,7 @@ GATED_CHAT_ARGS: dict[str, tuple[str, ...]] = {
     "edit_message": ("chat_id",),
     "delete_message": ("chat_id",),
     "get_chat_info": ("chat_id",),
-    "list_chat_members": ("chat_id",),
+    "list_chat_speakers": ("chat_id",),
     "list_topics": ("chat_id",),
     "get_recent_messages": ("chat_id",),
     "get_unread_messages_count": ("chat_id",),
@@ -1031,7 +1031,7 @@ class Toolbox:
             # chats & history
             "list_chats": self._list_chats,
             "get_chat_info": self._get_chat_info,
-            "list_chat_members": self._list_chat_members,
+            "list_chat_speakers": self._list_chat_speakers,
             "list_topics": self._list_topics,
             "get_recent_messages": self._get_recent_messages,
             "get_unread_messages_count": self._get_unread_messages_count,
@@ -1367,11 +1367,11 @@ class Toolbox:
             ensure_ascii=False,
         )
 
-    async def _list_chat_members(self, args: dict[str, Any]) -> str:
+    async def _list_chat_speakers(self, args: dict[str, Any]) -> str:
         """Return users seen talking in a chat as JSON."""
         rows = await self.db.chat_members(args["chat_id"])
         if not rows:
-            return "nobody seen talking in this chat yet"
+            return "no speakers observed in stored chat history yet"
         return json.dumps(rows, ensure_ascii=False)
 
     async def _list_topics(self, args: dict[str, Any]) -> str:
@@ -1492,6 +1492,12 @@ class Toolbox:
             return (
                 "error: no sleep left — you have already dreamt "
                 f"{self.dream_gate.daily_budget} times in the last 24h"
+            )
+        cooldown = await self.dream_gate.cooldown_left()
+        if cooldown > 0:
+            return (
+                "error: sleep is unavailable while dream cooldown is active "
+                f"({cooldown} min left)"
             )
         self.dream_gate.request(args["note"])
         return f"falling asleep shortly ({left} dreams left for the next 24h)"

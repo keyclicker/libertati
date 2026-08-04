@@ -15,6 +15,7 @@ accounting and the ``[dream ended …]`` event handed back to the agent.
 """
 
 import logging
+import math
 from datetime import UTC, datetime, timedelta
 from typing import TYPE_CHECKING, Any
 
@@ -47,10 +48,13 @@ class DreamGate:
     lets the toolbox ask about dreaming without knowing the loop.
     """
 
-    def __init__(self, db: Database, daily_budget: int) -> None:
+    def __init__(
+        self, db: Database, daily_budget: int, cooldown_minutes: int = 0
+    ) -> None:
         """Keep the ledger handle and the rolling 24h budget."""
         self.db = db
         self.daily_budget = daily_budget
+        self.cooldown_minutes = cooldown_minutes
         self.note: str | None = None
 
     @property
@@ -71,6 +75,15 @@ class DreamGate:
         """Return how many dreams are still allowed in the next 24h."""
         since = clock.utc_stamp(datetime.now(UTC) - timedelta(hours=24))
         return max(0, self.daily_budget - await self.db.dreams_since(since))
+
+    async def cooldown_left(self) -> int:
+        """Return whole minutes until another dream may start."""
+        last = await self.db.last_dream_end()
+        if last is None:
+            return 0
+        elapsed = datetime.now(UTC) - clock.parse_utc_stamp(last)
+        remaining = timedelta(minutes=self.cooldown_minutes) - elapsed
+        return max(0, math.ceil(remaining.total_seconds() / 60))
 
 
 class Dreamer(ModelLoop):
@@ -119,7 +132,6 @@ class Dreamer(ModelLoop):
         self.prompt = agent.prompts.dream
         self.nudge = agent.prompts.dream_nudge
         self.idle_minutes = settings.dream_idle_minutes
-        self.cooldown_minutes = settings.dream_cooldown_minutes
         self.max_rounds = settings.dream_max_rounds
 
     async def _remember(self, item: dict[str, Any]) -> None:
@@ -150,7 +162,7 @@ class Dreamer(ModelLoop):
         requested = self.gate.requested
         if not requested and self._idle_minutes() < self.idle_minutes:
             return
-        if not await self._cooled_down():
+        if await self.gate.cooldown_left() > 0:
             return
         if await self.gate.budget_left() <= 0:
             if requested:
@@ -235,11 +247,3 @@ class Dreamer(ModelLoop):
     def _idle_minutes(self) -> float:
         """Minutes since the waking agent last finished a turn."""
         return (datetime.now(UTC) - self.agent.last_active).total_seconds() / 60
-
-    async def _cooled_down(self) -> bool:
-        """Whether enough time has passed since the last dream ended."""
-        last = await self.db.last_dream_end()
-        if last is None:
-            return True
-        since = datetime.now(UTC) - clock.parse_utc_stamp(last)
-        return since >= timedelta(minutes=self.cooldown_minutes)
