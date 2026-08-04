@@ -12,7 +12,7 @@ lives here.
 import logging
 from typing import TYPE_CHECKING, Any, cast
 
-from openai import AsyncOpenAI, Omit
+from openai import AsyncOpenAI, BadRequestError, Omit
 from openai.types.responses import ResponseInputParam, ToolParam
 from openai.types.shared_params import Reasoning
 
@@ -77,17 +77,33 @@ class ModelLoop:
         :attr:`dream_id` instead.
         """
         input_context_id = await self._anchor_id()
-        response = await self.client.responses.create(
-            model=self.model,
-            instructions=instructions,
-            input=cast(ResponseInputParam, self._context),
-            tools=self._api_tools,
-            # Nothing is stored server-side; encrypted reasoning must
-            # ride along in the context for multi-round tool turns.
-            store=False,
-            include=["reasoning.encrypted_content"],
-            reasoning=self.reasoning,
-        )
+
+        async def create(tools: list[ToolParam]) -> Any:
+            return await self.client.responses.create(
+                model=self.model,
+                instructions=instructions,
+                input=cast(ResponseInputParam, self._context),
+                tools=tools,
+                # Nothing is stored server-side; encrypted reasoning must
+                # ride along in the context for multi-round tool turns.
+                store=False,
+                include=["reasoning.encrypted_content"],
+                reasoning=self.reasoning,
+            )
+
+        try:
+            response = await create(self._api_tools)
+        except BadRequestError as exc:
+            local_tools = [
+                tool for tool in self._api_tools if tool["type"] == "function"
+            ]
+            if "Server tool request failed" not in str(exc) or len(local_tools) == len(
+                self._api_tools
+            ):
+                raise
+            log.warning("server tool failed; disabling built-in tools and retrying")
+            self._api_tools = local_tools
+            response = await create(local_tools)
         self._last_output_text = response.output_text or ""
         await self._record_usage(response, turn_id, input_context_id)
         for item in response.output:
