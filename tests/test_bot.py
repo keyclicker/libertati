@@ -185,10 +185,12 @@ class FakeAgent:
     def __init__(self) -> None:
         """Start with an empty event list."""
         self.events: list[str] = []
+        self.activity: list[bool] = []
 
     async def push(self, event: str, *, activity: bool = True) -> None:
-        """Store the event."""
+        """Store the event and whether it counted as activity."""
         self.events.append(event)
+        self.activity.append(activity)
 
 
 def make_group_message(**overrides: Any) -> Message:
@@ -358,6 +360,10 @@ async def test_deliver_wakeups_pushes_due_and_completes(db: Database) -> None:
     await deliver_wakeups(cast(Any, agent), db, UTC_TZ)
     assert len(agent.events) == 1
     assert "ping alice" in agent.events[0]
+    # Self-scheduled alarms must not reset the dream idle clock, or an
+    # agent that keeps scheduling follow-ups never becomes idle enough
+    # to dream.
+    assert agent.activity == [False]
     assert await db.pending_wakeups() == []
 
 

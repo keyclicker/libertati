@@ -241,13 +241,20 @@ async def deliver_wakeups(agent: Agent, db: Database, tz: ZoneInfo) -> None:
 
     A wakeup is marked done only after it was pushed, so a crash in
     between redelivers it (at-least-once) rather than dropping it.
+
+    Like heartbeats, wakeups are pushed as non-activity events: they are
+    the agent's own alarms, so counting them as activity would let it
+    keep itself awake indefinitely by scheduling follow-ups, and the
+    idle dream trigger would never be reached. A wakeup turn that acts
+    outward still moves the idle clock.
     """
     now = clock.utc_stamp(datetime.now(UTC))
     for wakeup in await db.due_wakeups(now):
         due_local = clock.format_local(clock.parse_utc_stamp(wakeup["due_at"]), tz)
         await agent.push(
             f"[wakeup #{wakeup['id']} at {clock.format_now(tz)} — you "
-            f"scheduled it for {due_local}] {wakeup['note']}"
+            f"scheduled it for {due_local}] {wakeup['note']}",
+            activity=False,
         )
         await db.complete_wakeup(wakeup["id"])
 

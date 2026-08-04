@@ -36,6 +36,11 @@ class ModelLoop:
     #: rows can say which dream they belong to.
     dream_id: int | None = None
 
+    #: Set once a built-in (server-side) tool has failed, so the rest of
+    #: the turn stops paying a rejected request per round. Cleared when
+    #: the next turn/dream starts, since the failure may be transient.
+    server_tools_failed: bool = False
+
     def __init__(
         self,
         *,
@@ -76,6 +81,11 @@ class ModelLoop:
         """
         return self._context
 
+    @staticmethod
+    def _local_tools(tools: list[ToolParam]) -> list[ToolParam]:
+        """Return only the function tools this process executes itself."""
+        return [tool for tool in tools if tool["type"] == "function"]
+
     async def _round(self, instructions: str, turn_id: int | None) -> bool:
         """Call the model once and run whatever tools it asked for.
 
@@ -101,11 +111,18 @@ class ModelLoop:
             )
 
         request_tools = self._api_tools
-        for _ in range(3):
+        if self.server_tools_failed:
+            request_tools = self._local_tools(request_tools)
+        # One attempt per fallback that can still apply — shedding
+        # assistant turns, shedding tool envelopes, dropping built-in
+        # tools — plus the initial try.
+        last_error: BadRequestError | None = None
+        for _ in range(4):
             try:
                 response = await create(request_tools, request_context)
                 break
             except BadRequestError as exc:
+                last_error = exc
                 error = str(exc)
                 if (
                     "Duplicate tool call id in assistant message" in error
@@ -123,21 +140,24 @@ class ModelLoop:
                     self._context = fallback_context
                     request_context = fallback_context
                     continue
-                local_tools = [
-                    tool for tool in request_tools if tool["type"] == "function"
-                ]
+                local_tools = self._local_tools(request_tools)
                 if (
                     "Server tool request failed" in error
                     and local_tools != request_tools
                 ):
                     log.warning(
-                        "server tool failed; disabling built-in tools and retrying"
+                        "server tool failed; disabling built-in tools for this turn"
                     )
+                    # Remembered for the remaining rounds of this turn only:
+                    # retrying the built-in tool every round would pay a
+                    # rejected request each time, permanently disabling it
+                    # would lose web search after one transient failure.
+                    self.server_tools_failed = True
                     request_tools = local_tools
                     continue
                 raise
         else:  # pragma: no cover - each fallback can apply only once
-            raise RuntimeError("provider compatibility retries exhausted")
+            raise last_error or RuntimeError("provider compatibility retries exhausted")
         self._last_output_text = response.output_text or ""
         await self._record_usage(response, turn_id, input_context_id)
         for item in response.output:

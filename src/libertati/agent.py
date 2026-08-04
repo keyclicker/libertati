@@ -13,6 +13,7 @@ pruned tail window is kept in memory and sent to the API.
 
 import asyncio
 import logging
+from collections.abc import Callable
 from datetime import UTC, datetime
 from typing import Any, cast
 from zoneinfo import ZoneInfo
@@ -212,9 +213,15 @@ class Agent(ModelLoop):
             active_turn_start = getattr(self, "_active_turn_start", None)
             if active_turn_start is not None and active_turn_start < len(self._context):
                 active_head = self._context[active_turn_start]
-            self._context = self._trim_to_boundary(
-                self._context[-self.trim_context_items :]
-            )
+            tail = self._context[-self.trim_context_items :]
+            trimmed = self._trim_to_boundary(tail)
+            if not trimmed and active_head is not None:
+                # A single turn longer than the whole window: emptying it
+                # would send a context starting mid-turn (a tool output
+                # with no call), which the API rejects outright. Keep the
+                # turn instead and let it run over the soft limit.
+                trimmed = self._context[active_turn_start:]
+            self._context = trimmed
             if active_head is not None:
                 self._active_turn_start = next(
                     (
@@ -251,8 +258,26 @@ class Agent(ModelLoop):
             return {**item, "type": "message"}
         return item
 
+    @staticmethod
+    def _is_own_reply(item: dict[str, Any]) -> bool:
+        """Return whether an item is the agent's own settled output.
+
+        Such a message carries no tool-call id and no encrypted
+        reasoning, so it survives the provider incompatibilities the
+        fallback exists for — and it is the only record the model has of
+        what it already said.
+        """
+        return item.get("type") == "message" and item.get("role") == "assistant"
+
     def _provider_fallback_context(self) -> list[dict[str, Any]]:
-        """Keep external history plus every item in the active turn."""
+        """Shed one class of provider-specific envelopes from the window.
+
+        Called after the provider rejected the history it was sent. The
+        first step drops reasoning and tool envelopes but keeps the
+        agent's own replies; only when that is rejected too are they
+        dropped, leaving the bare event timeline. The active turn is
+        never touched: its function calls still need their outputs.
+        """
         start = getattr(self, "_active_turn_start", None)
         if start is None:
             start = next(
@@ -263,9 +288,15 @@ class Agent(ModelLoop):
                 ),
                 len(self._context),
             )
-        history = [
-            item for item in self._context[:start] if self._is_external_event(item)
-        ]
+        head = self._context[:start]
+
+        def with_replies(item: dict[str, Any]) -> bool:
+            return self._is_external_event(item) or self._is_own_reply(item)
+
+        keep: Callable[[dict[str, Any]], bool] = with_replies
+        if all(keep(item) for item in head):
+            keep = self._is_external_event
+        history = [item for item in head if keep(item)]
         if getattr(self, "_active_turn_start", None) is not None:
             self._active_turn_start = len(history)
         return [*history, *self._context[start:]]
@@ -358,6 +389,8 @@ class Agent(ModelLoop):
         turn so personality edits apply live.
         """
         instructions = f"{self.base_prompt}\n\n## Soul\n{self.mind.soul()}"
+        # A built-in tool that failed last turn may work again this one.
+        self.server_tools_failed = False
         turn_id = await self.db.start_agent_turn(await self.db.latest_context_id())
         turn_status = "failed"
         corrected_private_output = False

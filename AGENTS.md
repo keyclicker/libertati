@@ -64,8 +64,13 @@ One package, `src/libertati/`, no sub-packages:
   `datetime('now')`), the configured timezone for anything the model
   sees (`clock.format_local`).
 - **Idle clock**: `Agent.last_active` moves only on activity events or
-  outward tool calls — heartbeat-only turns must not reset it, or idle
-  dreams become unreachable.
+  outward tool calls. Self-generated events — heartbeats and the agent's
+  own due wakeups — are pushed with `activity=False`, or an agent that
+  keeps scheduling follow-ups never becomes idle enough to dream.
+- **Read cursors are the waking agent's.** `message_read_cursors` tracks
+  what the *awake* agent has been shown; the dreaming toolbox is built
+  with `track_reads=False` so browsing old chats in a dream doesn't zero
+  the unread counts it wakes up to.
 
 ## Adding an agent tool
 

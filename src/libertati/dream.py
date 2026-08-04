@@ -121,6 +121,7 @@ class Dreamer(ModelLoop):
                 recall_effort=settings.recall_reasoning_effort,
                 allowed=DREAM_TOOL_NAMES,
                 dream_min_steps=settings.dream_min_steps,
+                track_reads=False,
             ),
             api_tools=build_dream_tools(settings.web_search),
             reasoning=agent.reasoning,
@@ -211,6 +212,7 @@ class Dreamer(ModelLoop):
         """
         self.tools.steps = 0
         self.tools.wake_summary = None
+        self.server_tools_failed = False
         self._context = []
         await self._remember({"role": "user", "content": self._opening(dream_id, note)})
         instructions = f"{self.prompt}\n\n## Soul\n{self.mind.soul()}"

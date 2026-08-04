@@ -91,6 +91,16 @@ async def test_unread_count_tracks_whole_chat_and_topic_reads(db: Database) -> N
     assert await db.unread_messages_count(-1001, 12) == 1
 
 
+async def test_unread_count_ignores_own_messages(db: Database) -> None:
+    """Replies the agent just sent are not unread history for it."""
+    await db.save_message(make_message(1, "theirs"))
+    await db.mark_messages_read(100, 1)
+    await db.save_message(make_message(2, "mine", date=STAMP + 60), outgoing=True)
+    assert await db.unread_messages_count(100) == 0
+    await db.save_message(make_message(3, "theirs again", date=STAMP + 120))
+    assert await db.unread_messages_count(100) == 1
+
+
 async def test_search_messages(db: Database) -> None:
     """Substring search is case-insensitive, newest first, wildcards literal."""
     await db.save_message(make_message(1, "my Cat is grumpy", date=STAMP))

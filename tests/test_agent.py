@@ -227,6 +227,27 @@ async def test_remember_updates_active_turn_boundary_after_trim() -> None:
     assert agent._active_turn_start == len(agent._context) - 1
 
 
+async def test_remember_never_empties_the_window_mid_turn() -> None:
+    """A turn longer than the whole window keeps its own items, not nothing.
+
+    Emptying here would leave the window starting at a tool output whose
+    call was cut away, which the API rejects — the turn would wedge.
+    """
+    agent = Agent.__new__(Agent)
+    agent.db = cast(Database, FakeContextDB())
+    agent.max_context_items = MAX_CONTEXT_ITEMS
+    agent.trim_context_items = TRIM_CONTEXT_ITEMS
+    agent._context = [EVENT] + [
+        dict(CALL) if i % 2 else dict(CALL_OUTPUT) for i in range(MAX_CONTEXT_ITEMS - 1)
+    ]
+    agent._active_turn_start = 0
+
+    await agent._remember(dict(CALL))
+
+    assert agent._context[0] == EVENT
+    assert len(agent._context) == MAX_CONTEXT_ITEMS + 1
+
+
 STALE = datetime(2020, 1, 1, tzinfo=UTC)
 
 
@@ -425,8 +446,78 @@ async def test_turn_retries_without_failed_server_tool() -> None:
     assert agent._api_tools == [function_tool, {"type": "web_search"}]
 
 
-async def test_turn_retries_duplicate_tool_ids_with_events_only() -> None:
-    """Mistral duplicate-id errors fall back to external event context."""
+async def test_failed_server_tool_stays_off_for_the_rest_of_the_turn() -> None:
+    """Later rounds skip the built-in tool instead of paying its rejection.
+
+    The next turn offers it again: the failure may well be transient.
+    """
+    request = httpx.Request("POST", "https://openrouter.ai/api/v1/responses")
+    failure = BadRequestError(
+        "Server tool request failed",
+        response=httpx.Response(400, request=request),
+        body={"error": {"message": "Server tool request failed"}},
+    )
+    call_response = SimpleNamespace(
+        id="resp_1",
+        model="gpt-test",
+        output=[FakeOutputItem(CALL)],
+        output_text="",
+        usage=None,
+    )
+    settled = SimpleNamespace(
+        id="resp_2", model="gpt-test", output=[], output_text="", usage=None
+    )
+    responses = iter([failure, call_response, settled, failure, settled])
+    calls: list[dict[str, Any]] = []
+
+    async def create(**kwargs: Any) -> Any:
+        calls.append(kwargs)
+        result = next(responses)
+        if isinstance(result, Exception):
+            raise result
+        return result
+
+    class FakeTools:
+        """Answer the model's one function call with a fixed result."""
+
+        async def run(self, name: str, arguments: str) -> str:
+            """Return a stable tool result."""
+            return "sent"
+
+    db = FakeContextDB()
+    agent = Agent.__new__(Agent)
+    agent.client = cast(Any, SimpleNamespace(responses=SimpleNamespace(create=create)))
+    agent.model = "gpt-test"
+    agent.mind = cast(Any, SimpleNamespace(soul=lambda: "soul"))
+    agent.base_prompt = "base"
+    agent.max_rounds = 2
+    agent.max_context_items = MAX_CONTEXT_ITEMS
+    agent.trim_context_items = TRIM_CONTEXT_ITEMS
+    agent._context = [EVENT]
+    function_tool = cast(Any, {"type": "function", "name": "send_message"})
+    web_search = cast(Any, {"type": "web_search"})
+    agent._api_tools = [function_tool, web_search]
+    agent.reasoning = {}
+    agent.prune_completed_reasoning = False
+    agent.db = cast(Database, db)
+    agent.tools = cast(Any, FakeTools())
+
+    await agent._turn()
+
+    assert [call["tools"] for call in calls] == [
+        [function_tool, web_search],
+        [function_tool],
+        [function_tool],
+    ]
+
+    await agent._turn()
+
+    assert calls[3]["tools"] == [function_tool, web_search]
+    assert calls[4]["tools"] == [function_tool]
+
+
+async def test_turn_retries_duplicate_tool_ids_keeping_own_replies() -> None:
+    """Mistral duplicate-id errors shed tool envelopes, not the agent's words."""
     request = httpx.Request("POST", "https://openrouter.ai/api/v1/responses")
     failure = BadRequestError(
         "Duplicate tool call id in assistant message",
@@ -464,7 +555,51 @@ async def test_turn_retries_duplicate_tool_ids_with_events_only() -> None:
     await agent._turn()
 
     assert len(calls) == 2
-    assert calls[1]["input"] == [EVENT, EVENT]
+    assert calls[1]["input"] == [EVENT, MESSAGE, EVENT]
+    assert agent._context == [EVENT, MESSAGE, EVENT]
+
+
+async def test_turn_drops_own_replies_only_when_they_are_rejected_too() -> None:
+    """A provider that rejects even bare messages falls back to events only."""
+    request = httpx.Request("POST", "https://openrouter.ai/api/v1/responses")
+    failure = BadRequestError(
+        "Duplicate tool call id in assistant message",
+        response=httpx.Response(400, request=request),
+        body={"error": {"message": "Duplicate tool call id in assistant message"}},
+    )
+    response = SimpleNamespace(
+        id="resp_1", model="mistral-test", output=[], output_text="", usage=None
+    )
+    responses = iter([failure, failure, response])
+    calls: list[dict[str, Any]] = []
+
+    async def create(**kwargs: Any) -> Any:
+        calls.append(kwargs)
+        result = next(responses)
+        if isinstance(result, Exception):
+            raise result
+        return result
+
+    db = FakeContextDB()
+    agent = Agent.__new__(Agent)
+    agent.client = cast(Any, SimpleNamespace(responses=SimpleNamespace(create=create)))
+    agent.model = "mistral-test"
+    agent.mind = cast(Any, SimpleNamespace(soul=lambda: "soul"))
+    agent.base_prompt = "base"
+    agent.max_rounds = 1
+    agent.max_context_items = MAX_CONTEXT_ITEMS
+    agent.trim_context_items = TRIM_CONTEXT_ITEMS
+    agent._context = [EVENT, CALL, CALL_OUTPUT, MESSAGE, EVENT]
+    agent._api_tools = []
+    agent.reasoning = {}
+    agent.prune_completed_reasoning = False
+    agent.db = cast(Database, db)
+
+    await agent._turn()
+
+    assert len(calls) == 3
+    assert calls[1]["input"] == [EVENT, MESSAGE, EVENT]
+    assert calls[2]["input"] == [EVENT, EVENT]
     assert agent._context == [EVENT, EVENT]
 
 
@@ -508,8 +643,8 @@ async def test_turn_retries_encrypted_reasoning_with_provider_neutral_context() 
     await agent._turn()
 
     assert len(calls) == 2
-    assert calls[1]["input"] == [EVENT, EVENT]
-    assert agent._context == [EVENT, EVENT]
+    assert calls[1]["input"] == [EVENT, MESSAGE, EVENT]
+    assert agent._context == [EVENT, MESSAGE, EVENT]
 
 
 async def test_turn_chains_server_tool_and_duplicate_id_fallbacks() -> None:
@@ -558,9 +693,9 @@ async def test_turn_chains_server_tool_and_duplicate_id_fallbacks() -> None:
 
     assert len(calls) == 3
     assert calls[1]["tools"] == [function_tool]
-    assert calls[1]["input"] != [EVENT, EVENT]
+    assert calls[1]["input"] == [EVENT, CALL, CALL_OUTPUT, MESSAGE, EVENT]
     assert calls[2]["tools"] == [function_tool]
-    assert calls[2]["input"] == [EVENT, EVENT]
+    assert calls[2]["input"] == [EVENT, MESSAGE, EVENT]
 
 
 async def test_provider_fallback_preserves_tool_result_for_next_round() -> None:

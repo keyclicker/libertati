@@ -602,12 +602,18 @@ class Database:
     async def unread_messages_count(
         self, chat_id: int, message_thread_id: int | None = None
     ) -> int:
-        """Count messages newer than the last history read for a chat/topic."""
+        """Count messages newer than the last history read for a chat/topic.
+
+        Only incoming messages count: the agent's own replies are newer
+        than its last read by construction, and counting them would
+        report "unread" for a conversation it just finished writing.
+        """
         thread_key = message_thread_id or 0
         query = """
             SELECT COUNT(*)
             FROM messages m
             WHERE m.chat_id = ?
+              AND m.outgoing = 0
               AND (? IS NULL OR m.message_thread_id = ?)
               AND m.message_id > COALESCE((
                   SELECT message_id FROM message_read_cursors

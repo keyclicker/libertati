@@ -49,7 +49,7 @@ TYPING_MAX_SECONDS = 8.0
 # Telegram removes the escapes and still creates the mention entity.
 USERNAME_MENTION_RE = re.compile(r"(?<![\w@])@[A-Za-z0-9_]{5,32}(?![A-Za-z0-9_])")
 CITATION_ARTIFACT_RE = re.compile(
-    r"[ \t]*(?:<cite(?:\|[^>\r\n]+)?>|\ue200cite\ue202[^\ue201\r\n]*\ue201)"
+    r"[ \t]*(?:</?cite(?:\|[^>\r\n]+)?>|\ue200cite\ue202[^\ue201\r\n]*\ue201)"
 )
 
 
@@ -920,7 +920,12 @@ def valid_tool_arguments(name: str, args: object) -> bool:
     if schema.get("additionalProperties") is False and not set(args) <= set(properties):
         return False
     for key, value in args.items():
-        parameter = properties[key]
+        # A schema without additionalProperties: false would let an
+        # unknown key through the check above; refuse it here rather than
+        # raise out of Toolbox.run, which promises never to.
+        parameter = properties.get(key)
+        if parameter is None:
+            return False
         expected = parameter["type"]
         types = [expected] if isinstance(expected, str) else expected
         valid_type = any(
@@ -992,6 +997,7 @@ class Toolbox:
         allowed: frozenset[str] | None = None,
         dream_gate: "DreamGate | None" = None,
         dream_min_steps: int = 0,
+        track_reads: bool = True,
     ) -> None:
         """Keep resource handles and build the name-to-handler dispatch."""
         self.db = db
@@ -1007,6 +1013,11 @@ class Toolbox:
         self.recall_effort = recall_effort
         self.dream_gate = dream_gate
         self.dream_min_steps = dream_min_steps
+        #: Whether history reads advance the waking read cursors. A dream
+        #: browses the same chats through the same handler, and marking
+        #: them read there would silently zero the awake agent's unread
+        #: counts for every chat the dream wandered into.
+        self.track_reads = track_reads
         #: Tool calls dispatched so far; the dreaming loop resets it per
         #: dream and ``wake_up`` refuses to fire below the minimum.
         self.steps = 0
@@ -1393,7 +1404,7 @@ class Toolbox:
             args.get("before_message_id"),
             args.get("message_thread_id"),
         )
-        if args.get("before_message_id") is None and rows:
+        if self.track_reads and args.get("before_message_id") is None and rows:
             await self.db.mark_messages_read(
                 args["chat_id"],
                 max(row["message_id"] for row in rows),

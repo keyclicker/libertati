@@ -451,6 +451,13 @@ def test_strip_citation_artifacts_handles_search_marker_formats() -> None:
     assert strip_citation_artifacts(text) == "Ukraine and Crimea."
 
 
+def test_strip_citation_artifacts_removes_closing_tags() -> None:
+    """A closing </cite> is an artifact too; leaving it half-strips the text."""
+    assert strip_citation_artifacts("Kyiv <cite|turn0search1> is warm </cite>") == (
+        "Kyiv is warm"
+    )
+
+
 async def test_send_message_strips_citation_artifacts(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -952,6 +959,21 @@ async def test_unread_count_and_recent_read_cursor() -> None:
     }
     await toolbox.run("get_recent_messages", json.dumps(recent_args))
     assert db.read_marks == [(1, 9, 12)]
+
+
+async def test_dreaming_history_reads_leave_the_cursor_alone() -> None:
+    """A dream browsing old chats must not zero the waking unread counts."""
+    db = FakeDB()
+    db.recent_rows = [{"message_id": 9}]
+    toolbox = make_toolbox(db=db, track_reads=False)
+    recent_args = {
+        "chat_id": 1,
+        "limit": 3,
+        "before_message_id": None,
+        "message_thread_id": 12,
+    }
+    await toolbox.run("get_recent_messages", json.dumps(recent_args))
+    assert db.read_marks == []
 
 
 async def test_get_message_thread_clamps_limit_and_reports_missing() -> None:
