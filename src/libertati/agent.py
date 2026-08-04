@@ -240,15 +240,18 @@ class Agent(ModelLoop):
 
     @staticmethod
     def _normalize_internal_nudge(item: dict[str, Any]) -> dict[str, Any]:
-        """Mark delivery nudges written before they had an explicit type."""
+        """Canonicalize delivery nudges written by current or older versions."""
         content = item.get("content")
         if (
             item.get("role") == "user"
-            and "type" not in item
             and isinstance(content, str)
             and content.startswith(PRIVATE_OUTPUT_NUDGE_PREFIX)
         ):
-            return {**item, "type": "message"}
+            return {
+                **item,
+                "type": "message",
+                "content": [{"type": "input_text", "text": content}],
+            }
         return item
 
     def _provider_fallback_context(self) -> list[dict[str, Any]]:
@@ -370,7 +373,14 @@ class Agent(ModelLoop):
                             {
                                 "type": "message",
                                 "role": "user",
-                                "content": private_output_nudge(self._last_output_text),
+                                "content": [
+                                    {
+                                        "type": "input_text",
+                                        "text": private_output_nudge(
+                                            self._last_output_text
+                                        ),
+                                    }
+                                ],
                             }
                         )
                         continue

@@ -44,6 +44,7 @@ from libertati.config import Settings
 #: Header style and label per item kind.
 KINDS = {
     "event": ("cyan", "EVENT"),
+    "internal_message": ("bright_black", "INTERNAL INPUT"),
     "reasoning": ("bright_black", "REASONING"),
     "message": ("yellow", "FINAL OUTPUT"),
     "function_call": ("magenta", "TOOL CALL"),
@@ -114,6 +115,8 @@ def classify(item: dict[str, Any]) -> str:
     """Map a raw context item to one of the ``KINDS``."""
     if item.get("role") == "user" and "type" not in item:
         return "event"
+    if item.get("role") == "user" and item.get("type") == "message":
+        return "internal_message"
     kind = item.get("type", "other")
     return kind if kind in KINDS else "other"
 
@@ -125,12 +128,15 @@ def body_text(kind: str, item: dict[str, Any]) -> str:
     if kind == "reasoning":
         parts = [s.get("text", "") for s in item.get("summary", [])]
         return "\n".join(p for p in parts if p) or "(hidden)"
-    if kind == "message":
+    if kind in {"message", "internal_message"}:
         parts = item.get("content", [])
+        if isinstance(parts, str):
+            return parts
         return "\n".join(
             p.get("text", "") or p.get("refusal", "")
             for p in parts
-            if p.get("type") in {"output_text", "refusal"}
+            if isinstance(p, dict)
+            and p.get("type") in {"input_text", "output_text", "refusal"}
         )
     if kind == "function_call":
         args = item.get("arguments") or "{}"
