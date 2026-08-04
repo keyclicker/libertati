@@ -612,7 +612,7 @@ async def test_provider_fallback_preserves_tool_result_for_next_round() -> None:
     agent._context = [EVENT, {**CALL, "call_id": "old"}, EVENT]
     agent._api_tools = []
     agent.reasoning = {}
-    agent.prune_completed_reasoning = False
+    agent.prune_completed_reasoning = True
     agent.db = cast(Database, db)
     agent.tools = cast(Any, FakeTools())
 
@@ -620,6 +620,7 @@ async def test_provider_fallback_preserves_tool_result_for_next_round() -> None:
 
     assert len(calls) == 3
     assert calls[2]["input"][-2:] == [CALL, CALL_OUTPUT]
+    assert agent._context == [EVENT, EVENT, CALL, CALL_OUTPUT]
 
 
 async def test_record_usage_maps_all_authoritative_counts() -> None:
