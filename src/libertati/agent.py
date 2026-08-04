@@ -32,6 +32,11 @@ from libertati.tools import Toolbox, build_tools
 
 log = logging.getLogger(__name__)
 
+PRIVATE_OUTPUT_NUDGE = """[delivery correction]
+Your previous plain text output was private and was not sent. If it was meant
+for someone, call send_message now with that text and the target chat_id. If it
+was only private thought and no action is needed, stop with no text."""
+
 
 class Agent(ModelLoop):
     """One persistent agentic loop consuming events from all sources.
@@ -261,18 +266,26 @@ class Agent(ModelLoop):
     async def _turn(self) -> None:
         """Run one agentic turn: call the model, execute tools, repeat.
 
-        The turn ends when the model produces no tool calls (its text, if
-        any, is logged as private final output) or ``max_rounds`` is
-        reached. Everything the model produces is remembered. SOUL.md is
-        re-read every turn so personality edits apply live.
+        The turn ends when the model produces no tool calls or ``max_rounds``
+        is reached. A non-empty private final output gets one corrective retry
+        because some compatible providers mistake it for a delivered reply.
+        Everything the model produces is remembered. SOUL.md is re-read every
+        turn so personality edits apply live.
         """
         instructions = f"{self.base_prompt}\n\n## Soul\n{self.mind.soul()}"
         turn_start = len(self._context)
         turn_id = await self.db.start_agent_turn(await self.db.latest_context_id())
         turn_status = "failed"
+        corrected_private_output = False
         try:
             for _ in range(self.max_rounds):
                 if not await self._round(instructions, turn_id):
+                    if self._last_output_text and not corrected_private_output:
+                        corrected_private_output = True
+                        await self._remember(
+                            {"role": "user", "content": PRIVATE_OUTPUT_NUDGE}
+                        )
+                        continue
                     turn_status = "completed"
                     return
             turn_status = "max_rounds"

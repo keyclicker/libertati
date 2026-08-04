@@ -54,6 +54,7 @@ class ModelLoop:
         self.reasoning = reasoning
         self._api_tools = api_tools
         self._context: list[dict[str, Any]] = []
+        self._last_output_text = ""
 
     async def _remember(self, item: dict[str, Any]) -> None:
         """Append one item to the in-memory context window."""
@@ -87,6 +88,7 @@ class ModelLoop:
             include=["reasoning.encrypted_content"],
             reasoning=self.reasoning,
         )
+        self._last_output_text = response.output_text or ""
         await self._record_usage(response, turn_id, input_context_id)
         for item in response.output:
             await self._remember(item.model_dump(mode="json", exclude_none=True))
