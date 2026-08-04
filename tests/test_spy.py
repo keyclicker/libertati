@@ -133,6 +133,36 @@ def test_block_header_carries_kind_and_estimate() -> None:
     assert "tok" in block.plain
 
 
+def test_internal_input_message_renders_canonical_content() -> None:
+    """Typed user dialogue displays separately from external events."""
+    item = {
+        "type": "message",
+        "role": "user",
+        "content": [{"type": "input_text", "text": "delivery correction"}],
+    }
+
+    block = build_block((8, "2026-08-02 10:00:00", json.dumps(item)))
+
+    assert block is not None
+    assert "INTERNAL INPUT" in block.plain
+    assert "delivery correction" in block.plain
+
+
+def test_internal_input_message_renders_legacy_string_content() -> None:
+    """Spy remains compatible with string-form rows already persisted."""
+    item = {
+        "type": "message",
+        "role": "user",
+        "content": "[delivery correction] legacy",
+    }
+
+    block = build_block((9, "2026-08-02 10:00:00", json.dumps(item)))
+
+    assert block is not None
+    assert "INTERNAL INPUT" in block.plain
+    assert "[delivery correction] legacy" in block.plain
+
+
 def test_estimate_scales_with_script_and_shape() -> None:
     """Cyrillic costs more per byte than JSON; base64 reasoning far less."""
     ascii_event = json.dumps({"role": "user", "content": "hello there friend"})
