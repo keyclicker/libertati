@@ -105,21 +105,29 @@ def test_drop_legacy_reasoning_keeps_encrypted_items() -> None:
     assert Agent._drop_legacy_reasoning(items) == items
 
 
-def test_duplicate_call_ids_are_renamed_with_matching_outputs() -> None:
-    """Repeated provider ids become unique without changing persisted items."""
-    first_call = {**CALL, "name": "recall"}
-    first_output = {**CALL_OUTPUT, "output": "first"}
-    second_call = {**CALL, "name": "send_message"}
-    second_output = {**CALL_OUTPUT, "output": "second"}
-    items = [EVENT, first_call, first_output, EVENT, second_call, second_output]
+def test_legacy_delivery_nudge_is_not_an_external_event() -> None:
+    """Old untyped correction messages never become event boundaries."""
+    nudge = {"role": "user", "content": "[delivery correction]\nretry"}
+    assert not Agent._is_external_event(nudge)
+    assert Agent._normalize_internal_nudge(nudge) == {**nudge, "type": "message"}
 
-    normalized = Agent._unique_call_ids(items)
 
-    assert normalized[:4] == items[:4]
-    assert normalized[4]["call_id"] == "call_1__libertati_2"
-    assert normalized[5]["call_id"] == "call_1__libertati_2"
-    assert second_call["call_id"] == "call_1"
-    assert second_output["call_id"] == "call_1"
+def test_provider_fallback_keeps_active_turn_suffix() -> None:
+    """Provider-neutral history retains fresh tool calls and results."""
+    agent = Agent.__new__(Agent)
+    old_call = {**CALL, "call_id": "old"}
+    old_output = {**CALL_OUTPUT, "call_id": "old"}
+    current_call = {**CALL, "call_id": "current"}
+    current_output = {**CALL_OUTPUT, "call_id": "current"}
+    agent._context = [EVENT, old_call, old_output, EVENT, current_call, current_output]
+    agent._active_turn_start = 3
+
+    assert agent._provider_fallback_context() == [
+        EVENT,
+        EVENT,
+        current_call,
+        current_output,
+    ]
 
 
 def test_finish_turn_prunes_only_new_ephemeral_outputs() -> None:
@@ -203,6 +211,22 @@ async def test_remember_trims_in_chunks() -> None:
     assert agent._context[0] is head
 
 
+async def test_remember_updates_active_turn_boundary_after_trim() -> None:
+    """Chunk trimming keeps active-turn boundary attached to its first event."""
+    agent = Agent.__new__(Agent)
+    agent.db = cast(Database, FakeContextDB())
+    agent.max_context_items = MAX_CONTEXT_ITEMS
+    agent.trim_context_items = TRIM_CONTEXT_ITEMS
+    agent._context = [dict(EVENT) for _ in range(MAX_CONTEXT_ITEMS)]
+    agent._active_turn_start = len(agent._context)
+    active_event = {"role": "user", "content": "[event] current"}
+
+    await agent._remember(active_event)
+
+    assert agent._context[-1] is active_event
+    assert agent._active_turn_start == len(agent._context) - 1
+
+
 STALE = datetime(2020, 1, 1, tzinfo=UTC)
 
 
@@ -254,8 +278,9 @@ class FakeOutputItem:
 
     def __init__(self, item: dict[str, Any]) -> None:
         """Expose its type and serialized payload."""
-        self.type = item["type"]
         self.item = item
+        for key, value in item.items():
+            setattr(self, key, value)
 
     def model_dump(self, **_: Any) -> dict[str, Any]:
         """Return the canned API payload."""
@@ -347,7 +372,9 @@ async def test_turn_retries_private_final_output_once() -> None:
 
     assert len(calls) == 2
     assert calls[1]["input"][-1]["role"] == "user"
+    assert calls[1]["input"][-1]["type"] == "message"
     assert "call send_message now" in calls[1]["input"][-1]["content"]
+    assert "This should have been sent" in calls[1]["input"][-1]["content"]
     assert db.turns == [
         {"start_context_id": 0, "end_context_id": 2, "status": "completed"}
     ]
@@ -395,7 +422,7 @@ async def test_turn_retries_without_failed_server_tool() -> None:
     assert len(calls) == 2
     assert calls[0]["tools"] == [function_tool, {"type": "web_search"}]
     assert calls[1]["tools"] == [function_tool]
-    assert agent._api_tools == [function_tool]
+    assert agent._api_tools == [function_tool, {"type": "web_search"}]
 
 
 async def test_turn_retries_duplicate_tool_ids_with_events_only() -> None:
@@ -438,6 +465,162 @@ async def test_turn_retries_duplicate_tool_ids_with_events_only() -> None:
 
     assert len(calls) == 2
     assert calls[1]["input"] == [EVENT, EVENT]
+    assert agent._context == [EVENT, EVENT]
+
+
+async def test_turn_retries_encrypted_reasoning_with_provider_neutral_context() -> None:
+    """Cross-provider encrypted reasoning errors compact historical context."""
+    request = httpx.Request("POST", "https://openrouter.ai/api/v1/responses")
+    failure = BadRequestError(
+        "Could not decrypt the provided encrypted_content",
+        response=httpx.Response(400, request=request),
+        body={"error": {"message": "Could not decrypt encrypted_content"}},
+    )
+    response = SimpleNamespace(
+        id="resp_1", model="xai-test", output=[], output_text="", usage=None
+    )
+    responses = iter([failure, response])
+    calls: list[dict[str, Any]] = []
+
+    async def create(**kwargs: Any) -> Any:
+        calls.append(kwargs)
+        result = next(responses)
+        if isinstance(result, Exception):
+            raise result
+        return result
+
+    db = FakeContextDB()
+    agent = Agent.__new__(Agent)
+    agent.client = cast(Any, SimpleNamespace(responses=SimpleNamespace(create=create)))
+    agent.model = "xai-test"
+    agent.mind = cast(Any, SimpleNamespace(soul=lambda: "soul"))
+    agent.base_prompt = "base"
+    agent.max_rounds = 1
+    agent.max_context_items = MAX_CONTEXT_ITEMS
+    agent.trim_context_items = TRIM_CONTEXT_ITEMS
+    encrypted = {"type": "reasoning", "encrypted_content": "opaque"}
+    agent._context = [EVENT, encrypted, MESSAGE, EVENT]
+    agent._api_tools = []
+    agent.reasoning = {}
+    agent.prune_completed_reasoning = False
+    agent.db = cast(Database, db)
+
+    await agent._turn()
+
+    assert len(calls) == 2
+    assert calls[1]["input"] == [EVENT, EVENT]
+    assert agent._context == [EVENT, EVENT]
+
+
+async def test_turn_chains_server_tool_and_duplicate_id_fallbacks() -> None:
+    """Sequential compatibility failures both transform the next retry."""
+    request = httpx.Request("POST", "https://openrouter.ai/api/v1/responses")
+    server_failure = BadRequestError(
+        "Server tool request failed",
+        response=httpx.Response(400, request=request),
+        body={"error": {"message": "Server tool request failed"}},
+    )
+    duplicate_failure = BadRequestError(
+        "Duplicate tool call id in assistant message",
+        response=httpx.Response(400, request=request),
+        body={"error": {"message": "Duplicate tool call id in assistant message"}},
+    )
+    response = SimpleNamespace(
+        id="resp_1", model="mistral-test", output=[], output_text="", usage=None
+    )
+    responses = iter([server_failure, duplicate_failure, response])
+    calls: list[dict[str, Any]] = []
+
+    async def create(**kwargs: Any) -> Any:
+        calls.append(kwargs)
+        result = next(responses)
+        if isinstance(result, Exception):
+            raise result
+        return result
+
+    db = FakeContextDB()
+    agent = Agent.__new__(Agent)
+    agent.client = cast(Any, SimpleNamespace(responses=SimpleNamespace(create=create)))
+    agent.model = "mistral-test"
+    agent.mind = cast(Any, SimpleNamespace(soul=lambda: "soul"))
+    agent.base_prompt = "base"
+    agent.max_rounds = 1
+    agent.max_context_items = MAX_CONTEXT_ITEMS
+    agent.trim_context_items = TRIM_CONTEXT_ITEMS
+    agent._context = [EVENT, CALL, CALL_OUTPUT, MESSAGE, EVENT]
+    function_tool = cast(Any, {"type": "function", "name": "send_message"})
+    agent._api_tools = [function_tool, cast(Any, {"type": "web_search"})]
+    agent.reasoning = {}
+    agent.prune_completed_reasoning = False
+    agent.db = cast(Database, db)
+
+    await agent._turn()
+
+    assert len(calls) == 3
+    assert calls[1]["tools"] == [function_tool]
+    assert calls[1]["input"] != [EVENT, EVENT]
+    assert calls[2]["tools"] == [function_tool]
+    assert calls[2]["input"] == [EVENT, EVENT]
+
+
+async def test_provider_fallback_preserves_tool_result_for_next_round() -> None:
+    """Compacted context remains active through a multi-round tool turn."""
+    request = httpx.Request("POST", "https://openrouter.ai/api/v1/responses")
+    failure = BadRequestError(
+        "Duplicate tool call id in assistant message",
+        response=httpx.Response(400, request=request),
+        body={"error": {"message": "Duplicate tool call id in assistant message"}},
+    )
+    call_response = SimpleNamespace(
+        id="resp_1",
+        model="mistral-test",
+        output=[FakeOutputItem(CALL)],
+        output_text="",
+        usage=None,
+    )
+    final_response = SimpleNamespace(
+        id="resp_2", model="mistral-test", output=[], output_text="", usage=None
+    )
+    responses = iter([failure, call_response, final_response])
+    calls: list[dict[str, Any]] = []
+
+    async def create(**kwargs: Any) -> Any:
+        calls.append(kwargs)
+        result = next(responses)
+        if isinstance(result, Exception):
+            raise result
+        return result
+
+    class FakeTools:
+        """Return one stable result for the model's function call."""
+
+        async def run(self, name: str, arguments: str) -> str:
+            """Record no side effects and return a visible tool result."""
+            assert name == "send_message"
+            assert arguments == "{}"
+            return "sent"
+
+    db = FakeContextDB()
+    agent = Agent.__new__(Agent)
+    agent.client = cast(Any, SimpleNamespace(responses=SimpleNamespace(create=create)))
+    agent.model = "mistral-test"
+    agent.mind = cast(Any, SimpleNamespace(soul=lambda: "soul"))
+    agent.base_prompt = "base"
+    agent.max_rounds = 2
+    agent.max_context_items = MAX_CONTEXT_ITEMS
+    agent.trim_context_items = TRIM_CONTEXT_ITEMS
+    agent._context = [EVENT, {**CALL, "call_id": "old"}, EVENT]
+    agent._api_tools = []
+    agent.reasoning = {}
+    agent.prune_completed_reasoning = True
+    agent.db = cast(Database, db)
+    agent.tools = cast(Any, FakeTools())
+
+    await agent._turn()
+
+    assert len(calls) == 3
+    assert calls[2]["input"][-2:] == [CALL, CALL_OUTPUT]
+    assert agent._context == [EVENT, EVENT, CALL, CALL_OUTPUT]
 
 
 async def test_record_usage_maps_all_authoritative_counts() -> None:

@@ -10,7 +10,6 @@ lives here.
 """
 
 import logging
-from collections import defaultdict, deque
 from typing import TYPE_CHECKING, Any, cast
 
 from openai import AsyncOpenAI, BadRequestError, Omit
@@ -69,41 +68,13 @@ class ModelLoop:
         """
         return await self.db.latest_context_id()
 
-    @staticmethod
-    def _unique_call_ids(items: list[dict[str, Any]]) -> list[dict[str, Any]]:
-        """Rename repeated tool-call ids while preserving call/output pairs.
+    def _provider_fallback_context(self) -> list[dict[str, Any]]:
+        """Return a provider-neutral view after historical context fails.
 
-        Some compatible providers reuse short ids across turns while others
-        require every id in the full input to be unique. Persistence keeps the
-        provider's original values; only the request view is normalized.
+        Persistent waking agents override this. Dream context starts empty and
+        belongs to one provider session, so there is no safe history to shed.
         """
-        counts: dict[str, int] = defaultdict(int)
-        pending: dict[str, deque[str]] = defaultdict(deque)
-        used: set[str] = set()
-        normalized: list[dict[str, Any]] = []
-        for item in items:
-            kind = item.get("type")
-            call_id = item.get("call_id")
-            replacement = call_id
-            if kind == "function_call" and isinstance(call_id, str):
-                counts[call_id] += 1
-                replacement = call_id
-                suffix = counts[call_id]
-                while replacement in used:
-                    replacement = f"{call_id}__libertati_{suffix}"
-                    suffix += 1
-                used.add(replacement)
-                pending[call_id].append(replacement)
-            elif (
-                kind == "function_call_output"
-                and isinstance(call_id, str)
-                and pending[call_id]
-            ):
-                replacement = pending[call_id].popleft()
-            if replacement != call_id:
-                item = {**item, "call_id": replacement}
-            normalized.append(item)
-        return normalized
+        return self._context
 
     async def _round(self, instructions: str, turn_id: int | None) -> bool:
         """Call the model once and run whatever tools it asked for.
@@ -114,7 +85,7 @@ class ModelLoop:
         :attr:`dream_id` instead.
         """
         input_context_id = await self._anchor_id()
-        request_context = self._unique_call_ids(self._context)
+        request_context = self._context
 
         async def create(tools: list[ToolParam], context: list[dict[str, Any]]) -> Any:
             return await self.client.responses.create(
@@ -129,21 +100,44 @@ class ModelLoop:
                 reasoning=self.reasoning,
             )
 
-        try:
-            response = await create(self._api_tools, request_context)
-        except BadRequestError as exc:
-            if "Duplicate tool call id in assistant message" in str(exc):
-                event_context = [
-                    item
-                    for item in self._context
-                    if item.get("role") == "user" and "type" not in item
+        request_tools = self._api_tools
+        for _ in range(3):
+            try:
+                response = await create(request_tools, request_context)
+                break
+            except BadRequestError as exc:
+                error = str(exc)
+                if (
+                    "Duplicate tool call id in assistant message" in error
+                    or "Could not decrypt the provided encrypted_content" in error
+                ):
+                    fallback_context = self._provider_fallback_context()
+                    if request_context == fallback_context:
+                        raise
+                    log.warning(
+                        "provider rejected historical context; "
+                        "compacting window and retrying"
+                    )
+                    # Keep the compatible view for later model/tool rounds.
+                    # Full append-only history remains untouched in SQLite.
+                    self._context = fallback_context
+                    request_context = fallback_context
+                    continue
+                local_tools = [
+                    tool for tool in request_tools if tool["type"] == "function"
                 ]
-                log.warning(
-                    "provider rejected historical tool ids; retrying with events only"
-                )
-                response = await create(self._api_tools, event_context)
-            else:
-                response = await self._retry_without_server_tools(exc, create)
+                if (
+                    "Server tool request failed" in error
+                    and local_tools != request_tools
+                ):
+                    log.warning(
+                        "server tool failed; disabling built-in tools and retrying"
+                    )
+                    request_tools = local_tools
+                    continue
+                raise
+        else:  # pragma: no cover - each fallback can apply only once
+            raise RuntimeError("provider compatibility retries exhausted")
         self._last_output_text = response.output_text or ""
         await self._record_usage(response, turn_id, input_context_id)
         for item in response.output:
@@ -166,19 +160,6 @@ class ModelLoop:
                 }
             )
         return True
-
-    async def _retry_without_server_tools(
-        self, exc: BadRequestError, create: Any
-    ) -> Any:
-        """Retry a failed built-in server tool with local functions only."""
-        local_tools = [tool for tool in self._api_tools if tool["type"] == "function"]
-        if "Server tool request failed" not in str(exc) or len(local_tools) == len(
-            self._api_tools
-        ):
-            raise exc
-        log.warning("server tool failed; disabling built-in tools and retrying")
-        self._api_tools = local_tools
-        return await create(local_tools, self._unique_call_ids(self._context))
 
     async def _record_usage(
         self,
