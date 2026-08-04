@@ -1220,15 +1220,20 @@ def test_build_tools_web_search_toggle() -> None:
 class FakeDreamGate:
     """Stands in for the real gate's budget check and request slot."""
 
-    def __init__(self, left: int = 4, daily_budget: int = 4) -> None:
+    def __init__(self, left: int = 4, daily_budget: int = 4, cooldown: int = 0) -> None:
         """Start with a fixed budget and no request pending."""
         self.left = left
         self.daily_budget = daily_budget
+        self.cooldown = cooldown
         self.note: str | None = None
 
     async def budget_left(self) -> int:
         """Return the canned remaining budget."""
         return self.left
+
+    async def cooldown_left(self) -> int:
+        """Return the canned remaining cooldown."""
+        return self.cooldown
 
     def request(self, note: str) -> None:
         """Record the requested dream."""
@@ -1255,6 +1260,19 @@ async def test_dream_tool_reports_a_spent_budget() -> None:
     result = await toolbox.run("dream", json.dumps({"note": "the trip"}))
 
     assert result.startswith("error:")
+    assert gate.note is None
+
+
+async def test_dream_tool_reports_an_active_cooldown() -> None:
+    """A request is rejected when sleep cannot start during cooldown."""
+    gate = FakeDreamGate(cooldown=37)
+    toolbox = make_toolbox(dream_gate=cast(Any, gate))
+
+    result = await toolbox.run("dream", json.dumps({"note": "the trip"}))
+
+    assert result == (
+        "error: sleep is unavailable while dream cooldown is active (37 min left)"
+    )
     assert gate.note is None
 
 

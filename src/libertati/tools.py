@@ -1493,6 +1493,12 @@ class Toolbox:
                 "error: no sleep left — you have already dreamt "
                 f"{self.dream_gate.daily_budget} times in the last 24h"
             )
+        cooldown = await self.dream_gate.cooldown_left()
+        if cooldown > 0:
+            return (
+                "error: sleep is unavailable while dream cooldown is active "
+                f"({cooldown} min left)"
+            )
         self.dream_gate.request(args["note"])
         return f"falling asleep shortly ({left} dreams left for the next 24h)"
 

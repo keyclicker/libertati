@@ -361,7 +361,9 @@ async def run() -> None:
     await db.connect()
 
     bot = Bot(token=settings.bot_token)
-    dream_gate = DreamGate(db, settings.dream_daily_budget)
+    dream_gate = DreamGate(
+        db, settings.dream_daily_budget, settings.dream_cooldown_minutes
+    )
     registry = ChatRegistry(settings.chats_path, settings.chat_approval)
     agent = Agent(settings, db, bot, registry, dream_gate)
     await agent.load()

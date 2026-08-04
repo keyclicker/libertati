@@ -131,7 +131,11 @@ def make_dreamer(
     mind.ensure()
     client = FakeClient(rounds)
     agent = FakeAgent(mind, client, idle_minutes=settings.pop("idle_minutes", 90))
-    gate = DreamGate(db, settings.pop("daily_budget", 4))
+    gate = DreamGate(
+        db,
+        settings.pop("daily_budget", 4),
+        settings.get("dream_cooldown_minutes", 120),
+    )
     dreamer = Dreamer(
         make_settings(**settings),
         db,
