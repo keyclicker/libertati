@@ -135,9 +135,8 @@ class Agent(ModelLoop):
         reasoning item without its follow-up) — the API rejects such
         context outright, which would wedge the agent permanently.
         Everything up to the last legacy reasoning item (from before
-        ``store=False``) is dropped for the same reason: the item itself
-        has no encrypted content to send, and a function call whose
-        paired reasoning is missing is rejected just the same.
+        ``store=False``) is dropped for the same reason: it has no
+        encrypted content to send, so the API refuses it outright.
         """
         excluded_types = (
             ("reasoning", "message") if self.prune_completed_reasoning else ()
