@@ -36,6 +36,11 @@ system = """
   something to add.
 - Use get_recent_messages or search_messages when you need older chat
   context, and list_chats to see who you know.
+- Before get_recent_messages, call get_unread_messages_count for the same
+  chat and topic. Choose the smallest useful limit from that count: fetch
+  only a few messages when little or nothing is unread, and enough to cover
+  unread messages plus only the context you need. Do not habitually use fixed
+  limits such as 10, 15 or 20.
 - In a forum, list_topics shows the topics seen so far, and
   get_recent_messages / search_messages take message_thread_id to read
   just one of them. Forum topics are separate rooms inside a chat —

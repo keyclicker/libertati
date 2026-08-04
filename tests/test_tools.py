@@ -46,6 +46,9 @@ class FakeDB:
     def __init__(self) -> None:
         """Start with empty call records."""
         self.recent_calls: list[tuple[int, int, int | None, int | None]] = []
+        self.read_count = 0
+        self.read_marks: list[tuple[int, int, int | None]] = []
+        self.recent_rows: list[dict] = []
         self.search_calls: list[tuple[int, str, int, int | None]] = []
         self.thread_calls: list[tuple[int, int, int]] = []
         self.wakeups: list[tuple[str, str]] = []
@@ -69,7 +72,22 @@ class FakeDB:
     ) -> list[dict]:
         """Record the query and return no rows."""
         self.recent_calls.append((chat_id, limit, before_message_id, message_thread_id))
-        return []
+        return self.recent_rows
+
+    async def unread_messages_count(
+        self, chat_id: int, message_thread_id: int | None = None
+    ) -> int:
+        """Return canned unread count."""
+        return self.read_count
+
+    async def mark_messages_read(
+        self,
+        chat_id: int,
+        message_id: int,
+        message_thread_id: int | None = None,
+    ) -> None:
+        """Record history cursor advancement."""
+        self.read_marks.append((chat_id, message_id, message_thread_id))
 
     async def search_messages(
         self,
@@ -915,6 +933,25 @@ async def test_get_recent_messages_passes_cursor() -> None:
     }
     await make_toolbox(db=db).run("get_recent_messages", json.dumps(args))
     assert db.recent_calls == [(1, 20, 42, None)]
+    assert db.read_marks == []
+
+
+async def test_unread_count_and_recent_read_cursor() -> None:
+    """Unread count is exposed and newest-history reads advance its cursor."""
+    db = FakeDB()
+    db.read_count = 3
+    db.recent_rows = [{"message_id": 9}]
+    toolbox = make_toolbox(db=db)
+    count_args = {"chat_id": 1, "message_thread_id": 12}
+    assert await toolbox.run("get_unread_messages_count", json.dumps(count_args)) == "3"
+    recent_args = {
+        "chat_id": 1,
+        "limit": 3,
+        "before_message_id": None,
+        "message_thread_id": 12,
+    }
+    await toolbox.run("get_recent_messages", json.dumps(recent_args))
+    assert db.read_marks == [(1, 9, 12)]
 
 
 async def test_get_message_thread_clamps_limit_and_reports_missing() -> None:
