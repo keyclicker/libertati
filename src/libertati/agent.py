@@ -32,10 +32,18 @@ from libertati.tools import Toolbox, build_tools
 
 log = logging.getLogger(__name__)
 
-PRIVATE_OUTPUT_NUDGE = """[delivery correction]
-Your previous plain text output was private and was not sent. If it was meant
-for someone, call send_message now with that text and the target chat_id. If it
-was only private thought and no action is needed, stop with no text."""
+PRIVATE_OUTPUT_NUDGE_PREFIX = "[delivery correction]"
+
+
+def private_output_nudge(text: str) -> str:
+    """Build an internal retry message carrying the undelivered text."""
+    return f"""{PRIVATE_OUTPUT_NUDGE_PREFIX}
+Plain text output is private and was not sent. If the text below was meant for
+someone, call send_message now with that text and the target chat_id. If it was
+only private thought and no action is needed, stop with no text.
+
+Unsent text:
+{text}"""
 
 
 class Agent(ModelLoop):
@@ -107,6 +115,7 @@ class Agent(ModelLoop):
         self.max_context_items = settings.context_max_items
         self.trim_context_items = settings.context_trim_items
         self._queue: asyncio.Queue[tuple[str, bool]] = asyncio.Queue()
+        self._active_turn_start: int | None = None
         # Held for the whole of a turn. The dreaming loop takes the same
         # lock, which is how "the agent sleeps while it dreams" works:
         # a dream waits for the turn in flight and blocks the next one.
@@ -136,6 +145,13 @@ class Agent(ModelLoop):
             self.trim_context_items,
             exclude_types=excluded_types,
         )
+        items = [self._normalize_internal_nudge(item) for item in items]
+        if self.prune_completed_reasoning:
+            items = [
+                item
+                for item in items
+                if item.get("type") not in {"reasoning", "message"}
+            ]
         items = self._drop_legacy_reasoning(items)
         self._context = self._trim_dangling(self._trim_to_boundary(items))
         log.info("restored %d context items", len(self._context))
@@ -173,6 +189,7 @@ class Agent(ModelLoop):
         """
         outward_before = self.tools.outward_calls
         async with self.turn_lock:
+            self._active_turn_start = len(self._context)
             for event, _ in batch:
                 await self._remember({"role": "user", "content": event})
             try:
@@ -180,6 +197,8 @@ class Agent(ModelLoop):
             except Exception:
                 log.exception("agent turn failed")
                 self._context = self._trim_dangling(self._context)
+            finally:
+                self._active_turn_start = None
         acted = self.tools.outward_calls > outward_before
         if acted or any(activity for _, activity in batch):
             self.last_active = datetime.now(UTC)
@@ -189,9 +208,79 @@ class Agent(ModelLoop):
         await super()._remember(item)
         await self.db.append_context(item)
         if len(self._context) > self.max_context_items:
+            active_head = None
+            active_turn_start = getattr(self, "_active_turn_start", None)
+            if active_turn_start is not None and active_turn_start < len(self._context):
+                active_head = self._context[active_turn_start]
             self._context = self._trim_to_boundary(
                 self._context[-self.trim_context_items :]
             )
+            if active_head is not None:
+                self._active_turn_start = next(
+                    (
+                        i
+                        for i, context_item in enumerate(self._context)
+                        if context_item is active_head
+                    ),
+                    len(self._context),
+                )
+
+    @staticmethod
+    def _is_external_event(item: dict[str, Any]) -> bool:
+        """Return whether an item is a real event rather than model dialogue."""
+        content = item.get("content")
+        return (
+            item.get("role") == "user"
+            and "type" not in item
+            and not (
+                isinstance(content, str)
+                and content.startswith(PRIVATE_OUTPUT_NUDGE_PREFIX)
+            )
+        )
+
+    @staticmethod
+    def _normalize_internal_nudge(item: dict[str, Any]) -> dict[str, Any]:
+        """Mark delivery nudges written before they had an explicit type."""
+        content = item.get("content")
+        if (
+            item.get("role") == "user"
+            and "type" not in item
+            and isinstance(content, str)
+            and content.startswith(PRIVATE_OUTPUT_NUDGE_PREFIX)
+        ):
+            return {**item, "type": "message"}
+        return item
+
+    def _provider_fallback_context(self) -> list[dict[str, Any]]:
+        """Keep external history plus every item in the active turn."""
+        start = getattr(self, "_active_turn_start", None)
+        if start is None:
+            start = next(
+                (
+                    i
+                    for i in range(len(self._context) - 1, -1, -1)
+                    if self._is_external_event(self._context[i])
+                ),
+                len(self._context),
+            )
+        history = [
+            item for item in self._context[:start] if self._is_external_event(item)
+        ]
+        if getattr(self, "_active_turn_start", None) is not None:
+            self._active_turn_start = len(history)
+        return [*history, *self._context[start:]]
+
+    def _current_output_start(self) -> int:
+        """Return first model-produced item after current external event batch."""
+        last_event = next(
+            (
+                i
+                for i in range(len(self._context) - 1, -1, -1)
+                if self._is_external_event(self._context[i])
+            ),
+            len(self._context) - 1,
+        )
+        return last_event + 1
 
     @staticmethod
     def _trim_to_boundary(items: list[dict[str, Any]]) -> list[dict[str, Any]]:
@@ -201,11 +290,7 @@ class Agent(ModelLoop):
         separated from its output and no reply is left half-orphaned.
         """
         start = next(
-            (
-                i
-                for i, item in enumerate(items)
-                if item.get("role") == "user" and "type" not in item
-            ),
+            (i for i, item in enumerate(items) if Agent._is_external_event(item)),
             None,
         )
         if start is None:
@@ -273,7 +358,6 @@ class Agent(ModelLoop):
         turn so personality edits apply live.
         """
         instructions = f"{self.base_prompt}\n\n## Soul\n{self.mind.soul()}"
-        turn_start = len(self._context)
         turn_id = await self.db.start_agent_turn(await self.db.latest_context_id())
         turn_status = "failed"
         corrected_private_output = False
@@ -283,7 +367,11 @@ class Agent(ModelLoop):
                     if self._last_output_text and not corrected_private_output:
                         corrected_private_output = True
                         await self._remember(
-                            {"role": "user", "content": PRIVATE_OUTPUT_NUDGE}
+                            {
+                                "type": "message",
+                                "role": "user",
+                                "content": private_output_nudge(self._last_output_text),
+                            }
                         )
                         continue
                     turn_status = "completed"
@@ -298,7 +386,7 @@ class Agent(ModelLoop):
                     turn_status,
                 )
             finally:
-                self._finish_turn(turn_start)
+                self._finish_turn(self._current_output_start())
 
     def _finish_turn(self, start: int) -> None:
         """Prune ephemeral outputs from one settled live-context turn."""
