@@ -46,6 +46,8 @@ CREATE TABLE IF NOT EXISTS messages (
     text                TEXT,
     caption             TEXT,
     reply_to_message_id INTEGER,
+    -- Forum topic id; NULL outside forum topics (incl. the General topic).
+    message_thread_id   INTEGER,
     media_group_id      TEXT,
     outgoing            INTEGER NOT NULL DEFAULT 0,
     raw                 TEXT NOT NULL,
@@ -128,6 +130,19 @@ CREATE INDEX IF NOT EXISTS idx_wakeups_due ON wakeups (done, due_at);
 """
 
 
+def effective_reply_to(message: Message) -> int | None:
+    """Return the real reply target of a message, or ``None``.
+
+    Telegram makes every non-reply message in a forum topic "reply to"
+    the topic-creation service message (backward compatibility); such
+    pseudo-replies are not replies and are reported as ``None``.
+    """
+    reply = message.reply_to_message
+    if reply is None or reply.forum_topic_created is not None:
+        return None
+    return reply.message_id
+
+
 def _dump_context(item: dict) -> str:
     """Serialize context readably, escaping only invalid Unicode."""
     text = json.dumps(item, ensure_ascii=False)
@@ -183,6 +198,28 @@ class Database:
             "api_usage", "input_context_id", "INTEGER NOT NULL DEFAULT 0"
         )
         await self._ensure_column("api_usage", "dream_id", "INTEGER")
+        await self._ensure_column("messages", "message_thread_id", "INTEGER")
+        # Backfill topic ids for rows saved before the column existed, and
+        # strip Telegram's forum pseudo-replies (every non-reply message in
+        # a topic "replies to" the topic-creation service message, which
+        # would pollute reply-chain threads). Both idempotent.
+        await self._conn.execute(
+            """
+            UPDATE messages
+            SET message_thread_id = json_extract(raw, '$.message_thread_id')
+            WHERE message_thread_id IS NULL
+              AND json_extract(raw, '$.is_topic_message') = 1
+            """
+        )
+        await self._conn.execute(
+            """
+            UPDATE messages
+            SET reply_to_message_id = NULL
+            WHERE reply_to_message_id IS NOT NULL
+              AND json_extract(raw, '$.reply_to_message.forum_topic_created')
+                  IS NOT NULL
+            """
+        )
         await self._conn.commit()
 
     async def _ensure_column(
@@ -476,19 +513,35 @@ class Database:
     async def unanswered_chats(self) -> list[dict]:
         """Chats whose latest message is incoming (i.e. awaiting the agent).
 
-        Returns dicts with chat id/type/title, the sender's name and the
-        date of that last message.
+        One row per chat — or per forum topic within a forum chat, so an
+        answered topic cannot mask an unanswered one. Returns dicts with
+        chat id/type/title, the topic id (``NULL`` outside topics), the
+        sender's name and the date of that last message. Forum service
+        messages never count as the awaiting message, so a freshly
+        created topic doesn't nag forever.
         """
         query = """
-            SELECT c.id AS chat_id, c.type, c.title,
+            SELECT c.id AS chat_id, c.type, c.title, m.message_thread_id,
                    u.first_name, u.username, m.date
-            FROM chats c
-            JOIN messages m ON m.rowid = (
-                SELECT rowid FROM messages WHERE chat_id = c.id
-                ORDER BY date DESC, message_id DESC LIMIT 1
-            )
+            FROM messages m
+            JOIN chats c ON c.id = m.chat_id
             LEFT JOIN users u ON u.id = m.from_user_id
             WHERE m.outgoing = 0
+              AND m.content_type NOT IN ('forum_topic_created',
+                                         'forum_topic_edited',
+                                         'forum_topic_closed',
+                                         'forum_topic_reopened')
+              AND NOT EXISTS (
+                  SELECT 1 FROM messages n
+                  WHERE n.chat_id = m.chat_id
+                    AND COALESCE(n.message_thread_id, 0)
+                        = COALESCE(m.message_thread_id, 0)
+                    AND n.content_type NOT IN ('forum_topic_created',
+                                               'forum_topic_edited',
+                                               'forum_topic_closed',
+                                               'forum_topic_reopened')
+                    AND (n.date, n.message_id) > (m.date, m.message_id)
+              )
             ORDER BY m.date
         """
         async with self.conn.execute(query) as cursor:
@@ -497,50 +550,71 @@ class Database:
     #: Message columns returned to the LLM as chat context.
     _MESSAGE_ROW = """
         SELECT m.message_id, m.date, m.outgoing, u.username, u.first_name,
-               m.text, m.caption, m.content_type
+               m.text, m.caption, m.content_type, m.message_thread_id
         FROM messages m LEFT JOIN users u ON u.id = m.from_user_id
     """
 
     async def recent_messages(
-        self, chat_id: int, limit: int, before_message_id: int | None = None
+        self,
+        chat_id: int,
+        limit: int,
+        before_message_id: int | None = None,
+        message_thread_id: int | None = None,
     ) -> list[dict]:
         """Return the latest ``limit`` messages of a chat, oldest first.
 
         Each row is a small dict (id, date, sender, text/caption, content
-        type, outgoing flag) suitable for feeding to the LLM as context.
-        ``before_message_id`` pages into the past: only messages older
-        than it are returned.
+        type, outgoing flag, forum topic id) suitable for feeding to the
+        LLM as context. ``before_message_id`` pages into the past: only
+        messages older than it are returned. ``message_thread_id``
+        restricts the result to one forum topic; ``None`` means the whole
+        chat.
         """
         query = (
             self._MESSAGE_ROW
             + """
             WHERE m.chat_id = ? AND (? IS NULL OR m.message_id < ?)
+              AND (? IS NULL OR m.message_thread_id = ?)
             ORDER BY m.date DESC, m.message_id DESC LIMIT ?
         """
         )
-        params = (chat_id, before_message_id, before_message_id, limit)
+        params = (
+            chat_id,
+            before_message_id,
+            before_message_id,
+            message_thread_id,
+            message_thread_id,
+            limit,
+        )
         async with self.conn.execute(query, params) as cursor:
             rows = list(await cursor.fetchall())
         return [dict(row) for row in reversed(rows)]
 
     async def search_messages(
-        self, chat_id: int, needle: str, limit: int
+        self,
+        chat_id: int,
+        needle: str,
+        limit: int,
+        message_thread_id: int | None = None,
     ) -> list[dict]:
         """Return a chat's messages containing ``needle``, newest first.
 
         Literal substring match over text and caption, case-insensitive
         via Unicode casefold (LIKE would only fold ASCII); rows have the
-        same shape as :meth:`recent_messages`.
+        same shape as :meth:`recent_messages`. ``message_thread_id``
+        restricts the search to one forum topic; ``None`` means the whole
+        chat.
         """
         query = (
             self._MESSAGE_ROW
             + """
             WHERE m.chat_id = ? AND (instr(casefold(m.text), casefold(?))
                                      OR instr(casefold(m.caption), casefold(?)))
+              AND (? IS NULL OR m.message_thread_id = ?)
             ORDER BY m.date DESC, m.message_id DESC LIMIT ?
         """
         )
-        params = (chat_id, needle, needle, limit)
+        params = (chat_id, needle, needle, message_thread_id, message_thread_id, limit)
         async with self.conn.execute(query, params) as cursor:
             return [dict(row) for row in await cursor.fetchall()]
 
@@ -568,7 +642,8 @@ class Database:
                         OR m.reply_to_message_id = t.message_id)
             )
             SELECT m.message_id, m.date, m.outgoing, u.username, u.first_name,
-                   m.text, m.caption, m.content_type, m.reply_to_message_id
+                   m.text, m.caption, m.content_type, m.message_thread_id,
+                   m.reply_to_message_id
             FROM messages m LEFT JOIN users u ON u.id = m.from_user_id
             WHERE m.chat_id = :chat_id
               AND m.message_id IN (SELECT message_id FROM thread)
@@ -579,6 +654,80 @@ class Database:
         async with self.conn.execute(query, params) as cursor:
             rows = list(await cursor.fetchall())
         return [dict(row) for row in reversed(rows)]
+
+    async def topic_name(self, chat_id: int, thread_id: int) -> str | None:
+        """Return the latest known name of a forum topic, or ``None``.
+
+        Three sources, all mined from stored raw payloads: the creation
+        service message (if the bot saw it), rename service messages, and
+        the pseudo-reply payload every non-reply topic message carries
+        (covers topics created before the bot joined). Renames win over
+        the creation-time name that pseudo-replies keep echoing forever;
+        icon-only edits carry no name and are skipped.
+        """
+        query = """
+            SELECT name FROM (
+                SELECT COALESCE(
+                           json_extract(raw, '$.forum_topic_edited.name'),
+                           json_extract(raw, '$.forum_topic_created.name'),
+                           json_extract(
+                               raw, '$.reply_to_message.forum_topic_created.name'
+                           )
+                       ) AS name,
+                       (content_type = 'forum_topic_edited') AS renamed,
+                       date, message_id
+                FROM messages
+                WHERE chat_id = ? AND message_thread_id = ?
+            )
+            WHERE name IS NOT NULL
+            ORDER BY renamed DESC, date DESC, message_id DESC
+            LIMIT 1
+        """
+        async with self.conn.execute(query, (chat_id, thread_id)) as cursor:
+            row = await cursor.fetchone()
+        return row["name"] if row else None
+
+    async def topic_observed(self, chat_id: int, thread_id: int) -> bool:
+        """True when any stored message of the chat belongs to the topic."""
+        query = """
+            SELECT 1 FROM messages
+            WHERE chat_id = ? AND message_thread_id = ? LIMIT 1
+        """
+        async with self.conn.execute(query, (chat_id, thread_id)) as cursor:
+            return await cursor.fetchone() is not None
+
+    async def list_topics(self, chat_id: int) -> list[dict]:
+        """Return the forum topics seen in a chat, most recent first.
+
+        Each row carries the topic id, its latest known name, message
+        count, last activity date and a ``closed`` flag from the newest
+        close/reopen service message. The General topic never appears:
+        its messages carry no topic id.
+        """
+        query = """
+            SELECT m.message_thread_id AS topic_id,
+                   COUNT(*) AS messages,
+                   MAX(m.date) AS last_date,
+                   COALESCE((SELECT e.content_type FROM messages e
+                             WHERE e.chat_id = m.chat_id
+                               AND e.message_thread_id = m.message_thread_id
+                               AND e.content_type IN ('forum_topic_closed',
+                                                      'forum_topic_reopened')
+                             ORDER BY e.date DESC, e.message_id DESC LIMIT 1
+                            ) = 'forum_topic_closed', 0) AS closed
+            FROM messages m
+            WHERE m.chat_id = ? AND m.message_thread_id IS NOT NULL
+            GROUP BY m.message_thread_id
+            ORDER BY last_date DESC
+        """
+        async with self.conn.execute(query, (chat_id,)) as cursor:
+            rows = [dict(row) for row in await cursor.fetchall()]
+        # Topic counts are tiny; a name lookup per row keeps the tricky
+        # name-resolution logic in one place.
+        for row in rows:
+            row["name"] = await self.topic_name(chat_id, row["topic_id"])
+            row["closed"] = bool(row["closed"])
+        return rows
 
     async def list_chats(self) -> list[dict]:
         """Return every known chat with a display name and activity stats.
@@ -714,9 +863,9 @@ class Database:
             """
             INSERT INTO messages (chat_id, message_id, from_user_id, date,
                                   edit_date, content_type, text, caption,
-                                  reply_to_message_id, media_group_id,
-                                  outgoing, raw)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                                  reply_to_message_id, message_thread_id,
+                                  media_group_id, outgoing, raw)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             ON CONFLICT (chat_id, message_id) DO UPDATE SET
                 edit_date = excluded.edit_date,
                 content_type = excluded.content_type,
@@ -738,9 +887,10 @@ class Database:
                 message.content_type,
                 message.text,
                 message.caption,
-                message.reply_to_message.message_id
-                if message.reply_to_message
-                else None,
+                effective_reply_to(message),
+                # Bot API also sets message_thread_id on plain reply chains;
+                # is_topic_message discriminates real forum topics.
+                message.message_thread_id if message.is_topic_message else None,
                 message.media_group_id,
                 int(outgoing),
                 message.model_dump_json(exclude_none=True),

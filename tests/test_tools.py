@@ -44,8 +44,8 @@ class FakeDB:
 
     def __init__(self) -> None:
         """Start with empty call records."""
-        self.recent_calls: list[tuple[int, int, int | None]] = []
-        self.search_calls: list[tuple[int, str, int]] = []
+        self.recent_calls: list[tuple[int, int, int | None, int | None]] = []
+        self.search_calls: list[tuple[int, str, int, int | None]] = []
         self.thread_calls: list[tuple[int, int, int]] = []
         self.wakeups: list[tuple[str, str]] = []
         self.pending: list[dict] = []
@@ -56,20 +56,38 @@ class FakeDB:
         self.stored_rows: set[tuple[int, int]] = set()
         self.deleted: list[tuple[int, int]] = []
         self.outgoing_rows: set[tuple[int, int]] = set()
+        self.topics: list[dict] = []
+        self.observed_topics: set[tuple[int, int]] = set()
 
     async def recent_messages(
-        self, chat_id: int, limit: int, before_message_id: int | None = None
+        self,
+        chat_id: int,
+        limit: int,
+        before_message_id: int | None = None,
+        message_thread_id: int | None = None,
     ) -> list[dict]:
         """Record the query and return no rows."""
-        self.recent_calls.append((chat_id, limit, before_message_id))
+        self.recent_calls.append((chat_id, limit, before_message_id, message_thread_id))
         return []
 
     async def search_messages(
-        self, chat_id: int, needle: str, limit: int
+        self,
+        chat_id: int,
+        needle: str,
+        limit: int,
+        message_thread_id: int | None = None,
     ) -> list[dict]:
         """Record the query and return no rows."""
-        self.search_calls.append((chat_id, needle, limit))
+        self.search_calls.append((chat_id, needle, limit, message_thread_id))
         return []
+
+    async def list_topics(self, chat_id: int) -> list[dict]:
+        """Return the canned topic list."""
+        return self.topics
+
+    async def topic_observed(self, chat_id: int, thread_id: int) -> bool:
+        """Report whether a topic is in the canned observed set."""
+        return (chat_id, thread_id) in self.observed_topics
 
     async def message_thread(
         self, chat_id: int, message_id: int, limit: int
@@ -177,8 +195,8 @@ class RecordingBot:
         self.reactions: list[tuple[int, int, list]] = []
         self.edits: list[dict[str, Any]] = []
         self.deletes: list[tuple[int, int]] = []
-        self.sent_stickers: list[tuple[int, str]] = []
-        self.forwards: list[tuple[int, int, int]] = []
+        self.sent_stickers: list[tuple[int, str, int | None]] = []
+        self.forwards: list[tuple[int, int, int, int | None]] = []
         self.chat_info: Any = None
         self.member_count = 0
         self.admins: list[Any] = []
@@ -209,16 +227,22 @@ class RecordingBot:
         self.deletes.append((chat_id, message_id))
         return True
 
-    async def send_sticker(self, chat_id: int, file_id: str) -> Any:
+    async def send_sticker(
+        self, chat_id: int, file_id: str, message_thread_id: int | None = None
+    ) -> Any:
         """Record the sticker send and return a minimal sent message."""
-        self.sent_stickers.append((chat_id, file_id))
+        self.sent_stickers.append((chat_id, file_id, message_thread_id))
         return SimpleNamespace(message_id=6, chat=SimpleNamespace(id=chat_id))
 
     async def forward_message(
-        self, chat_id: int, from_chat_id: int, message_id: int
+        self,
+        chat_id: int,
+        from_chat_id: int,
+        message_id: int,
+        message_thread_id: int | None = None,
     ) -> Any:
         """Record the forward and return a minimal sent message."""
-        self.forwards.append((chat_id, from_chat_id, message_id))
+        self.forwards.append((chat_id, from_chat_id, message_id, message_thread_id))
         return SimpleNamespace(message_id=9, chat=SimpleNamespace(id=chat_id))
 
     async def get_chat(self, chat_id: int) -> Any:
@@ -297,15 +321,28 @@ async def test_invalid_arguments() -> None:
         "null",
         "[]",
         json.dumps(
-            {"chat_id": "@unguarded", "text": "hi", "reply_to_message_id": None}
+            {
+                "chat_id": "@unguarded",
+                "text": "hi",
+                "reply_to_message_id": None,
+                "message_thread_id": None,
+            }
         ),
-        json.dumps({"chat_id": True, "text": "hi", "reply_to_message_id": None}),
+        json.dumps(
+            {
+                "chat_id": True,
+                "text": "hi",
+                "reply_to_message_id": None,
+                "message_thread_id": None,
+            }
+        ),
         json.dumps({"chat_id": 1, "text": "hi"}),
         json.dumps(
             {
                 "chat_id": 1,
                 "text": "hi",
                 "reply_to_message_id": None,
+                "message_thread_id": None,
                 "extra": "field",
             }
         ),
@@ -334,7 +371,14 @@ async def test_handler_exception_is_wrapped(
 ) -> None:
     """A raising handler is reported as an error, not propagated."""
     monkeypatch.setattr("libertati.tools.typing_delay", lambda text, cps: 0.0)
-    args = json.dumps({"chat_id": 1, "text": "hi", "reply_to_message_id": None})
+    args = json.dumps(
+        {
+            "chat_id": 1,
+            "text": "hi",
+            "reply_to_message_id": None,
+            "message_thread_id": None,
+        }
+    )
     result = await make_toolbox().run("send_message", args)
     assert result == "error: send_message failed"
 
@@ -345,7 +389,14 @@ async def test_send_message_falls_back_to_plain_text(
     """Markdown rejected by Telegram is resent as plain text, not lost."""
     monkeypatch.setattr("libertati.tools.typing_delay", lambda text, cps: 0.0)
     bot = MarkdownRejectingBot()
-    args = json.dumps({"chat_id": 1, "text": "a_b", "reply_to_message_id": None})
+    args = json.dumps(
+        {
+            "chat_id": 1,
+            "text": "a_b",
+            "reply_to_message_id": None,
+            "message_thread_id": None,
+        }
+    )
     result = await make_toolbox(bot=bot).run("send_message", args)
     assert result.startswith("sent message 5 to chat 1")
     assert bot.parse_modes == [ParseMode.MARKDOWN, None]
@@ -362,6 +413,7 @@ async def test_send_message_preserves_username_underscores(
             "chat_id": 1,
             "text": "hi @hermes_keyclicker_bot",
             "reply_to_message_id": None,
+            "message_thread_id": None,
         }
     )
     result = await make_toolbox(bot=bot).run("send_message", args)
@@ -374,7 +426,12 @@ async def test_send_message_preserves_username_underscores(
 async def test_send_message_refuses_unobserved_reply_target() -> None:
     """Replying cannot target a message hidden from local history."""
     bot = RecordingBot()
-    args = {"chat_id": 1, "text": "hi", "reply_to_message_id": 99}
+    args = {
+        "chat_id": 1,
+        "text": "hi",
+        "reply_to_message_id": 99,
+        "message_thread_id": None,
+    }
     result = await make_toolbox(bot=bot).run("send_message", json.dumps(args))
     assert result == "error: message 99 in chat 1 was not observed"
     assert bot.sent_messages == []
@@ -456,10 +513,10 @@ async def test_send_sticker() -> None:
     db = FakeDB()
     db.chats = [{"chat_id": 1}]
     db.known_sticker_ids = {"AAA"}
-    args = {"chat_id": 1, "file_id": "AAA"}
+    args = {"chat_id": 1, "file_id": "AAA", "message_thread_id": None}
     result = await make_toolbox(db=db, bot=bot).run("send_sticker", json.dumps(args))
     assert result == "sent sticker as message 6 to chat 1"
-    assert bot.sent_stickers == [(1, "AAA")]
+    assert bot.sent_stickers == [(1, "AAA", None)]
 
 
 async def test_send_sticker_refuses_unknown_file_id() -> None:
@@ -468,7 +525,8 @@ async def test_send_sticker_refuses_unknown_file_id() -> None:
     db = FakeDB()
     db.chats = [{"chat_id": 1}]
     result = await make_toolbox(db=db, bot=bot).run(
-        "send_sticker", json.dumps({"chat_id": 1, "file_id": "UNKNOWN"})
+        "send_sticker",
+        json.dumps({"chat_id": 1, "file_id": "UNKNOWN", "message_thread_id": None}),
     )
     assert result == "error: sticker was not observed in an approved chat"
     assert bot.sent_stickers == []
@@ -491,19 +549,192 @@ async def test_forward_message() -> None:
     bot = RecordingBot()
     db = FakeDB()
     db.stored_rows = {(1, 42)}
-    args = {"to_chat_id": 2, "from_chat_id": 1, "message_id": 42}
+    args = {
+        "to_chat_id": 2,
+        "from_chat_id": 1,
+        "message_id": 42,
+        "message_thread_id": None,
+    }
     result = await make_toolbox(db=db, bot=bot).run("forward_message", json.dumps(args))
     assert result == "forwarded message 42 from chat 1 to chat 2 as message 9"
-    assert bot.forwards == [(2, 1, 42)]
+    assert bot.forwards == [(2, 1, 42, None)]
 
 
 async def test_forward_message_refuses_unobserved_source_message() -> None:
     """Forwarding cannot retrieve a guessed message id from Telegram."""
     bot = RecordingBot()
-    args = {"to_chat_id": 2, "from_chat_id": 1, "message_id": 42}
+    args = {
+        "to_chat_id": 2,
+        "from_chat_id": 1,
+        "message_id": 42,
+        "message_thread_id": None,
+    }
     result = await make_toolbox(bot=bot).run("forward_message", json.dumps(args))
     assert result == "error: message 42 in chat 1 was not observed"
     assert bot.forwards == []
+
+
+async def test_send_message_passes_topic(monkeypatch: pytest.MonkeyPatch) -> None:
+    """A topic id reaches the bot call and shows in the confirmation."""
+    monkeypatch.setattr("libertati.tools.typing_delay", lambda text, cps: 0.0)
+    bot = RecordingBot()
+    db = FakeDB()
+    db.observed_topics = {(1, 12)}
+    args = {
+        "chat_id": 1,
+        "text": "hi",
+        "reply_to_message_id": None,
+        "message_thread_id": 12,
+    }
+    result = await make_toolbox(db=db, bot=bot).run("send_message", json.dumps(args))
+    assert result.startswith("sent message 5 to chat 1 (topic 12)")
+    (sent,) = bot.sent_messages
+    assert sent["message_thread_id"] == 12
+
+
+async def test_send_message_refuses_unobserved_topic() -> None:
+    """Sending into a topic the bot never saw fails closed."""
+    bot = RecordingBot()
+    args = {
+        "chat_id": 1,
+        "text": "hi",
+        "reply_to_message_id": None,
+        "message_thread_id": 99,
+    }
+    result = await make_toolbox(bot=bot).run("send_message", json.dumps(args))
+    assert result == "error: topic 99 in chat 1 was not observed"
+    assert bot.sent_messages == []
+
+
+async def test_send_sticker_passes_topic() -> None:
+    """A sticker send carries the topic id to the bot call."""
+    bot = RecordingBot()
+    db = FakeDB()
+    db.chats = [{"chat_id": 1}]
+    db.known_sticker_ids = {"AAA"}
+    db.observed_topics = {(1, 12)}
+    args = {"chat_id": 1, "file_id": "AAA", "message_thread_id": 12}
+    result = await make_toolbox(db=db, bot=bot).run("send_sticker", json.dumps(args))
+    assert result == "sent sticker as message 6 to chat 1"
+    assert bot.sent_stickers == [(1, "AAA", 12)]
+
+
+async def test_send_sticker_refuses_unobserved_topic() -> None:
+    """A sticker cannot go into a topic the bot never saw."""
+    bot = RecordingBot()
+    db = FakeDB()
+    db.chats = [{"chat_id": 1}]
+    db.known_sticker_ids = {"AAA"}
+    args = {"chat_id": 1, "file_id": "AAA", "message_thread_id": 99}
+    result = await make_toolbox(db=db, bot=bot).run("send_sticker", json.dumps(args))
+    assert result == "error: topic 99 in chat 1 was not observed"
+    assert bot.sent_stickers == []
+
+
+async def test_forward_message_passes_topic() -> None:
+    """A forward carries the destination-chat topic id to the bot call."""
+    bot = RecordingBot()
+    db = FakeDB()
+    db.stored_rows = {(1, 42)}
+    db.observed_topics = {(2, 12)}
+    args = {
+        "to_chat_id": 2,
+        "from_chat_id": 1,
+        "message_id": 42,
+        "message_thread_id": 12,
+    }
+    result = await make_toolbox(db=db, bot=bot).run("forward_message", json.dumps(args))
+    assert result == "forwarded message 42 from chat 1 to chat 2 as message 9"
+    assert bot.forwards == [(2, 1, 42, 12)]
+
+
+async def test_forward_message_refuses_unobserved_topic() -> None:
+    """The topic pre-check runs against the destination chat."""
+    bot = RecordingBot()
+    db = FakeDB()
+    db.stored_rows = {(1, 42)}
+    # Topic 12 exists in the source chat only.
+    db.observed_topics = {(1, 12)}
+    args = {
+        "to_chat_id": 2,
+        "from_chat_id": 1,
+        "message_id": 42,
+        "message_thread_id": 12,
+    }
+    result = await make_toolbox(db=db, bot=bot).run("forward_message", json.dumps(args))
+    assert result == "error: topic 12 in chat 2 was not observed"
+    assert bot.forwards == []
+
+
+async def test_get_recent_messages_passes_topic_filter() -> None:
+    """The topic filter reaches the database query."""
+    db = FakeDB()
+    args = {
+        "chat_id": 1,
+        "limit": None,
+        "before_message_id": None,
+        "message_thread_id": 12,
+    }
+    await make_toolbox(db=db).run("get_recent_messages", json.dumps(args))
+    assert db.recent_calls == [(1, 20, None, 12)]
+
+
+async def test_search_messages_passes_topic_filter() -> None:
+    """The topic filter reaches the search query."""
+    db = FakeDB()
+    args = {"chat_id": 1, "query": "cat", "limit": None, "message_thread_id": 12}
+    await make_toolbox(db=db).run("search_messages", json.dumps(args))
+    assert db.search_calls == [(1, "cat", 20, 12)]
+
+
+async def test_list_topics() -> None:
+    """Seen topics come back as JSON; a topicless chat says so."""
+    db = FakeDB()
+    toolbox = make_toolbox(db=db)
+    result = await toolbox.run("list_topics", json.dumps({"chat_id": 1}))
+    assert result.startswith("no topics seen in this chat")
+    db.topics = [
+        {
+            "topic_id": 12,
+            "messages": 3,
+            "last_date": "2026-08-02",
+            "closed": False,
+            "name": "Ideas",
+        }
+    ]
+    result = await toolbox.run("list_topics", json.dumps({"chat_id": 1}))
+    assert json.loads(result) == db.topics
+
+
+async def test_list_topics_is_gated(tmp_path: Path) -> None:
+    """An unapproved chat's topics are unreachable."""
+    db = FakeDB()
+    db.topics = [{"topic_id": 12}]
+    toolbox = make_toolbox(
+        db=db, registry=make_approving_registry(tmp_path, approved=100)
+    )
+    result = await toolbox.run("list_topics", json.dumps({"chat_id": 200}))
+    assert result == "error: chat 200 is not approved"
+
+
+async def test_get_chat_info_surfaces_is_forum() -> None:
+    """Forum supergroups report is_forum; other chats omit it."""
+    bot = RecordingBot()
+    bot.chat_info = SimpleNamespace(
+        id=-1001,
+        type="supergroup",
+        title="Hub",
+        first_name=None,
+        last_name=None,
+        username=None,
+        bio=None,
+        description=None,
+        is_forum=True,
+    )
+    result = await make_toolbox(bot=bot).run(
+        "get_chat_info", json.dumps({"chat_id": -1001})
+    )
+    assert json.loads(result)["is_forum"] is True
 
 
 async def test_get_chat_info_private() -> None:
@@ -518,6 +749,7 @@ async def test_get_chat_info_private() -> None:
         username="alice",
         bio="just a cat person",
         description=None,
+        is_forum=None,
     )
     result = await make_toolbox(bot=bot).run(
         "get_chat_info", json.dumps({"chat_id": 100})
@@ -543,6 +775,7 @@ async def test_get_chat_info_group_adds_members_and_admins() -> None:
         username=None,
         bio=None,
         description="the gang",
+        is_forum=None,
     )
     bot.member_count = 5
     bot.admins = [
@@ -629,17 +862,27 @@ async def test_get_recent_messages_clamps_limit() -> None:
     db = FakeDB()
     toolbox = make_toolbox(db=db)
     for limit, expected in ((999, 50), (None, 20), (-5, 1)):
-        args = {"chat_id": 1, "limit": limit, "before_message_id": None}
+        args = {
+            "chat_id": 1,
+            "limit": limit,
+            "before_message_id": None,
+            "message_thread_id": None,
+        }
         await toolbox.run("get_recent_messages", json.dumps(args))
-        assert db.recent_calls[-1] == (1, expected, None)
+        assert db.recent_calls[-1] == (1, expected, None, None)
 
 
 async def test_get_recent_messages_passes_cursor() -> None:
     """The pagination cursor reaches the database query."""
     db = FakeDB()
-    args = {"chat_id": 1, "limit": None, "before_message_id": 42}
+    args = {
+        "chat_id": 1,
+        "limit": None,
+        "before_message_id": 42,
+        "message_thread_id": None,
+    }
     await make_toolbox(db=db).run("get_recent_messages", json.dumps(args))
-    assert db.recent_calls == [(1, 20, 42)]
+    assert db.recent_calls == [(1, 20, 42, None)]
 
 
 async def test_get_message_thread_clamps_limit_and_reports_missing() -> None:
@@ -656,10 +899,10 @@ async def test_get_message_thread_clamps_limit_and_reports_missing() -> None:
 async def test_search_messages_reports_no_matches() -> None:
     """An empty result says so instead of returning bare JSON."""
     db = FakeDB()
-    args = {"chat_id": 1, "query": "cat", "limit": None}
+    args = {"chat_id": 1, "query": "cat", "limit": None, "message_thread_id": None}
     result = await make_toolbox(db=db).run("search_messages", json.dumps(args))
     assert result == "no matches"
-    assert db.search_calls == [(1, "cat", 20)]
+    assert db.search_calls == [(1, "cat", 20, None)]
 
 
 async def test_list_chats() -> None:
@@ -692,11 +935,21 @@ async def test_unapproved_chat_is_refused_before_the_handler(
     toolbox = make_toolbox(
         db=db, bot=bot, registry=make_approving_registry(tmp_path, approved=100)
     )
-    send = {"chat_id": 200, "text": "hi", "reply_to_message_id": None}
+    send = {
+        "chat_id": 200,
+        "text": "hi",
+        "reply_to_message_id": None,
+        "message_thread_id": None,
+    }
     result = await toolbox.run("send_message", json.dumps(send))
     assert result == "error: chat 200 is not approved"
     assert bot.sent_messages == []
-    history = {"chat_id": 200, "limit": None, "before_message_id": None}
+    history = {
+        "chat_id": 200,
+        "limit": None,
+        "before_message_id": None,
+        "message_thread_id": None,
+    }
     result = await toolbox.run("get_recent_messages", json.dumps(history))
     assert result == "error: chat 200 is not approved"
     assert db.recent_calls == []
@@ -710,8 +963,18 @@ async def test_forward_message_gates_both_chats(tmp_path: Path) -> None:
         bot=bot, registry=make_approving_registry(tmp_path, approved=100)
     )
     for args in (
-        {"to_chat_id": 100, "from_chat_id": 200, "message_id": 1},
-        {"to_chat_id": 200, "from_chat_id": 100, "message_id": 1},
+        {
+            "to_chat_id": 100,
+            "from_chat_id": 200,
+            "message_id": 1,
+            "message_thread_id": None,
+        },
+        {
+            "to_chat_id": 200,
+            "from_chat_id": 100,
+            "message_id": 1,
+            "message_thread_id": None,
+        },
     ):
         result = await toolbox.run("forward_message", json.dumps(args))
         assert result == "error: chat 200 is not approved"
@@ -727,7 +990,12 @@ async def test_approved_chat_passes_the_gate(
     toolbox = make_toolbox(
         bot=bot, registry=make_approving_registry(tmp_path, approved=100)
     )
-    send = {"chat_id": 100, "text": "hi", "reply_to_message_id": None}
+    send = {
+        "chat_id": 100,
+        "text": "hi",
+        "reply_to_message_id": None,
+        "message_thread_id": None,
+    }
     result = await toolbox.run("send_message", json.dumps(send))
     assert result.startswith("sent message 5 to chat 100")
 

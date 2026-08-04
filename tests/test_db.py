@@ -142,6 +142,185 @@ async def test_message_thread_unknown_message(db: Database) -> None:
     assert await db.message_thread(100, 999, 10) == []
 
 
+#: The forum supergroup used by topic tests.
+FORUM_CHAT = {"id": -1001, "type": "supergroup", "title": "Hub", "is_forum": True}
+
+
+def topic_creation(thread_id: int, name: str = "Ideas") -> dict[str, Any]:
+    """Build the topic-creation service payload topic messages "reply" to."""
+    return {
+        "message_id": thread_id,
+        "date": STAMP,
+        "chat": FORUM_CHAT,
+        "forum_topic_created": {"name": name, "icon_color": 0x6FB9F0},
+    }
+
+
+def make_topic_message(
+    message_id: int,
+    text: str | None,
+    thread_id: int = 12,
+    date: int = STAMP,
+    **overrides: Any,
+) -> Message:
+    """Build a forum-topic message carrying Telegram's pseudo-reply."""
+    data: dict[str, Any] = {
+        "chat": FORUM_CHAT,
+        "message_thread_id": thread_id,
+        "is_topic_message": True,
+        "reply_to_message": topic_creation(thread_id),
+    }
+    data.update(overrides)
+    return make_message(message_id, text, date=date, **data)
+
+
+def make_topic_service(
+    message_id: int, thread_id: int, date: int = STAMP, **service: Any
+) -> Message:
+    """Build a forum topic service message (created/edited/closed/reopened)."""
+    return make_topic_message(
+        message_id, None, thread_id, date, reply_to_message=None, **service
+    )
+
+
+async def test_save_message_stores_topic_id(db: Database) -> None:
+    """Topic messages store their topic id; plain messages store NULL."""
+    await db.save_message(make_topic_message(43, "in topic"))
+    await db.save_message(make_message(1, "plain", date=STAMP))
+    async with db.conn.execute(
+        "SELECT chat_id, message_id, message_thread_id FROM messages"
+    ) as cursor:
+        rows = {(r[0], r[1]): r[2] for r in await cursor.fetchall()}
+    assert rows[(-1001, 43)] == 12
+    assert rows[(100, 1)] is None
+
+
+async def test_save_message_suppresses_topic_pseudo_reply(db: Database) -> None:
+    """The pseudo-reply is dropped; a real in-topic reply is kept."""
+    await db.save_message(make_topic_message(43, "not a reply"))
+    real_parent = {"message_id": 43, "date": STAMP, "chat": FORUM_CHAT}
+    await db.save_message(
+        make_topic_message(44, "a real reply", reply_to_message=real_parent)
+    )
+    async with db.conn.execute(
+        "SELECT message_id, reply_to_message_id FROM messages"
+    ) as cursor:
+        rows = {row[0]: row[1] for row in await cursor.fetchall()}
+    assert rows[43] is None
+    assert rows[44] == 43
+
+
+async def test_message_thread_ignores_topic_pseudo_replies(db: Database) -> None:
+    """A reply chain inside a topic does not sweep in the whole topic."""
+    await db.save_message(make_topic_message(43, "root"))
+    await db.save_message(make_topic_message(44, "unrelated", date=STAMP + 60))
+    real_parent = {"message_id": 43, "date": STAMP, "chat": FORUM_CHAT}
+    await db.save_message(
+        make_topic_message(45, "reply", date=STAMP + 120, reply_to_message=real_parent)
+    )
+    rows = await db.message_thread(-1001, 45, 10)
+    assert [row["message_id"] for row in rows] == [43, 45]
+
+
+async def test_recent_messages_filters_by_topic(db: Database) -> None:
+    """The topic filter narrows history; rows expose their topic id."""
+    await db.save_message(make_topic_message(43, "in 12"))
+    await db.save_message(
+        make_topic_message(44, "in 13", thread_id=13, date=STAMP + 60)
+    )
+    all_rows = await db.recent_messages(-1001, 10)
+    assert [row["message_id"] for row in all_rows] == [43, 44]
+    assert [row["message_thread_id"] for row in all_rows] == [12, 13]
+    topic_rows = await db.recent_messages(-1001, 10, message_thread_id=12)
+    assert [row["message_id"] for row in topic_rows] == [43]
+
+
+async def test_search_messages_filters_by_topic(db: Database) -> None:
+    """Search restricted to a topic skips matches in other topics."""
+    await db.save_message(make_topic_message(43, "cat here"))
+    await db.save_message(
+        make_topic_message(44, "cat there", thread_id=13, date=STAMP + 60)
+    )
+    rows = await db.search_messages(-1001, "cat", 10, message_thread_id=13)
+    assert [row["message_id"] for row in rows] == [44]
+
+
+async def test_topic_name_prefers_latest_rename(db: Database) -> None:
+    """Renames beat the creation-time name pseudo-replies keep echoing."""
+    await db.save_message(
+        make_topic_service(
+            12, 12, forum_topic_created={"name": "Ideas", "icon_color": 0x6FB9F0}
+        )
+    )
+    await db.save_message(make_topic_message(43, "chat", date=STAMP + 60))
+    assert await db.topic_name(-1001, 12) == "Ideas"
+    await db.save_message(
+        make_topic_service(
+            44, 12, date=STAMP + 120, forum_topic_edited={"name": "Plans"}
+        )
+    )
+    # An icon-only edit carries no name and must not win.
+    await db.save_message(
+        make_topic_service(
+            45, 12, date=STAMP + 180, forum_topic_edited={"icon_custom_emoji_id": "x"}
+        )
+    )
+    assert await db.topic_name(-1001, 12) == "Plans"
+
+
+async def test_topic_name_falls_back_to_pseudo_reply(db: Database) -> None:
+    """A topic created before the bot joined still gets its name."""
+    await db.save_message(make_topic_message(43, "hello", thread_id=13))
+    assert await db.topic_name(-1001, 13) == "Ideas"
+    assert await db.topic_name(-1001, 999) is None
+
+
+async def test_topic_observed(db: Database) -> None:
+    """Only topics with stored messages count as observed."""
+    await db.save_message(make_topic_message(43, "hello"))
+    assert await db.topic_observed(-1001, 12) is True
+    assert await db.topic_observed(-1001, 13) is False
+    assert await db.topic_observed(100, 12) is False
+
+
+async def test_list_topics(db: Database) -> None:
+    """Topics list with name, count, activity order and closed flag."""
+    await db.save_message(make_topic_message(43, "one"))
+    await db.save_message(make_topic_message(44, "two", date=STAMP + 60))
+    await db.save_message(
+        make_topic_message(
+            45,
+            "newer",
+            thread_id=13,
+            date=STAMP + 120,
+            reply_to_message=topic_creation(13, name="Chatter"),
+        )
+    )
+    await db.save_message(
+        make_topic_service(46, 13, date=STAMP + 180, forum_topic_closed={})
+    )
+    await db.save_message(make_message(1, "no topic", date=STAMP))
+    topics = await db.list_topics(-1001)
+    assert [t["topic_id"] for t in topics] == [13, 12]
+    assert [t["name"] for t in topics] == ["Chatter", "Ideas"]
+    assert [t["closed"] for t in topics] == [True, False]
+    assert topics[1]["messages"] == 2
+    assert await db.list_topics(100) == []
+
+
+async def test_list_topics_reopened_clears_closed(db: Database) -> None:
+    """The newest close/reopen service message decides the closed flag."""
+    await db.save_message(make_topic_message(43, "hello"))
+    await db.save_message(
+        make_topic_service(44, 12, date=STAMP + 60, forum_topic_closed={})
+    )
+    await db.save_message(
+        make_topic_service(45, 12, date=STAMP + 120, forum_topic_reopened={})
+    )
+    (topic,) = await db.list_topics(-1001)
+    assert topic["closed"] is False
+
+
 async def test_list_chats(db: Database) -> None:
     """Chats list with a display name (peer's name for private chats)."""
     peer = {"id": 100, "is_bot": False, "first_name": "Alice"}
@@ -232,6 +411,46 @@ async def test_unanswered_chats_same_second_reply_counts(db: Database) -> None:
     await db.save_message(make_message(1, "hi", date=STAMP))
     await db.save_message(make_message(2, "yo", date=STAMP), outgoing=True)
     assert await db.unanswered_chats() == []
+
+
+async def test_unanswered_chats_per_topic(db: Database) -> None:
+    """A bot reply in one topic does not answer another topic."""
+    await db.save_message(make_topic_message(43, "anyone?"))
+    await db.save_message(
+        make_topic_message(44, "sure", thread_id=13, date=STAMP + 60),
+        outgoing=True,
+    )
+    (row,) = await db.unanswered_chats()
+    assert (row["chat_id"], row["message_thread_id"]) == (-1001, 12)
+    await db.save_message(
+        make_topic_message(45, "done", date=STAMP + 120), outgoing=True
+    )
+    assert await db.unanswered_chats() == []
+
+
+async def test_unanswered_chats_ignores_topic_service_messages(db: Database) -> None:
+    """A freshly created, never-used topic does not nag forever."""
+    await db.save_message(
+        make_topic_service(
+            12, 12, forum_topic_created={"name": "Ideas", "icon_color": 0x6FB9F0}
+        )
+    )
+    assert await db.unanswered_chats() == []
+
+
+async def test_topic_service_message_does_not_mask_unanswered_message(
+    db: Database,
+) -> None:
+    """A later topic rename does not count as an answer to a message."""
+    await db.save_message(make_topic_message(43, "anyone?"))
+    await db.save_message(
+        make_topic_service(
+            44, 12, date=STAMP + 60, forum_topic_edited={"name": "Plans"}
+        )
+    )
+
+    (row,) = await db.unanswered_chats()
+    assert (row["chat_id"], row["message_thread_id"]) == (-1001, 12)
 
 
 async def test_wakeup_lifecycle(db: Database) -> None:
@@ -361,6 +580,73 @@ async def test_usage_schema_migrates_existing_table(tmp_path: Path) -> None:
     await database.close()
 
     assert {"turn_id", "input_context_id", "dream_id"} <= columns
+
+
+async def test_messages_schema_migrates_and_backfills(tmp_path: Path) -> None:
+    """Connecting adds the topic column, backfills it and strips pseudo-replies."""
+    path = tmp_path / "old.db"
+    conn = sqlite3.connect(path)
+    conn.executescript(
+        """
+        CREATE TABLE chats (
+            id INTEGER PRIMARY KEY, type TEXT NOT NULL, title TEXT,
+            username TEXT, raw TEXT NOT NULL,
+            first_seen_at TEXT NOT NULL DEFAULT (datetime('now')),
+            last_seen_at TEXT NOT NULL DEFAULT (datetime('now'))
+        );
+        CREATE TABLE messages (
+            chat_id INTEGER NOT NULL REFERENCES chats(id),
+            message_id INTEGER NOT NULL,
+            from_user_id INTEGER,
+            date TEXT NOT NULL,
+            edit_date TEXT,
+            content_type TEXT NOT NULL,
+            text TEXT,
+            caption TEXT,
+            reply_to_message_id INTEGER,
+            media_group_id TEXT,
+            outgoing INTEGER NOT NULL DEFAULT 0,
+            raw TEXT NOT NULL,
+            saved_at TEXT NOT NULL DEFAULT (datetime('now')),
+            PRIMARY KEY (chat_id, message_id)
+        );
+        """
+    )
+    conn.execute("INSERT INTO chats (id, type, raw) VALUES (-1001, 'supergroup', '{}')")
+    topic_raw = json.dumps(
+        {
+            "message_id": 43,
+            "is_topic_message": True,
+            "message_thread_id": 12,
+            "reply_to_message": {
+                "message_id": 12,
+                "forum_topic_created": {"name": "Ideas", "icon_color": 1},
+            },
+        }
+    )
+    conn.execute(
+        "INSERT INTO messages (chat_id, message_id, date, content_type,"
+        " reply_to_message_id, raw) VALUES (-1001, 43, 'd', 'text', 12, ?)",
+        (topic_raw,),
+    )
+    conn.execute(
+        "INSERT INTO messages (chat_id, message_id, date, content_type,"
+        " reply_to_message_id, raw) VALUES (-1001, 44, 'd', 'text', 43,"
+        " '{\"message_id\": 44}')"
+    )
+    conn.commit()
+    conn.close()
+
+    database = Database(path)
+    await database.connect()
+    async with database.conn.execute(
+        "SELECT message_id, message_thread_id, reply_to_message_id FROM messages"
+    ) as cursor:
+        rows = {r[0]: (r[1], r[2]) for r in await cursor.fetchall()}
+    await database.close()
+
+    assert rows[43] == (12, None)
+    assert rows[44] == (None, 43)
 
 
 async def test_dream_ledger_round_trip(db: Database) -> None:
