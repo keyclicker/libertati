@@ -536,6 +536,10 @@ class Database:
                   WHERE n.chat_id = m.chat_id
                     AND COALESCE(n.message_thread_id, 0)
                         = COALESCE(m.message_thread_id, 0)
+                    AND n.content_type NOT IN ('forum_topic_created',
+                                               'forum_topic_edited',
+                                               'forum_topic_closed',
+                                               'forum_topic_reopened')
                     AND (n.date, n.message_id) > (m.date, m.message_id)
               )
             ORDER BY m.date

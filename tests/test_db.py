@@ -438,6 +438,21 @@ async def test_unanswered_chats_ignores_topic_service_messages(db: Database) -> 
     assert await db.unanswered_chats() == []
 
 
+async def test_topic_service_message_does_not_mask_unanswered_message(
+    db: Database,
+) -> None:
+    """A later topic rename does not count as an answer to a message."""
+    await db.save_message(make_topic_message(43, "anyone?"))
+    await db.save_message(
+        make_topic_service(
+            44, 12, date=STAMP + 60, forum_topic_edited={"name": "Plans"}
+        )
+    )
+
+    (row,) = await db.unanswered_chats()
+    assert (row["chat_id"], row["message_thread_id"]) == (-1001, 12)
+
+
 async def test_wakeup_lifecycle(db: Database) -> None:
     """Wakeups appear in due/pending queries until completed."""
     wakeup_id = await db.add_wakeup("2026-08-02 10:00:00", "ping")
