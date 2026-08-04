@@ -282,6 +282,57 @@ async def test_turn_persists_then_prunes_ephemeral_outputs() -> None:
     ]
 
 
+async def test_turn_retries_private_final_output_once() -> None:
+    """A provider mistaking final output for a reply gets one correction."""
+    responses = iter(
+        [
+            SimpleNamespace(
+                id="resp_1",
+                model="gpt-test",
+                output=[FakeOutputItem(MESSAGE)],
+                output_text="This should have been sent",
+                usage=None,
+            ),
+            SimpleNamespace(
+                id="resp_2",
+                model="gpt-test",
+                output=[],
+                output_text="",
+                usage=None,
+            ),
+        ]
+    )
+    calls: list[dict[str, Any]] = []
+
+    async def create(**kwargs: Any) -> Any:
+        calls.append(kwargs)
+        return next(responses)
+
+    db = FakeContextDB()
+    agent = Agent.__new__(Agent)
+    agent.client = cast(Any, SimpleNamespace(responses=SimpleNamespace(create=create)))
+    agent.model = "gpt-test"
+    agent.mind = cast(Any, SimpleNamespace(soul=lambda: "soul"))
+    agent.base_prompt = "base"
+    agent.max_rounds = 3
+    agent.max_context_items = MAX_CONTEXT_ITEMS
+    agent.trim_context_items = TRIM_CONTEXT_ITEMS
+    agent._context = [EVENT]
+    agent._api_tools = []
+    agent.reasoning = {}
+    agent.prune_completed_reasoning = False
+    agent.db = cast(Database, db)
+
+    await agent._turn()
+
+    assert len(calls) == 2
+    assert calls[1]["input"][-1]["role"] == "user"
+    assert "call send_message now" in calls[1]["input"][-1]["content"]
+    assert db.turns == [
+        {"start_context_id": 0, "end_context_id": 2, "status": "completed"}
+    ]
+
+
 async def test_record_usage_maps_all_authoritative_counts() -> None:
     """Response usage fields map into persistent records unchanged."""
     db = FakeContextDB()
