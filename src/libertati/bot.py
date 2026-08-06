@@ -268,7 +268,9 @@ async def on_message(
 
     Everything the event carries counts as read, the skipped older
     messages included: they were deliberately left out, and leaving them
-    unread would quote them into every later event instead.
+    unread would quote them into every later event instead. The cursor
+    is handed to the agent rather than moved here, so it only advances
+    once the event is persisted and the messages really have been shown.
     """
     if not registry.register(message.chat.id, chat_label(message)):
         return
@@ -277,8 +279,10 @@ async def on_message(
     thread_id = event_thread_id(message)
     topic_name = await db.topic_name(message.chat.id, thread_id) if thread_id else None
     context = await event_context(db, message, tz)
-    await agent.push([format_event(message, tz, topic_name=topic_name), *context])
-    await db.mark_messages_read(message.chat.id, message.message_id, thread_id)
+    await agent.push(
+        [format_event(message, tz, topic_name=topic_name), *context],
+        read_mark=(message.chat.id, message.message_id, thread_id),
+    )
 
 
 @router.message_reaction()

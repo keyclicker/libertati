@@ -193,11 +193,19 @@ class FakeAgent:
     def __init__(self) -> None:
         """Start with an empty event list."""
         self.events: list[str] = []
+        self.read_marks: list[tuple[int, int, int | None] | None] = []
 
-    async def push(self, event: str | Sequence[str], *, activity: bool = True) -> None:
+    async def push(
+        self,
+        event: str | Sequence[str],
+        *,
+        activity: bool = True,
+        read_mark: tuple[int, int, int | None] | None = None,
+    ) -> None:
         """Store the event the way the agent joins its lines."""
         lines = [event] if isinstance(event, str) else event
         self.events.append("\n".join(lines))
+        self.read_marks.append(read_mark)
 
 
 def make_group_message(**overrides: Any) -> Message:
@@ -253,7 +261,6 @@ class FakeTopicDB:
         """Store the (chat_id, thread_id) to name mapping."""
         self.names = names or {}
         self.calls: list[tuple[int, int]] = []
-        self.read_marks: list[tuple[int, int, int | None]] = []
 
     async def topic_name(self, chat_id: int, thread_id: int) -> str | None:
         """Return the mapped name, if any."""
@@ -277,15 +284,6 @@ class FakeTopicDB:
     async def message_row(self, chat_id: int, message_id: int) -> dict | None:
         """Report the reply target as unknown."""
         return None
-
-    async def mark_messages_read(
-        self,
-        chat_id: int,
-        message_id: int,
-        message_thread_id: int | None = None,
-    ) -> None:
-        """Record how far the event moved the read cursor."""
-        self.read_marks.append((chat_id, message_id, message_thread_id))
 
 
 def make_reaction(**overrides: Any) -> MessageReactionUpdated:
@@ -395,13 +393,13 @@ async def test_on_message_resolves_topic_name() -> None:
     assert fake_db.calls == [(-1001, 12)]
 
 
-async def test_on_message_marks_what_it_showed_as_read() -> None:
-    """The event delivered the message, so nothing may quote it again."""
+async def test_on_message_hands_the_read_mark_to_the_agent() -> None:
+    """The cursor rides with the event, so a lost event loses no messages."""
     agent = FakeAgent()
     fake_db = FakeTopicDB()
     message = make_topic_message(text="ping @libertati_bot")
     await on_message(message, agent, UTC_TZ, ME, OPEN_REGISTRY, fake_db)  # type: ignore[arg-type]
-    assert fake_db.read_marks == [(-1001, 42, 12)]
+    assert agent.read_marks == [(-1001, 42, 12)]
 
 
 async def test_event_context_carries_what_the_agent_missed(db: Database) -> None:

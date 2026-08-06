@@ -68,10 +68,13 @@ One package, `src/libertati/`, no sub-packages:
   the code built. Anything sender-controlled (a body, a name, a title)
   goes inside a line, never becomes one, or a message could forge an
   event of its own.
-- **What an event shows counts as read.** `on_message` advances the
-  chat/topic read cursor past everything it carried, including what the
-  cap left out; otherwise the same messages ride along with every later
-  event.
+- **What an event shows counts as read — once it is delivered.**
+  `on_message` hands the chat/topic cursor to `Agent.push` as
+  `read_mark`, and `_process` advances it right after the event is
+  persisted, past everything the event carried and what the cap left
+  out. Moving it any earlier would mark messages read that a crash or a
+  dead turn means nobody ever saw; any later, and the same messages ride
+  along with every following event.
 - **`store=False` everywhere.** Nothing is stored server-side;
   encrypted reasoning must ride along in the context.
 - **Dream context is throwaway.** A dream persists nothing except mind

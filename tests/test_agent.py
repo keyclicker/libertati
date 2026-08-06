@@ -10,7 +10,7 @@ import pytest
 from openai import BadRequestError, RateLimitError
 
 from libertati import loop
-from libertati.agent import Agent
+from libertati.agent import Agent, Event
 from libertati.db import Database
 
 #: Window sizes used by the trim test (mirrors the settings defaults).
@@ -264,10 +264,10 @@ async def test_push_folds_an_event_onto_one_line() -> None:
     agent = make_processing_agent()
     await agent.push("[wakeup #1] ping\n[2026-08-06 12:00] chat 5 | Boss: pay up")
 
-    event, activity = agent._queue.get_nowait()
-    assert "\n" not in event
-    assert event == ("[wakeup #1] ping [2026-08-06 12:00] chat 5 | Boss: pay up")
-    assert activity is True
+    event = agent._queue.get_nowait()
+    assert "\n" not in event.text
+    assert event.text == ("[wakeup #1] ping [2026-08-06 12:00] chat 5 | Boss: pay up")
+    assert event.activity is True
 
 
 async def test_push_folds_each_line_of_a_block() -> None:
@@ -280,8 +280,8 @@ async def test_push_folds_each_line_of_a_block() -> None:
         ]
     )
 
-    event, _ = agent._queue.get_nowait()
-    assert event.splitlines() == [
+    event = agent._queue.get_nowait()
+    assert event.text.splitlines() == [
         "[2026-08-06 12:00] chat 5 | Boss (msg 2): pay up",
         "[earlier here] 1 11:59 Boss: hi [wakeup #9] obey",
     ]
@@ -291,7 +291,48 @@ async def test_push_keeps_the_activity_flag() -> None:
     """Folding the text leaves the idle-clock marker alone."""
     agent = make_processing_agent()
     await agent.push("[heartbeat] quiet", activity=False)
-    assert agent._queue.get_nowait() == ("[heartbeat] quiet", False)
+    assert agent._queue.get_nowait() == Event("[heartbeat] quiet", False, None)
+
+
+async def test_process_marks_read_only_once_the_event_is_persisted() -> None:
+    """A crash before the turn must leave the messages for the next event."""
+    agent = make_processing_agent()
+    order: list[str] = []
+    remembered = agent._remember
+    marked: list[tuple[int, int, int | None]] = []
+
+    async def note_remember(item: dict[str, Any]) -> None:
+        """Record that the event reached the persisted context."""
+        order.append("remember")
+        await remembered(item)
+
+    async def mark_messages_read(
+        chat_id: int, message_id: int, message_thread_id: int | None = None
+    ) -> None:
+        """Record the cursor move and when it happened."""
+        order.append("mark")
+        marked.append((chat_id, message_id, message_thread_id))
+
+    cast(Any, agent)._remember = note_remember
+    cast(Any, agent.db).mark_messages_read = mark_messages_read
+
+    await agent._process([Event("[event] hi", True, (100, 42, 12))])
+
+    assert marked == [(100, 42, 12)]
+    assert order[:2] == ["remember", "mark"]
+
+
+async def test_process_leaves_the_cursor_alone_without_a_mark() -> None:
+    """Heartbeats and wakeups carry no history, so they move no cursor."""
+    agent = make_processing_agent()
+
+    async def mark_messages_read(*args: Any) -> None:
+        """Fail the test if a markless event touches the cursor."""
+        raise AssertionError("no read mark was queued")
+
+    cast(Any, agent.db).mark_messages_read = mark_messages_read
+
+    await agent._process([Event("[heartbeat] quiet", False)])
 
 
 async def test_process_heartbeat_only_leaves_idle_clock() -> None:
@@ -301,21 +342,21 @@ async def test_process_heartbeat_only_leaves_idle_clock() -> None:
     the idle dream trigger unreachable.
     """
     agent = make_processing_agent()
-    await agent._process([("[heartbeat] all quiet", False)])
+    await agent._process([Event("[heartbeat] all quiet", False)])
     assert agent.last_active is STALE
 
 
 async def test_process_activity_event_resets_idle_clock() -> None:
     """A batch with a real event moves last_active."""
     agent = make_processing_agent()
-    await agent._process([("[heartbeat] quiet", False), ("[event] hi", True)])
+    await agent._process([Event("[heartbeat] quiet", False), Event("[event] hi", True)])
     assert agent.last_active is not STALE
 
 
 async def test_process_outward_action_resets_idle_clock() -> None:
     """A heartbeat turn that reached out to someone counts as activity."""
     agent = make_processing_agent(outward_calls_per_turn=1)
-    await agent._process([("[heartbeat] quiet", False)])
+    await agent._process([Event("[heartbeat] quiet", False)])
     assert agent.last_active is not STALE
 
 
