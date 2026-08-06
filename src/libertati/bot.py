@@ -29,7 +29,7 @@ from aiogram.types import (
 )
 
 from libertati import clock
-from libertati.agent import Agent
+from libertati.agent import Agent, one_line
 from libertati.chats import ChatRegistry
 from libertati.config import Settings
 from libertati.db import Database, effective_reply_to
@@ -52,11 +52,6 @@ EVENT_TEXT_LIMIT = 1000
 #: heartbeat is appended to the agent's context for good, so an unbounded
 #: digest would grow the prompt with each one; the rest is counted.
 HEARTBEAT_DIGEST_LIMIT = 20
-
-
-def one_line(text: str | None) -> str:
-    """Collapse whitespace runs (newlines included) to single spaces."""
-    return " ".join((text or "").split())
 
 
 class PersistMiddleware(BaseMiddleware):
@@ -88,7 +83,9 @@ def format_event(message: Message, tz: ZoneInfo, topic_name: str | None = None) 
     Strictly one line: every interpolated field is sender-controlled, and
     a body (or name) containing a newline could otherwise forge extra
     event lines — a fake wakeup, a fake message from another chat — and
-    steer the agent. Newlines in the body survive as a literal backslash-n.
+    steer the agent. :meth:`Agent.push` collapses whatever slips through;
+    the body is folded here instead so its newlines survive visibly, as a
+    literal backslash-n, rather than reading as ordinary spaces.
     Forum topic messages name their topic after the chat; the caller
     resolves ``topic_name`` (this function stays sync and DB-free).
     """
