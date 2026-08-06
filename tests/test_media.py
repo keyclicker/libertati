@@ -393,6 +393,23 @@ async def test_nothing_is_started_for_a_message_without_media(
     assert lens._tasks == set()
 
 
+async def test_a_flood_of_media_is_dropped_rather_than_queued(
+    db: Database, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A backlog nobody will read is a bill nobody meant to pay."""
+    monkeypatch.setattr("libertati.media.MAX_PENDING_JOBS", 1)
+    client = FakeClient("a cat", delay=0.05)
+    lens = make_lens(db, tmp_path, client)
+    (lens.media_dir / artifact_name("sticker-uid", ".webp")).write_bytes(b"webp")
+
+    first = lens.start(10, 1, {"sticker": STICKER})
+    second = lens.start(10, 2, {"sticker": STICKER})
+
+    assert first is not None
+    assert second is None
+    await asyncio.gather(*lens._tasks)
+
+
 async def test_a_files_lock_is_forgotten_once_nobody_holds_it(
     db: Database, tmp_path: Path
 ) -> None:

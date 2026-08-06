@@ -64,6 +64,13 @@ FFMPEG_TIMEOUT = 60.0
 #: this bot is expected to live on small hardware.
 CONCURRENT_JOBS = 2
 
+#: Descriptions allowed to be waiting for a slot at once. Two jobs run
+#: while the rest queue, so a group dumping an album a second builds a
+#: backlog nobody will still care about by the time it drains — and one
+#: model call each. Past this, media is left undescribed until the queue
+#: empties; ``look_at_media`` still covers whatever was skipped.
+MAX_PENDING_JOBS = 64
+
 #: Message fields carrying media, in the order a message is inspected.
 #: Documents are deliberately absent: they are arbitrary files, often
 #: large, and rarely worth a model call.
@@ -495,6 +502,14 @@ class MediaLens:
         along with an event as context.
         """
         if media_ref(payload) is None:
+            return None
+        if len(self._tasks) >= MAX_PENDING_JOBS:
+            log.warning(
+                "media backlog full (%d jobs); leaving msg %s in chat %s undescribed",
+                len(self._tasks),
+                message_id,
+                chat_id,
+            )
             return None
         task = asyncio.create_task(self.look(chat_id, message_id, payload))
         self._tasks.add(task)
