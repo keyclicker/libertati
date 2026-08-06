@@ -2,12 +2,11 @@
 
 import asyncio
 import json
-import sqlite3
 import stat
-from pathlib import Path
 from typing import Any
 
 from aiogram.types import Message
+from conftest import fetch_rows
 
 from libertati.db import Database
 
@@ -285,10 +284,10 @@ async def test_save_message_stores_topic_id(db: Database) -> None:
     """Topic messages store their topic id; plain messages store NULL."""
     await db.save_message(make_topic_message(43, "in topic"))
     await db.save_message(make_message(1, "plain", date=STAMP))
-    async with db.conn.execute(
-        "SELECT chat_id, message_id, message_thread_id FROM messages"
-    ) as cursor:
-        rows = {(r[0], r[1]): r[2] for r in await cursor.fetchall()}
+    stored = await fetch_rows(
+        db, "SELECT chat_id, message_id, message_thread_id FROM messages"
+    )
+    rows = {(r["chat_id"], r["message_id"]): r["message_thread_id"] for r in stored}
     assert rows[(-1001, 43)] == 12
     assert rows[(100, 1)] is None
 
@@ -300,10 +299,10 @@ async def test_save_message_suppresses_topic_pseudo_reply(db: Database) -> None:
     await db.save_message(
         make_topic_message(44, "a real reply", reply_to_message=real_parent)
     )
-    async with db.conn.execute(
-        "SELECT message_id, reply_to_message_id FROM messages"
-    ) as cursor:
-        rows = {row[0]: row[1] for row in await cursor.fetchall()}
+    stored = await fetch_rows(
+        db, "SELECT message_id, reply_to_message_id FROM messages"
+    )
+    rows = {r["message_id"]: r["reply_to_message_id"] for r in stored}
     assert rows[43] is None
     assert rows[44] == 43
 
@@ -639,7 +638,8 @@ async def test_api_usage_roundtrip(db: Database) -> None:
         total_tokens=130,
     )
 
-    row = await (await db.conn.execute("SELECT * FROM api_usage")).fetchone()
+    rows = await fetch_rows(db, "SELECT * FROM api_usage")
+    row = rows[0] if rows else None
     assert row is not None
     assert row["response_id"] == "resp_1"
     assert row["turn_id"] == turn_id
@@ -659,9 +659,10 @@ async def test_agent_turn_lifecycle(db: Database) -> None:
     end_context_id = await db.latest_context_id()
     await db.finish_agent_turn(turn_id, end_context_id, "completed")
 
-    row = await (
-        await db.conn.execute("SELECT * FROM agent_turns WHERE id = ?", (turn_id,))
-    ).fetchone()
+    rows = await fetch_rows(
+        db, "SELECT * FROM agent_turns WHERE id = :id", {"id": turn_id}
+    )
+    row = rows[0] if rows else None
     assert row is not None
     assert row["start_context_id"] == start_context_id
     assert row["end_context_id"] == end_context_id
@@ -669,127 +670,18 @@ async def test_agent_turn_lifecycle(db: Database) -> None:
     assert row["finished_at"] is not None
 
 
-async def test_usage_schema_migrates_existing_table(tmp_path: Path) -> None:
-    """Connecting adds context linkage to pre-linkage usage tables."""
-    path = tmp_path / "old.db"
-    conn = sqlite3.connect(path)
-    conn.execute(
-        """CREATE TABLE api_usage (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            response_id TEXT,
-            model TEXT NOT NULL,
-            input_tokens INTEGER NOT NULL,
-            cached_tokens INTEGER NOT NULL,
-            cache_write_tokens INTEGER NOT NULL,
-            output_tokens INTEGER NOT NULL,
-            reasoning_tokens INTEGER NOT NULL,
-            total_tokens INTEGER NOT NULL,
-            created_at TEXT NOT NULL DEFAULT (datetime('now'))
-        )"""
-    )
-    conn.close()
-
-    database = Database(path)
-    await database.connect()
-    columns = {
-        row[1]
-        for row in await (
-            await database.conn.execute("PRAGMA table_info(api_usage)")
-        ).fetchall()
-    }
-    await database.close()
-
-    assert {"turn_id", "input_context_id", "dream_id"} <= columns
-
-
-async def test_messages_schema_migrates_and_backfills(tmp_path: Path) -> None:
-    """Connecting adds the topic column, backfills it and strips pseudo-replies.
-
-    Also pins the ordering the topic index depends on: it names a column
-    the migration adds, so creating it from ``SCHEMA`` would fail to open
-    every database written before that column existed.
-    """
-    path = tmp_path / "old.db"
-    conn = sqlite3.connect(path)
-    conn.executescript(
-        """
-        CREATE TABLE chats (
-            id INTEGER PRIMARY KEY, type TEXT NOT NULL, title TEXT,
-            username TEXT, raw TEXT NOT NULL,
-            first_seen_at TEXT NOT NULL DEFAULT (datetime('now')),
-            last_seen_at TEXT NOT NULL DEFAULT (datetime('now'))
-        );
-        CREATE TABLE messages (
-            chat_id INTEGER NOT NULL REFERENCES chats(id),
-            message_id INTEGER NOT NULL,
-            from_user_id INTEGER,
-            date TEXT NOT NULL,
-            edit_date TEXT,
-            content_type TEXT NOT NULL,
-            text TEXT,
-            caption TEXT,
-            reply_to_message_id INTEGER,
-            media_group_id TEXT,
-            outgoing INTEGER NOT NULL DEFAULT 0,
-            raw TEXT NOT NULL,
-            saved_at TEXT NOT NULL DEFAULT (datetime('now')),
-            PRIMARY KEY (chat_id, message_id)
-        );
-        """
-    )
-    conn.execute("INSERT INTO chats (id, type, raw) VALUES (-1001, 'supergroup', '{}')")
-    topic_raw = json.dumps(
-        {
-            "message_id": 43,
-            "is_topic_message": True,
-            "message_thread_id": 12,
-            "reply_to_message": {
-                "message_id": 12,
-                "forum_topic_created": {"name": "Ideas", "icon_color": 1},
-            },
-        }
-    )
-    conn.execute(
-        "INSERT INTO messages (chat_id, message_id, date, content_type,"
-        " reply_to_message_id, raw) VALUES (-1001, 43, 'd', 'text', 12, ?)",
-        (topic_raw,),
-    )
-    conn.execute(
-        "INSERT INTO messages (chat_id, message_id, date, content_type,"
-        " reply_to_message_id, raw) VALUES (-1001, 44, 'd', 'text', 43,"
-        " '{\"message_id\": 44}')"
-    )
-    conn.commit()
-    conn.close()
-
-    database = Database(path)
-    await database.connect()
-    async with database.conn.execute(
-        "SELECT message_id, message_thread_id, reply_to_message_id FROM messages"
-    ) as cursor:
-        rows = {r[0]: (r[1], r[2]) for r in await cursor.fetchall()}
-    async with database.conn.execute(
-        "SELECT name FROM sqlite_master WHERE type = 'index'"
-    ) as cursor:
-        indexes = {r[0] for r in await cursor.fetchall()}
-    await database.close()
-
-    assert rows[43] == (12, None)
-    assert rows[44] == (None, 43)
-    assert "idx_messages_chat_thread" in indexes
-
-
 async def test_dream_ledger_round_trip(db: Database) -> None:
     """A dream is opened running and closed with its outcome."""
     dream_id = await db.start_dream("idle")
     await db.finish_dream(dream_id, "woke", 14, "talk to Alice about the trip")
 
-    async with db.conn.execute(
-        "SELECT trigger, status, steps, summary, finished_at FROM dreams WHERE id = ?",
-        (dream_id,),
-    ) as cursor:
-        row = await cursor.fetchone()
-
+    rows = await fetch_rows(
+        db,
+        "SELECT trigger, status, steps, summary, finished_at"
+        " FROM dreams WHERE id = :id",
+        {"id": dream_id},
+    )
+    row = rows[0] if rows else None
     assert row is not None
     assert row["trigger"] == "idle"
     assert row["status"] == "woke"
@@ -805,10 +697,7 @@ async def test_dream_context_round_trip(db: Database) -> None:
     await db.append_dream_context(first, {"role": "user", "content": "asleep"})
     await db.append_dream_context(second, {"type": "reasoning"})
 
-    async with db.conn.execute(
-        "SELECT dream_id, item FROM dream_context ORDER BY id"
-    ) as cursor:
-        rows = list(await cursor.fetchall())
+    rows = await fetch_rows(db, "SELECT dream_id, item FROM dream_context ORDER BY id")
 
     assert [row["dream_id"] for row in rows] == [first, second]
     assert json.loads(rows[0]["item"])["content"] == "asleep"
@@ -826,11 +715,10 @@ async def test_start_dream_leaves_other_running_rows_alone(db: Database) -> None
     first = await db.start_dream("idle")
     await db.start_dream("requested")
 
-    async with db.conn.execute(
-        "SELECT status FROM dreams WHERE id = ?", (first,)
-    ) as cursor:
-        row = await cursor.fetchone()
-
+    rows = await fetch_rows(
+        db, "SELECT status FROM dreams WHERE id = :id", {"id": first}
+    )
+    row = rows[0] if rows else None
     assert row is not None
     assert row["status"] == "running"
 

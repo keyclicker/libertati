@@ -9,6 +9,7 @@ from typing import Any, cast
 from zoneinfo import ZoneInfo
 
 import pytest
+from conftest import fetch_rows, run_sql
 
 from libertati.agent import Agent
 from libertati.chats import ChatRegistry
@@ -168,8 +169,7 @@ async def test_dream_runs_a_session_and_wakes_the_agent(
     assert "dream #1 ended" in agent.pushed[0]
     assert "say hi to Bob" in agent.pushed[0]
 
-    async with db.conn.execute("SELECT * FROM dreams") as cursor:
-        rows = list(await cursor.fetchall())
+    rows = await fetch_rows(db, "SELECT * FROM dreams")
     assert [row["status"] for row in rows] == ["woke"]
     assert rows[0]["trigger"] == "idle"
     assert rows[0]["steps"] == 1
@@ -191,8 +191,8 @@ async def test_a_dream_that_dies_on_the_way_in_reports_nothing(
 
     assert "say hi to Bob" not in agent.pushed[1]
     assert "ran out before waking" in agent.pushed[1]
-    async with db.conn.execute("SELECT steps FROM dreams ORDER BY id") as cursor:
-        assert [row["steps"] for row in await cursor.fetchall()] == [1, 0]
+    rows = await fetch_rows(db, "SELECT steps FROM dreams ORDER BY id")
+    assert [row["steps"] for row in rows] == [1, 0]
 
 
 async def test_dream_records_its_own_context_only(db: Database, tmp_path: Path) -> None:
@@ -201,10 +201,7 @@ async def test_dream_records_its_own_context_only(db: Database, tmp_path: Path) 
 
     await dreamer.maybe_dream()
 
-    async with db.conn.execute(
-        "SELECT dream_id, item FROM dream_context ORDER BY id"
-    ) as cursor:
-        rows = list(await cursor.fetchall())
+    rows = await fetch_rows(db, "SELECT dream_id, item FROM dream_context ORDER BY id")
     assert [row["dream_id"] for row in rows] == [1, 1, 1]
     kinds = [json.loads(row["item"]) for row in rows]
     assert "you fall asleep" in kinds[0]["content"]
@@ -212,10 +209,8 @@ async def test_dream_records_its_own_context_only(db: Database, tmp_path: Path) 
     assert kinds[2]["type"] == "function_call_output"
 
     for table in ("context", "agent_turns"):
-        async with db.conn.execute(f"SELECT COUNT(*) FROM {table}") as cursor:
-            row = await cursor.fetchone()
-        assert row is not None
-        assert row[0] == 0, table
+        counted = await fetch_rows(db, f"SELECT COUNT(*) AS n FROM {table}")
+        assert counted[0]["n"] == 0, table
     assert dreamer._context == []
     assert dreamer.dream_id is None
 
@@ -235,8 +230,7 @@ async def test_dream_usage_is_recorded_against_the_dream(
 
     await dreamer.maybe_dream()
 
-    async with db.conn.execute("SELECT * FROM api_usage") as cursor:
-        rows = list(await cursor.fetchall())
+    rows = await fetch_rows(db, "SELECT * FROM api_usage")
     assert len(rows) == 1
     assert rows[0]["dream_id"] == 1
     assert rows[0]["turn_id"] is None
@@ -276,10 +270,10 @@ async def test_dream_carries_habits_and_leaves_the_rewrite_in_its_trace(
 
     assert "## Habits\nkeep it short with Anna" in client.calls[0]["instructions"]
     assert agent.mind.habits() == "answer Bob within the day"
-    async with db.conn.execute(
-        "SELECT item FROM dream_context WHERE dream_id = 1 ORDER BY id"
-    ) as cursor:
-        items = [json.loads(row["item"]) for row in await cursor.fetchall()]
+    trace = await fetch_rows(
+        db, "SELECT item FROM dream_context WHERE dream_id = 1 ORDER BY id"
+    )
+    items = [json.loads(row["item"]) for row in trace]
     written = [
         json.loads(item["arguments"])["text"]
         for item in items
@@ -318,8 +312,8 @@ async def test_max_rounds_ends_the_dream_without_waking(
     await dreamer.maybe_dream()
 
     assert len(client.calls) == 3
-    async with db.conn.execute("SELECT status FROM dreams") as cursor:
-        row = await cursor.fetchone()
+    statuses = await fetch_rows(db, "SELECT status FROM dreams")
+    row = statuses[0] if statuses else None
     assert row is not None
     assert row["status"] == "max_rounds"
     assert "ran out before waking" in agent.pushed[0]
@@ -358,8 +352,8 @@ async def test_a_request_overrides_the_idle_gate(db: Database, tmp_path: Path) -
     assert len(client.calls) == 1
     assert "the trip" in client.calls[0]["input"][0]["content"]
     assert dreamer.gate.requested is False
-    async with db.conn.execute("SELECT trigger FROM dreams") as cursor:
-        row = await cursor.fetchone()
+    triggers = await fetch_rows(db, "SELECT trigger FROM dreams")
+    row = triggers[0] if triggers else None
     assert row is not None
     assert row["trigger"] == "requested"
 
@@ -412,10 +406,8 @@ async def test_no_dream_starts_mid_turn(db: Database, tmp_path: Path) -> None:
     await dreamer.maybe_dream()
 
     assert client.calls == []
-    async with db.conn.execute("SELECT COUNT(*) FROM dreams") as cursor:
-        row = await cursor.fetchone()
-    assert row is not None
-    assert row[0] == 0, "budget was spent on a dream that never started"
+    counted = await fetch_rows(db, "SELECT COUNT(*) AS n FROM dreams")
+    assert counted[0]["n"] == 0, "budget was spent on a dream that never started"
 
     agent.turn_lock.release()
     await dreamer.maybe_dream()
@@ -452,8 +444,8 @@ async def test_a_failing_dream_still_wakes_the_agent(
 
     await dreamer.maybe_dream()
 
-    async with db.conn.execute("SELECT status FROM dreams") as cursor:
-        row = await cursor.fetchone()
+    statuses = await fetch_rows(db, "SELECT status FROM dreams")
+    row = statuses[0] if statuses else None
     assert row is not None
     assert row["status"] == "failed"
     assert len(agent.pushed) == 1
@@ -477,8 +469,7 @@ async def test_budget_left_counts_the_rolling_window(db: Database) -> None:
     await db.start_dream("idle")
     assert await gate.budget_left() == 3
 
-    await db.conn.execute("UPDATE dreams SET started_at = '2020-01-01 00:00:00'")
-    await db.conn.commit()
+    await run_sql(db, "UPDATE dreams SET started_at = '2020-01-01 00:00:00'")
     assert await gate.budget_left() == 4
 
 
@@ -526,4 +517,9 @@ async def test_a_held_lock_stops_the_real_agent_loop(
     agent.turn_lock.release()
     await asyncio.wait_for(took_a_turn.wait(), timeout=2)
     worker.cancel()
+    # Let the cancelled worker unwind while the engine is still alive:
+    # torn down out of order, its connection's graceful close would wait
+    # on a pool the fixture already disposed.
+    with pytest.raises(asyncio.CancelledError):
+        await worker
     assert len(turns) == 1

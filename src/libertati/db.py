@@ -2,167 +2,43 @@
 
 Every message flowing through the bot (incoming and its own replies) is
 stored, along with the full raw Telegram payload for metadata not covered
-by dedicated columns.
+by dedicated columns. Tables are declared in :mod:`libertati.schema`;
+schema creation and upgrades are Alembic's job
+(:func:`libertati.migrations.upgrade_to_head`), run before connecting.
 """
 
 import json
 from datetime import UTC, datetime
 from pathlib import Path
+from typing import Any
 
-import aiosqlite
 from aiogram.types import Chat, Message, User
+from sqlalchemy import Select, delete, desc, event, func, or_, select, update
+from sqlalchemy.dialects.sqlite import insert as sqlite_insert
+from sqlalchemy.ext.asyncio import AsyncEngine, create_async_engine
 
-SCHEMA = """
-CREATE TABLE IF NOT EXISTS users (
-    id            INTEGER PRIMARY KEY,
-    is_bot        INTEGER NOT NULL DEFAULT 0,
-    username      TEXT,
-    first_name    TEXT,
-    last_name     TEXT,
-    language_code TEXT,
-    raw           TEXT NOT NULL,
-    first_seen_at TEXT NOT NULL DEFAULT (datetime('now')),
-    last_seen_at  TEXT NOT NULL DEFAULT (datetime('now'))
-);
+from .schema import (
+    agent_turns,
+    api_usage,
+    chats,
+    context,
+    dream_context,
+    dreams,
+    media_notes,
+    message_read_cursors,
+    messages,
+    steering,
+    users,
+    wakeups,
+)
 
-CREATE TABLE IF NOT EXISTS chats (
-    id            INTEGER PRIMARY KEY,
-    type          TEXT NOT NULL,
-    title         TEXT,
-    username      TEXT,
-    raw           TEXT NOT NULL,
-    first_seen_at TEXT NOT NULL DEFAULT (datetime('now')),
-    last_seen_at  TEXT NOT NULL DEFAULT (datetime('now'))
-);
-
-CREATE TABLE IF NOT EXISTS messages (
-    chat_id             INTEGER NOT NULL REFERENCES chats(id),
-    message_id          INTEGER NOT NULL,
-    from_user_id        INTEGER REFERENCES users(id),
-    -- Full ISO datetime; named "date" for parity with the Telegram API field.
-    date                TEXT NOT NULL,
-    edit_date           TEXT,
-    content_type        TEXT NOT NULL,
-    text                TEXT,
-    caption             TEXT,
-    reply_to_message_id INTEGER,
-    -- Forum topic id; NULL outside forum topics (incl. the General topic).
-    message_thread_id   INTEGER,
-    media_group_id      TEXT,
-    outgoing            INTEGER NOT NULL DEFAULT 0,
-    raw                 TEXT NOT NULL,
-    saved_at            TEXT NOT NULL DEFAULT (datetime('now')),
-    PRIMARY KEY (chat_id, message_id)
-);
-
-CREATE INDEX IF NOT EXISTS idx_messages_chat_date
-    ON messages (chat_id, date);
-CREATE INDEX IF NOT EXISTS idx_messages_from_user
-    ON messages (from_user_id);
-
--- What a media file turned out to depict, in words. Keyed by Telegram's
--- file_unique_id rather than by message: the same sticker or forwarded
--- photo appears in many chats and is worth describing exactly once.
-CREATE TABLE IF NOT EXISTS media_notes (
-    file_unique_id TEXT PRIMARY KEY,
-    kind           TEXT NOT NULL,
-    note           TEXT NOT NULL,
-    model          TEXT NOT NULL,
-    created_at     TEXT NOT NULL DEFAULT (datetime('now'))
-);
-
--- Last message exposed through get_recent_messages, per chat/topic.  Zero
--- represents a whole-chat cursor; Telegram topic ids are positive.
-CREATE TABLE IF NOT EXISTS message_read_cursors (
-    chat_id           INTEGER NOT NULL REFERENCES chats(id),
-    message_thread_id INTEGER NOT NULL DEFAULT 0,
-    message_id        INTEGER NOT NULL,
-    PRIMARY KEY (chat_id, message_thread_id)
-);
-
-CREATE TABLE IF NOT EXISTS context (
-    id         INTEGER PRIMARY KEY AUTOINCREMENT,
-    item       TEXT NOT NULL,
-    created_at TEXT NOT NULL DEFAULT (datetime('now'))
-);
-
-CREATE TABLE IF NOT EXISTS agent_turns (
-    id               INTEGER PRIMARY KEY AUTOINCREMENT,
-    start_context_id INTEGER NOT NULL,
-    end_context_id   INTEGER,
-    status           TEXT NOT NULL DEFAULT 'running',
-    started_at       TEXT NOT NULL DEFAULT (datetime('now')),
-    finished_at      TEXT
-);
-
-CREATE TABLE IF NOT EXISTS api_usage (
-    id                 INTEGER PRIMARY KEY AUTOINCREMENT,
-    response_id        TEXT,
-    turn_id            INTEGER,
-    dream_id           INTEGER,
-    input_context_id   INTEGER NOT NULL DEFAULT 0,
-    model              TEXT NOT NULL,
-    input_tokens       INTEGER NOT NULL,
-    cached_tokens      INTEGER NOT NULL,
-    cache_write_tokens INTEGER NOT NULL,
-    output_tokens      INTEGER NOT NULL,
-    reasoning_tokens   INTEGER NOT NULL,
-    total_tokens       INTEGER NOT NULL,
-    created_at         TEXT NOT NULL DEFAULT (datetime('now'))
-);
-
--- One row per dream: its budget has to survive restarts, and a dream
--- that dies before writing its journal entry still has to count against
--- that budget.
-CREATE TABLE IF NOT EXISTS dreams (
-    id          INTEGER PRIMARY KEY AUTOINCREMENT,
-    trigger     TEXT NOT NULL,
-    status      TEXT NOT NULL DEFAULT 'running',
-    steps       INTEGER NOT NULL DEFAULT 0,
-    summary     TEXT,
-    started_at  TEXT NOT NULL DEFAULT (datetime('now')),
-    finished_at TEXT
-);
-
-CREATE INDEX IF NOT EXISTS idx_dreams_started ON dreams (started_at);
-
--- A dream's context, kept apart from the waking one: it is written for
--- inspection only and never read back, so nothing here can leak into
--- what the waking agent is sent.
-CREATE TABLE IF NOT EXISTS dream_context (
-    id         INTEGER PRIMARY KEY AUTOINCREMENT,
-    dream_id   INTEGER NOT NULL REFERENCES dreams(id),
-    item       TEXT NOT NULL,
-    created_at TEXT NOT NULL DEFAULT (datetime('now'))
-);
-
-CREATE INDEX IF NOT EXISTS idx_dream_context_dream ON dream_context (dream_id, id);
-
-CREATE TABLE IF NOT EXISTS wakeups (
-    id         INTEGER PRIMARY KEY AUTOINCREMENT,
-    due_at     TEXT NOT NULL,
-    note       TEXT NOT NULL,
-    done       INTEGER NOT NULL DEFAULT 0,
-    created_at TEXT NOT NULL DEFAULT (datetime('now'))
-);
-
-CREATE INDEX IF NOT EXISTS idx_wakeups_due ON wakeups (done, due_at);
-
--- Instructions typed at the operator console (the spy TUI) and waiting
--- to be handed to the agent as events. The console is a separate
--- process that shares nothing with the bot but this file, so the table
--- is the channel; ``urgent`` picks between waiting for the running turn
--- to end and landing between its rounds.
-CREATE TABLE IF NOT EXISTS steering (
-    id         INTEGER PRIMARY KEY AUTOINCREMENT,
-    text       TEXT NOT NULL,
-    urgent     INTEGER NOT NULL DEFAULT 0,
-    done       INTEGER NOT NULL DEFAULT 0,
-    created_at TEXT NOT NULL DEFAULT (datetime('now'))
-);
-
-CREATE INDEX IF NOT EXISTS idx_steering_pending ON steering (done, id);
-"""
+#: Forum housekeeping messages, which nobody is waiting on an answer to.
+_FORUM_SERVICE_TYPES = (
+    "forum_topic_created",
+    "forum_topic_edited",
+    "forum_topic_closed",
+    "forum_topic_reopened",
+)
 
 
 def effective_reply_to(message: Message) -> int | None:
@@ -188,181 +64,186 @@ def _dump_context(item: dict) -> str:
     return text
 
 
+def _configure_connection(dbapi_connection: Any, _record: Any) -> None:
+    """Set per-connection pragmas and register the casefold function.
+
+    Runs for every connection the pool opens: pragmas and custom SQL
+    functions are per-connection state, not per-engine.
+    """
+    # SQLite's own LIKE/NOCASE are case-insensitive for ASCII only;
+    # message search needs real Unicode folding (Cyrillic etc.).
+    dbapi_connection.create_function(
+        "casefold",
+        1,
+        lambda text: text.casefold() if text else "",
+        deterministic=True,
+    )
+    cursor = dbapi_connection.cursor()
+    cursor.execute("PRAGMA journal_mode = WAL")
+    cursor.execute("PRAGMA foreign_keys = ON")
+    # Pooled connections write concurrently, so a briefly locked
+    # database is normal; wait it out instead of failing.
+    cursor.execute("PRAGMA busy_timeout = 5000")
+    cursor.close()
+
+
+def _message_select() -> Select:
+    """Message columns returned to the LLM as chat context.
+
+    The media note rides along so a picture reads as what it depicts
+    wherever a transcript is rendered, instead of as a bare ``<photo>``.
+    """
+    return select(
+        messages.c.message_id,
+        messages.c.date,
+        messages.c.outgoing,
+        users.c.username,
+        users.c.first_name,
+        messages.c.text,
+        messages.c.caption,
+        messages.c.content_type,
+        messages.c.message_thread_id,
+        messages.c.reply_to_message_id,
+        media_notes.c.note.label("media_note"),
+    ).select_from(
+        messages.outerjoin(users, users.c.id == messages.c.from_user_id).outerjoin(
+            media_notes, media_notes.c.file_unique_id == messages.c.media_uid
+        )
+    )
+
+
+def _read_cursor(chat_id: int, thread_key: int):
+    """Newest message of a chat/topic the agent has already been shown.
+
+    A topic honours the whole-chat cursor too — a chat-wide history
+    read exposed that topic's older messages just the same.
+    """
+    return (
+        select(func.coalesce(func.max(message_read_cursors.c.message_id), 0))
+        .where(
+            message_read_cursors.c.chat_id == chat_id,
+            message_read_cursors.c.message_thread_id.in_((0, thread_key)),
+        )
+        .scalar_subquery()
+    )
+
+
 class Database:
     """Async wrapper around the bot's SQLite database.
 
-    Owns a single :mod:`aiosqlite` connection; call :meth:`connect` before
-    use and :meth:`close` on shutdown.
+    Owns an async engine over a small connection pool; call
+    :meth:`connect` before use and :meth:`close` on shutdown. Every
+    method is one unit of work — a single transaction for writes, a
+    single pooled connection for reads — and rows come back as plain
+    dicts.
     """
 
     def __init__(self, path: Path) -> None:
         """Remember the database file location; no I/O happens here."""
         self.path = path
-        self._conn: aiosqlite.Connection | None = None
+        self._engine: AsyncEngine | None = None
 
     @property
-    def conn(self) -> aiosqlite.Connection:
-        """Return the live connection, or raise if not connected yet."""
-        if self._conn is None:
+    def engine(self) -> AsyncEngine:
+        """Return the live engine, or raise if not connected yet."""
+        if self._engine is None:
             raise RuntimeError("database is not connected")
-        return self._conn
+        return self._engine
 
     async def connect(self) -> None:
-        """Open the database, enable WAL and foreign keys, create schema."""
+        """Open the engine and prove the database file is reachable."""
         self.path.parent.mkdir(parents=True, exist_ok=True)
-        self._conn = await aiosqlite.connect(self.path)
+        self._engine = create_async_engine(f"sqlite+aiosqlite:///{self.path}")
+        event.listen(self._engine.sync_engine, "connect", _configure_connection)
+        # Open one connection now so a bad path fails here, not on the
+        # first query, and so the file exists before it is chmodded.
+        async with self._engine.connect():
+            pass
         # Full message payloads and model context are private even on a
         # multi-user host; do not leave the database world-readable.
         self.path.chmod(0o600)
-        self._conn.row_factory = aiosqlite.Row
-        await self._conn.execute("PRAGMA journal_mode = WAL")
-        await self._conn.execute("PRAGMA foreign_keys = ON")
-        # SQLite's own LIKE/NOCASE are case-insensitive for ASCII only;
-        # message search needs real Unicode folding (Cyrillic etc.).
-        await self._conn.create_function(
-            "casefold",
-            1,
-            lambda text: text.casefold() if text else "",
-            deterministic=True,
-        )
-        await self._conn.executescript(SCHEMA)
-        # ``CREATE TABLE IF NOT EXISTS`` does not add columns to DBs
-        # created before usage snapshots gained context linkage.
-        await self._ensure_column("api_usage", "turn_id", "INTEGER")
-        await self._ensure_column(
-            "api_usage", "input_context_id", "INTEGER NOT NULL DEFAULT 0"
-        )
-        await self._ensure_column("api_usage", "dream_id", "INTEGER")
-        await self._ensure_column("messages", "message_thread_id", "INTEGER")
-        # Filled when a message's media is described, not when it is
-        # saved: it is the join key to media_notes, and a message whose
-        # file nobody has looked at has no note to join to.
-        await self._ensure_column("messages", "media_uid", "TEXT")
-        # Backfill topic ids for rows saved before the column existed, and
-        # strip Telegram's forum pseudo-replies (every non-reply message in
-        # a topic "replies to" the topic-creation service message, which
-        # would pollute reply-chain threads). Both idempotent.
-        await self._conn.execute(
-            """
-            UPDATE messages
-            SET message_thread_id = json_extract(raw, '$.message_thread_id')
-            WHERE message_thread_id IS NULL
-              AND json_extract(raw, '$.is_topic_message') = 1
-            """
-        )
-        await self._conn.execute(
-            """
-            UPDATE messages
-            SET reply_to_message_id = NULL
-            WHERE reply_to_message_id IS NOT NULL
-              AND json_extract(raw, '$.reply_to_message.forum_topic_created')
-                  IS NOT NULL
-            """
-        )
-        # Indexed here rather than in SCHEMA: that runs before the column
-        # exists, so an older database would fail to open. Covers the
-        # per-topic lookups (topic_observed, topic_name, list_topics,
-        # topic-scoped history), which otherwise walk a chat by date.
-        await self._conn.execute(
-            """
-            CREATE INDEX IF NOT EXISTS idx_messages_chat_thread
-                ON messages (chat_id, message_thread_id, date)
-            """
-        )
-        await self._conn.commit()
-
-    async def _ensure_column(
-        self,
-        table: str,
-        column: str,
-        definition: str,
-    ) -> None:
-        """Add one trusted schema column when an older DB lacks it."""
-        async with self.conn.execute(f"PRAGMA table_info({table})") as cursor:
-            columns = {row[1] for row in await cursor.fetchall()}
-        if column not in columns:
-            await self.conn.execute(
-                f"ALTER TABLE {table} ADD COLUMN {column} {definition}"
-            )
 
     async def close(self) -> None:
-        """Close the connection; safe to call when already closed."""
-        if self._conn is not None:
-            await self._conn.close()
-            self._conn = None
+        """Dispose the engine; safe to call when already closed."""
+        if self._engine is not None:
+            await self._engine.dispose()
+            self._engine = None
+
+    @staticmethod
+    def _user_upsert(user: User):
+        """Build the insert-or-refresh statement for one user row."""
+        stmt = sqlite_insert(users).values(
+            id=user.id,
+            is_bot=int(user.is_bot),
+            username=user.username,
+            first_name=user.first_name,
+            last_name=user.last_name,
+            language_code=user.language_code,
+            raw=user.model_dump_json(exclude_none=True),
+        )
+        return stmt.on_conflict_do_update(
+            index_elements=[users.c.id],
+            set_={
+                "is_bot": stmt.excluded.is_bot,
+                "username": stmt.excluded.username,
+                "first_name": stmt.excluded.first_name,
+                "last_name": stmt.excluded.last_name,
+                "language_code": stmt.excluded.language_code,
+                "raw": stmt.excluded.raw,
+                "last_seen_at": func.datetime("now"),
+            },
+        )
+
+    @staticmethod
+    def _chat_upsert(chat: Chat):
+        """Build the insert-or-refresh statement for one chat row."""
+        stmt = sqlite_insert(chats).values(
+            id=chat.id,
+            type=chat.type,
+            title=chat.title,
+            username=chat.username,
+            raw=chat.model_dump_json(exclude_none=True),
+        )
+        return stmt.on_conflict_do_update(
+            index_elements=[chats.c.id],
+            set_={
+                "type": stmt.excluded.type,
+                "title": stmt.excluded.title,
+                "username": stmt.excluded.username,
+                "raw": stmt.excluded.raw,
+                "last_seen_at": func.datetime("now"),
+            },
+        )
 
     async def upsert_user(self, user: User) -> None:
         """Insert or refresh a user row, bumping ``last_seen_at``."""
-        await self.conn.execute(
-            """
-            INSERT INTO users (id, is_bot, username, first_name, last_name,
-                               language_code, raw)
-            VALUES (?, ?, ?, ?, ?, ?, ?)
-            ON CONFLICT (id) DO UPDATE SET
-                is_bot = excluded.is_bot,
-                username = excluded.username,
-                first_name = excluded.first_name,
-                last_name = excluded.last_name,
-                language_code = excluded.language_code,
-                raw = excluded.raw,
-                last_seen_at = datetime('now')
-            """,
-            (
-                user.id,
-                int(user.is_bot),
-                user.username,
-                user.first_name,
-                user.last_name,
-                user.language_code,
-                user.model_dump_json(exclude_none=True),
-            ),
-        )
+        async with self.engine.begin() as conn:
+            await conn.execute(self._user_upsert(user))
 
     async def upsert_chat(self, chat: Chat) -> None:
         """Insert or refresh a chat row, bumping ``last_seen_at``."""
-        await self.conn.execute(
-            """
-            INSERT INTO chats (id, type, title, username, raw)
-            VALUES (?, ?, ?, ?, ?)
-            ON CONFLICT (id) DO UPDATE SET
-                type = excluded.type,
-                title = excluded.title,
-                username = excluded.username,
-                raw = excluded.raw,
-                last_seen_at = datetime('now')
-            """,
-            (
-                chat.id,
-                chat.type,
-                chat.title,
-                chat.username,
-                chat.model_dump_json(exclude_none=True),
-            ),
-        )
+        async with self.engine.begin() as conn:
+            await conn.execute(self._chat_upsert(chat))
 
     async def append_context(self, item: dict) -> None:
         """Append one agent context item (as JSON) to the full history."""
-        await self.conn.execute(
-            "INSERT INTO context (item) VALUES (?)",
-            (_dump_context(item),),
-        )
-        await self.conn.commit()
+        async with self.engine.begin() as conn:
+            await conn.execute(context.insert().values(item=_dump_context(item)))
 
     async def latest_context_id(self) -> int:
         """Return newest persisted context id, or zero when empty."""
-        async with self.conn.execute(
-            "SELECT COALESCE(MAX(id), 0) FROM context"
-        ) as cursor:
-            row = await cursor.fetchone()
-        return int(row[0]) if row else 0
+        stmt = select(func.coalesce(func.max(context.c.id), 0))
+        async with self.engine.connect() as conn:
+            return int((await conn.execute(stmt)).scalar_one())
 
     async def append_dream_context(self, dream_id: int, item: dict) -> None:
         """Append one dreaming context item (as JSON) to a dream's trace."""
-        await self.conn.execute(
-            "INSERT INTO dream_context (dream_id, item) VALUES (?, ?)",
-            (dream_id, _dump_context(item)),
-        )
-        await self.conn.commit()
+        async with self.engine.begin() as conn:
+            await conn.execute(
+                dream_context.insert().values(
+                    dream_id=dream_id, item=_dump_context(item)
+                )
+            )
 
     async def latest_dream_context_id(self) -> int:
         """Return newest persisted dreaming context id, or zero when empty.
@@ -370,27 +251,24 @@ class Database:
         Deliberately not scoped to one dream: ids are monotonic, so an
         ``id > anchor`` comparison within a single dream holds either way.
         """
-        async with self.conn.execute(
-            "SELECT COALESCE(MAX(id), 0) FROM dream_context"
-        ) as cursor:
-            row = await cursor.fetchone()
-        return int(row[0]) if row else 0
+        stmt = select(func.coalesce(func.max(dream_context.c.id), 0))
+        async with self.engine.connect() as conn:
+            return int((await conn.execute(stmt)).scalar_one())
 
     async def start_agent_turn(self, start_context_id: int) -> int:
         """Open a turn and mark any crash-left turn interrupted."""
-        await self.conn.execute(
-            """
-            UPDATE agent_turns
-            SET status = 'interrupted', finished_at = datetime('now')
-            WHERE status = 'running'
-            """
-        )
-        cursor = await self.conn.execute(
-            "INSERT INTO agent_turns (start_context_id) VALUES (?)",
-            (start_context_id,),
-        )
-        await self.conn.commit()
-        return cursor.lastrowid or 0
+        async with self.engine.begin() as conn:
+            await conn.execute(
+                update(agent_turns)
+                .where(agent_turns.c.status == "running")
+                .values(status="interrupted", finished_at=func.datetime("now"))
+            )
+            result = await conn.execute(
+                agent_turns.insert()
+                .values(start_context_id=start_context_id)
+                .returning(agent_turns.c.id)
+            )
+            return int(result.scalar_one())
 
     async def finish_agent_turn(
         self,
@@ -399,15 +277,16 @@ class Database:
         status: str,
     ) -> None:
         """Close a turn with its final context id and outcome."""
-        await self.conn.execute(
-            """
-            UPDATE agent_turns
-            SET end_context_id = ?, status = ?, finished_at = datetime('now')
-            WHERE id = ?
-            """,
-            (end_context_id, status, turn_id),
-        )
-        await self.conn.commit()
+        async with self.engine.begin() as conn:
+            await conn.execute(
+                update(agent_turns)
+                .where(agent_turns.c.id == turn_id)
+                .values(
+                    end_context_id=end_context_id,
+                    status=status,
+                    finished_at=func.datetime("now"),
+                )
+            )
 
     async def load_context(
         self,
@@ -415,20 +294,14 @@ class Database:
         exclude_types: tuple[str, ...] = (),
     ) -> list[dict]:
         """Return newest eligible context items, oldest first."""
-        query = "SELECT item FROM context"
-        params: list[object] = []
+        stmt = select(context.c.item)
         if exclude_types:
-            placeholders = ", ".join("?" for _ in exclude_types)
-            query += (
-                " WHERE COALESCE(json_extract(item, '$.type'), '')"
-                f" NOT IN ({placeholders})"
-            )
-            params.extend(exclude_types)
-        query += " ORDER BY id DESC LIMIT ?"
-        params.append(limit)
-        async with self.conn.execute(query, params) as cursor:
-            rows = list(await cursor.fetchall())
-        return [json.loads(row["item"]) for row in reversed(rows)]
+            item_type = func.coalesce(func.json_extract(context.c.item, "$.type"), "")
+            stmt = stmt.where(item_type.not_in(exclude_types))
+        stmt = stmt.order_by(context.c.id.desc()).limit(limit)
+        async with self.engine.connect() as conn:
+            rows = (await conn.execute(stmt)).scalars().all()
+        return [json.loads(item) for item in reversed(rows)]
 
     async def append_api_usage(
         self,
@@ -450,29 +323,22 @@ class Database:
         Exactly one of ``turn_id`` and ``dream_id`` is set: the row
         belongs either to a waking turn or to a dream.
         """
-        await self.conn.execute(
-            """
-            INSERT INTO api_usage (
-                response_id, turn_id, dream_id, input_context_id, model,
-                input_tokens, cached_tokens, cache_write_tokens,
-                output_tokens, reasoning_tokens, total_tokens
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-            """,
-            (
-                response_id,
-                turn_id,
-                dream_id,
-                input_context_id,
-                model,
-                input_tokens,
-                cached_tokens,
-                cache_write_tokens,
-                output_tokens,
-                reasoning_tokens,
-                total_tokens,
-            ),
-        )
-        await self.conn.commit()
+        async with self.engine.begin() as conn:
+            await conn.execute(
+                api_usage.insert().values(
+                    response_id=response_id,
+                    turn_id=turn_id,
+                    dream_id=dream_id,
+                    input_context_id=input_context_id,
+                    model=model,
+                    input_tokens=input_tokens,
+                    cached_tokens=cached_tokens,
+                    cache_write_tokens=cache_write_tokens,
+                    output_tokens=output_tokens,
+                    reasoning_tokens=reasoning_tokens,
+                    total_tokens=total_tokens,
+                )
+            )
 
     async def start_dream(self, trigger: str) -> int:
         """Open a dream record and return its id.
@@ -482,11 +348,11 @@ class Database:
         concurrently, and a stale row only ever costs one dream of
         budget.
         """
-        cursor = await self.conn.execute(
-            "INSERT INTO dreams (trigger) VALUES (?)", (trigger,)
-        )
-        await self.conn.commit()
-        return cursor.lastrowid or 0
+        async with self.engine.begin() as conn:
+            result = await conn.execute(
+                dreams.insert().values(trigger=trigger).returning(dreams.c.id)
+            )
+            return int(result.scalar_one())
 
     async def finish_dream(
         self,
@@ -496,79 +362,90 @@ class Database:
         summary: str,
     ) -> None:
         """Close a dream with its outcome, tool-call count and summary."""
-        await self.conn.execute(
-            """
-            UPDATE dreams
-            SET status = ?, steps = ?, summary = ?, finished_at = datetime('now')
-            WHERE id = ?
-            """,
-            (status, steps, summary, dream_id),
-        )
-        await self.conn.commit()
+        async with self.engine.begin() as conn:
+            await conn.execute(
+                update(dreams)
+                .where(dreams.c.id == dream_id)
+                .values(
+                    status=status,
+                    steps=steps,
+                    summary=summary,
+                    finished_at=func.datetime("now"),
+                )
+            )
 
     async def dreams_since(self, since: str) -> int:
         """Count dreams started at or after a UTC stamp."""
-        async with self.conn.execute(
-            "SELECT COUNT(*) FROM dreams WHERE started_at >= ?", (since,)
-        ) as cursor:
-            row = await cursor.fetchone()
-        return int(row[0]) if row else 0
+        stmt = (
+            select(func.count()).select_from(dreams).where(dreams.c.started_at >= since)
+        )
+        async with self.engine.connect() as conn:
+            return int((await conn.execute(stmt)).scalar_one())
 
     async def last_dream_end(self) -> str | None:
         """Return the UTC stamp of the last finished dream, if any."""
-        async with self.conn.execute("SELECT MAX(finished_at) FROM dreams") as cursor:
-            row = await cursor.fetchone()
-        return row[0] if row else None
+        stmt = select(func.max(dreams.c.finished_at))
+        async with self.engine.connect() as conn:
+            return (await conn.execute(stmt)).scalar_one()
 
     async def add_wakeup(self, due_at: str, note: str) -> int:
         """Store a scheduled wakeup (``due_at`` as UTC stamp); return its id."""
-        cursor = await self.conn.execute(
-            "INSERT INTO wakeups (due_at, note) VALUES (?, ?)", (due_at, note)
-        )
-        await self.conn.commit()
-        return cursor.lastrowid or 0
+        async with self.engine.begin() as conn:
+            result = await conn.execute(
+                wakeups.insert()
+                .values(due_at=due_at, note=note)
+                .returning(wakeups.c.id)
+            )
+            return int(result.scalar_one())
 
-    async def due_wakeups(self, now: str) -> list[aiosqlite.Row]:
+    async def due_wakeups(self, now: str) -> list[dict]:
         """Return id/due_at/note rows of undone wakeups due by ``now`` (UTC)."""
-        async with self.conn.execute(
-            "SELECT id, due_at, note FROM wakeups"
-            " WHERE done = 0 AND due_at <= ? ORDER BY due_at",
-            (now,),
-        ) as cursor:
-            return list(await cursor.fetchall())
+        stmt = (
+            select(wakeups.c.id, wakeups.c.due_at, wakeups.c.note)
+            .where(wakeups.c.done == 0, wakeups.c.due_at <= now)
+            .order_by(wakeups.c.due_at)
+        )
+        async with self.engine.connect() as conn:
+            return [dict(row) for row in (await conn.execute(stmt)).mappings()]
 
-    async def pending_wakeups(self) -> list[aiosqlite.Row]:
+    async def pending_wakeups(self) -> list[dict]:
         """Return id/due_at/note rows of all undone wakeups, soonest first."""
-        async with self.conn.execute(
-            "SELECT id, due_at, note FROM wakeups WHERE done = 0 ORDER BY due_at"
-        ) as cursor:
-            return list(await cursor.fetchall())
+        stmt = (
+            select(wakeups.c.id, wakeups.c.due_at, wakeups.c.note)
+            .where(wakeups.c.done == 0)
+            .order_by(wakeups.c.due_at)
+        )
+        async with self.engine.connect() as conn:
+            return [dict(row) for row in (await conn.execute(stmt)).mappings()]
 
     async def complete_wakeup(self, wakeup_id: int) -> None:
         """Mark a wakeup as done."""
-        await self.conn.execute(
-            "UPDATE wakeups SET done = 1 WHERE id = ?", (wakeup_id,)
-        )
-        await self.conn.commit()
+        async with self.engine.begin() as conn:
+            await conn.execute(
+                update(wakeups).where(wakeups.c.id == wakeup_id).values(done=1)
+            )
 
     async def cancel_wakeup(self, wakeup_id: int) -> bool:
         """Mark a pending wakeup as done; return whether one was cancelled."""
-        cursor = await self.conn.execute(
-            "UPDATE wakeups SET done = 1 WHERE id = ? AND done = 0", (wakeup_id,)
-        )
-        await self.conn.commit()
-        return cursor.rowcount > 0
+        async with self.engine.begin() as conn:
+            result = await conn.execute(
+                update(wakeups)
+                .where(wakeups.c.id == wakeup_id, wakeups.c.done == 0)
+                .values(done=1)
+            )
+            return result.rowcount > 0
 
     async def add_steering(self, text: str, urgent: bool = False) -> int:
         """Queue one operator instruction from the console; return its id."""
-        cursor = await self.conn.execute(
-            "INSERT INTO steering (text, urgent) VALUES (?, ?)",
-            (text, int(urgent)),
-        )
-        await self.conn.commit()
-        return cursor.lastrowid or 0
+        async with self.engine.begin() as conn:
+            result = await conn.execute(
+                steering.insert()
+                .values(text=text, urgent=int(urgent))
+                .returning(steering.c.id)
+            )
+            return int(result.scalar_one())
 
-    async def claim_steering(self, urgent: bool | None = None) -> list[aiosqlite.Row]:
+    async def claim_steering(self, urgent: bool | None = None) -> list[dict]:
         """Take undelivered operator instructions, oldest first.
 
         ``urgent`` selects one class of them (``True`` only the urgent
@@ -576,40 +453,26 @@ class Database:
 
         Claiming and returning are one step: two deliverers race for
         these rows — the background loop and the turn in flight — and a
-        row is only returned to whoever's ``UPDATE`` actually flipped it,
-        so an instruction cannot be delivered twice. The cost is the
-        opposite guarantee wakeups have: a crash between the claim and
-        the event being persisted drops it. Repeating an instruction is
-        worse than losing one you can see is still unread.
+        single ``UPDATE … RETURNING`` hands each row to exactly one of
+        them (the loser's transaction sees ``done = 1`` and matches
+        nothing), so an instruction cannot be delivered twice. The cost
+        is the opposite guarantee wakeups have: a crash between the
+        claim and the event being persisted drops it. Repeating an
+        instruction is worse than losing one you can see is still
+        unread.
         """
-        scope = "" if urgent is None else " AND urgent = ?"
-        params = () if urgent is None else (int(urgent),)
-        async with self.conn.execute(
-            f"SELECT id, text, urgent FROM steering WHERE done = 0{scope} ORDER BY id",
-            params,
-        ) as cursor:
-            pending = list(await cursor.fetchall())
-        claimed = []
-        for row in pending:
-            updated = await self.conn.execute(
-                "UPDATE steering SET done = 1 WHERE id = ? AND done = 0", (row["id"],)
-            )
-            if updated.rowcount > 0:
-                claimed.append(row)
-        # Only when an ``UPDATE`` actually ran. This is polled every few
-        # seconds on the connection everything else shares, and a commit
-        # on an empty poll would end a transaction someone else opened.
-        if pending:
-            await self.conn.commit()
-        return claimed
-
-    #: Forum housekeeping messages, which nobody is waiting on an answer
-    #: to. Inlined into SQL rather than bound, so the planner can see the
-    #: literal set; the values are this module's own constants.
-    _FORUM_SERVICE_TYPES = (
-        "('forum_topic_created', 'forum_topic_edited',"
-        " 'forum_topic_closed', 'forum_topic_reopened')"
-    )
+        stmt = (
+            update(steering)
+            .where(steering.c.done == 0)
+            .values(done=1)
+            .returning(steering.c.id, steering.c.text, steering.c.urgent)
+        )
+        if urgent is not None:
+            stmt = stmt.where(steering.c.urgent == int(urgent))
+        async with self.engine.begin() as conn:
+            rows = (await conn.execute(stmt)).mappings().all()
+        # RETURNING carries no ORDER BY; restore the oldest-first order.
+        return sorted((dict(row) for row in rows), key=lambda row: row["id"])
 
     async def unanswered_chats(self) -> list[dict]:
         """Chats whose latest message is incoming (i.e. awaiting the agent).
@@ -623,41 +486,48 @@ class Database:
 
         Ranking each chat/topic once beats asking "is anything newer?"
         per message: the correlated form re-scanned the chat for every
-        row it considered, which is quadratic in history length and runs
-        on the connection every other loop shares.
+        row it considered, which is quadratic in history length.
         """
-        query = f"""
-            WITH latest AS (
-                SELECT chat_id, message_thread_id, from_user_id, date, outgoing,
-                       ROW_NUMBER() OVER (
-                           PARTITION BY chat_id, COALESCE(message_thread_id, 0)
-                           ORDER BY date DESC, message_id DESC
-                       ) AS position
-                FROM messages
-                WHERE content_type NOT IN {self._FORUM_SERVICE_TYPES}
+        latest = (
+            select(
+                messages.c.chat_id,
+                messages.c.message_thread_id,
+                messages.c.from_user_id,
+                messages.c.date,
+                messages.c.outgoing,
+                func.row_number()
+                .over(
+                    partition_by=(
+                        messages.c.chat_id,
+                        func.coalesce(messages.c.message_thread_id, 0),
+                    ),
+                    order_by=(messages.c.date.desc(), messages.c.message_id.desc()),
+                )
+                .label("position"),
             )
-            SELECT c.id AS chat_id, c.type, c.title, l.message_thread_id,
-                   u.first_name, u.username, l.date
-            FROM latest l
-            JOIN chats c ON c.id = l.chat_id
-            LEFT JOIN users u ON u.id = l.from_user_id
-            WHERE l.position = 1 AND l.outgoing = 0
-            ORDER BY l.date
-        """
-        async with self.conn.execute(query) as cursor:
-            return [dict(row) for row in await cursor.fetchall()]
-
-    #: Message columns returned to the LLM as chat context. The media
-    #: note rides along so a picture reads as what it depicts wherever a
-    #: transcript is rendered, instead of as a bare ``<photo>``.
-    _MESSAGE_ROW = """
-        SELECT m.message_id, m.date, m.outgoing, u.username, u.first_name,
-               m.text, m.caption, m.content_type, m.message_thread_id,
-               m.reply_to_message_id, n.note AS media_note
-        FROM messages m
-        LEFT JOIN users u ON u.id = m.from_user_id
-        LEFT JOIN media_notes n ON n.file_unique_id = m.media_uid
-    """
+            .where(messages.c.content_type.not_in(_FORUM_SERVICE_TYPES))
+            .cte("latest")
+        )
+        stmt = (
+            select(
+                chats.c.id.label("chat_id"),
+                chats.c.type,
+                chats.c.title,
+                latest.c.message_thread_id,
+                users.c.first_name,
+                users.c.username,
+                latest.c.date,
+            )
+            .select_from(
+                latest.join(chats, chats.c.id == latest.c.chat_id).outerjoin(
+                    users, users.c.id == latest.c.from_user_id
+                )
+            )
+            .where(latest.c.position == 1, latest.c.outgoing == 0)
+            .order_by(latest.c.date)
+        )
+        async with self.engine.connect() as conn:
+            return [dict(row) for row in (await conn.execute(stmt)).mappings()]
 
     async def recent_messages(
         self,
@@ -675,34 +545,17 @@ class Database:
         restricts the result to one forum topic; ``None`` means the whole
         chat.
         """
-        query = (
-            self._MESSAGE_ROW
-            + """
-            WHERE m.chat_id = ? AND (? IS NULL OR m.message_id < ?)
-              AND (? IS NULL OR m.message_thread_id = ?)
-            ORDER BY m.date DESC, m.message_id DESC LIMIT ?
-        """
-        )
-        params = (
-            chat_id,
-            before_message_id,
-            before_message_id,
-            message_thread_id,
-            message_thread_id,
-            limit,
-        )
-        async with self.conn.execute(query, params) as cursor:
-            rows = list(await cursor.fetchall())
+        stmt = _message_select().where(messages.c.chat_id == chat_id)
+        if before_message_id is not None:
+            stmt = stmt.where(messages.c.message_id < before_message_id)
+        if message_thread_id is not None:
+            stmt = stmt.where(messages.c.message_thread_id == message_thread_id)
+        stmt = stmt.order_by(
+            messages.c.date.desc(), messages.c.message_id.desc()
+        ).limit(limit)
+        async with self.engine.connect() as conn:
+            rows = (await conn.execute(stmt)).mappings().all()
         return [dict(row) for row in reversed(rows)]
-
-    #: Newest message of a chat/topic the agent has already been shown.
-    #: A topic honours the whole-chat cursor too — a chat-wide history
-    #: read exposed that topic's older messages just the same.
-    _READ_CURSOR = """
-        SELECT COALESCE(MAX(message_id), 0)
-        FROM message_read_cursors
-        WHERE chat_id = ? AND message_thread_id IN (0, ?)
-    """
 
     async def unread_messages_count(
         self, chat_id: int, message_thread_id: int | None = None
@@ -716,19 +569,19 @@ class Database:
         in the same table, and reporting them back as unread would make
         every answered chat look like it still needs reading.
         """
-        thread_key = message_thread_id or 0
-        query = f"""
-            SELECT COUNT(*)
-            FROM messages m
-            WHERE m.chat_id = ?
-              AND m.outgoing = 0
-              AND (? IS NULL OR m.message_thread_id = ?)
-              AND m.message_id > ({self._READ_CURSOR})
-        """
-        params = (chat_id, message_thread_id, message_thread_id, chat_id, thread_key)
-        async with self.conn.execute(query, params) as cursor:
-            row = await cursor.fetchone()
-        return int(row[0]) if row else 0
+        stmt = (
+            select(func.count())
+            .select_from(messages)
+            .where(
+                messages.c.chat_id == chat_id,
+                messages.c.outgoing == 0,
+                messages.c.message_id > _read_cursor(chat_id, message_thread_id or 0),
+            )
+        )
+        if message_thread_id is not None:
+            stmt = stmt.where(messages.c.message_thread_id == message_thread_id)
+        async with self.engine.connect() as conn:
+            return int((await conn.execute(stmt)).scalar_one())
 
     async def messages_since_read(
         self,
@@ -747,34 +600,28 @@ class Database:
         of :meth:`recent_messages`; when more than ``limit`` are pending,
         the newest are kept.
         """
-        query = (
-            self._MESSAGE_ROW
-            + f"""
-            WHERE m.chat_id = ? AND (? IS NULL OR m.message_id < ?)
-              AND (? IS NULL OR m.message_thread_id = ?)
-              AND m.message_id > ({self._READ_CURSOR})
-            ORDER BY m.date DESC, m.message_id DESC LIMIT ?
-        """
+        stmt = _message_select().where(
+            messages.c.chat_id == chat_id,
+            messages.c.message_id > _read_cursor(chat_id, message_thread_id or 0),
         )
-        params = (
-            chat_id,
-            before_message_id,
-            before_message_id,
-            message_thread_id,
-            message_thread_id,
-            chat_id,
-            message_thread_id or 0,
-            limit,
-        )
-        async with self.conn.execute(query, params) as cursor:
-            rows = list(await cursor.fetchall())
+        if before_message_id is not None:
+            stmt = stmt.where(messages.c.message_id < before_message_id)
+        if message_thread_id is not None:
+            stmt = stmt.where(messages.c.message_thread_id == message_thread_id)
+        stmt = stmt.order_by(
+            messages.c.date.desc(), messages.c.message_id.desc()
+        ).limit(limit)
+        async with self.engine.connect() as conn:
+            rows = (await conn.execute(stmt)).mappings().all()
         return [dict(row) for row in reversed(rows)]
 
     async def message_row(self, chat_id: int, message_id: int) -> dict | None:
         """Return one stored message in :meth:`recent_messages` shape."""
-        query = self._MESSAGE_ROW + "WHERE m.chat_id = ? AND m.message_id = ?"
-        async with self.conn.execute(query, (chat_id, message_id)) as cursor:
-            row = await cursor.fetchone()
+        stmt = _message_select().where(
+            messages.c.chat_id == chat_id, messages.c.message_id == message_id
+        )
+        async with self.engine.connect() as conn:
+            row = (await conn.execute(stmt)).mappings().first()
         return dict(row) if row else None
 
     async def mark_messages_read(
@@ -784,19 +631,26 @@ class Database:
         message_thread_id: int | None = None,
     ) -> None:
         """Advance a chat/topic history cursor through one exposed message."""
-        thread_key = message_thread_id or 0
-        await self.conn.execute(
-            """
-            INSERT INTO message_read_cursors
-                (chat_id, message_thread_id, message_id)
-            VALUES (?, ?, ?)
-            ON CONFLICT(chat_id, message_thread_id) DO UPDATE SET
-                message_id = MAX(message_read_cursors.message_id,
-                                 excluded.message_id)
-            """,
-            (chat_id, thread_key, message_id),
+        stmt = sqlite_insert(message_read_cursors).values(
+            chat_id=chat_id,
+            message_thread_id=message_thread_id or 0,
+            message_id=message_id,
         )
-        await self.conn.commit()
+        stmt = stmt.on_conflict_do_update(
+            index_elements=[
+                message_read_cursors.c.chat_id,
+                message_read_cursors.c.message_thread_id,
+            ],
+            # The cursor only ever advances; two-argument MAX keeps the
+            # newer of the stored and offered ids.
+            set_={
+                "message_id": func.max(
+                    message_read_cursors.c.message_id, stmt.excluded.message_id
+                )
+            },
+        )
+        async with self.engine.begin() as conn:
+            await conn.execute(stmt)
 
     async def search_messages(
         self,
@@ -813,18 +667,21 @@ class Database:
         restricts the search to one forum topic; ``None`` means the whole
         chat.
         """
-        query = (
-            self._MESSAGE_ROW
-            + """
-            WHERE m.chat_id = ? AND (instr(casefold(m.text), casefold(?))
-                                     OR instr(casefold(m.caption), casefold(?)))
-              AND (? IS NULL OR m.message_thread_id = ?)
-            ORDER BY m.date DESC, m.message_id DESC LIMIT ?
-        """
+        stmt = _message_select().where(
+            messages.c.chat_id == chat_id,
+            or_(
+                func.instr(func.casefold(messages.c.text), func.casefold(needle)) > 0,
+                func.instr(func.casefold(messages.c.caption), func.casefold(needle))
+                > 0,
+            ),
         )
-        params = (chat_id, needle, needle, message_thread_id, message_thread_id, limit)
-        async with self.conn.execute(query, params) as cursor:
-            return [dict(row) for row in await cursor.fetchall()]
+        if message_thread_id is not None:
+            stmt = stmt.where(messages.c.message_thread_id == message_thread_id)
+        stmt = stmt.order_by(
+            messages.c.date.desc(), messages.c.message_id.desc()
+        ).limit(limit)
+        async with self.engine.connect() as conn:
+            return [dict(row) for row in (await conn.execute(stmt)).mappings()]
 
     async def message_thread(
         self, chat_id: int, message_id: int, limit: int
@@ -837,37 +694,38 @@ class Database:
         :meth:`recent_messages` plus ``reply_to_message_id`` so the
         reply structure is visible. When the thread exceeds ``limit``
         the newest messages are kept. Unknown messages yield no rows.
-
-        The recursive CTE keeps this query from reusing
-        :data:`_MESSAGE_ROW`, so its column list has to track that one by
-        hand — a transcript rendered from rows missing a column silently
-        loses what the column carried.
         """
-        query = r"""
-            WITH RECURSIVE thread (message_id, reply_to_message_id) AS (
-                SELECT message_id, reply_to_message_id FROM messages
-                WHERE chat_id = :chat_id AND message_id = :message_id
-                UNION
-                SELECT m.message_id, m.reply_to_message_id
-                FROM messages m JOIN thread t
-                ON m.chat_id = :chat_id
-                   AND (m.message_id = t.reply_to_message_id
-                        OR m.reply_to_message_id = t.message_id)
+        thread = (
+            select(messages.c.message_id, messages.c.reply_to_message_id)
+            .where(messages.c.chat_id == chat_id, messages.c.message_id == message_id)
+            .cte("thread", recursive=True)
+        )
+        walker = messages.alias("m")
+        # ``union`` (not ``union_all``): the walk goes both directions
+        # through reply links, and deduplication is what terminates it.
+        thread = thread.union(
+            select(walker.c.message_id, walker.c.reply_to_message_id).select_from(
+                walker.join(
+                    thread,
+                    (walker.c.chat_id == chat_id)
+                    & (
+                        (walker.c.message_id == thread.c.reply_to_message_id)
+                        | (walker.c.reply_to_message_id == thread.c.message_id)
+                    ),
+                )
             )
-            SELECT m.message_id, m.date, m.outgoing, u.username, u.first_name,
-                   m.text, m.caption, m.content_type, m.message_thread_id,
-                   m.reply_to_message_id, n.note AS media_note
-            FROM messages m
-            LEFT JOIN users u ON u.id = m.from_user_id
-            LEFT JOIN media_notes n ON n.file_unique_id = m.media_uid
-            WHERE m.chat_id = :chat_id
-              AND m.message_id IN (SELECT message_id FROM thread)
-            ORDER BY m.date DESC, m.message_id DESC
-            LIMIT :limit
-        """
-        params = {"chat_id": chat_id, "message_id": message_id, "limit": limit}
-        async with self.conn.execute(query, params) as cursor:
-            rows = list(await cursor.fetchall())
+        )
+        stmt = (
+            _message_select()
+            .where(
+                messages.c.chat_id == chat_id,
+                messages.c.message_id.in_(select(thread.c.message_id)),
+            )
+            .order_by(messages.c.date.desc(), messages.c.message_id.desc())
+            .limit(limit)
+        )
+        async with self.engine.connect() as conn:
+            rows = (await conn.execute(stmt)).mappings().all()
         return [dict(row) for row in reversed(rows)]
 
     async def topic_name(self, chat_id: int, thread_id: int) -> str | None:
@@ -880,36 +738,52 @@ class Database:
         the creation-time name that pseudo-replies keep echoing forever;
         icon-only edits carry no name and are skipped.
         """
-        query = """
-            SELECT name FROM (
-                SELECT COALESCE(
-                           json_extract(raw, '$.forum_topic_edited.name'),
-                           json_extract(raw, '$.forum_topic_created.name'),
-                           json_extract(
-                               raw, '$.reply_to_message.forum_topic_created.name'
-                           )
-                       ) AS name,
-                       (content_type = 'forum_topic_edited') AS renamed,
-                       date, message_id
-                FROM messages
-                WHERE chat_id = ? AND message_thread_id = ?
+        named = (
+            select(
+                func.coalesce(
+                    func.json_extract(messages.c.raw, "$.forum_topic_edited.name"),
+                    func.json_extract(messages.c.raw, "$.forum_topic_created.name"),
+                    func.json_extract(
+                        messages.c.raw,
+                        "$.reply_to_message.forum_topic_created.name",
+                    ),
+                ).label("name"),
+                (messages.c.content_type == "forum_topic_edited").label("renamed"),
+                messages.c.date,
+                messages.c.message_id,
             )
-            WHERE name IS NOT NULL
-            ORDER BY renamed DESC, date DESC, message_id DESC
-            LIMIT 1
-        """
-        async with self.conn.execute(query, (chat_id, thread_id)) as cursor:
-            row = await cursor.fetchone()
-        return row["name"] if row else None
+            .where(
+                messages.c.chat_id == chat_id,
+                messages.c.message_thread_id == thread_id,
+            )
+            .subquery()
+        )
+        stmt = (
+            select(named.c.name)
+            .where(named.c.name.is_not(None))
+            .order_by(
+                named.c.renamed.desc(),
+                named.c.date.desc(),
+                named.c.message_id.desc(),
+            )
+            .limit(1)
+        )
+        async with self.engine.connect() as conn:
+            return (await conn.execute(stmt)).scalar_one_or_none()
 
     async def topic_observed(self, chat_id: int, thread_id: int) -> bool:
         """True when any stored message of the chat belongs to the topic."""
-        query = """
-            SELECT 1 FROM messages
-            WHERE chat_id = ? AND message_thread_id = ? LIMIT 1
-        """
-        async with self.conn.execute(query, (chat_id, thread_id)) as cursor:
-            return await cursor.fetchone() is not None
+        stmt = (
+            select(1)
+            .select_from(messages)
+            .where(
+                messages.c.chat_id == chat_id,
+                messages.c.message_thread_id == thread_id,
+            )
+            .limit(1)
+        )
+        async with self.engine.connect() as conn:
+            return (await conn.execute(stmt)).first() is not None
 
     async def list_topics(self, chat_id: int) -> list[dict]:
         """Return the forum topics seen in a chat, most recent first.
@@ -919,24 +793,36 @@ class Database:
         close/reopen service message. The General topic never appears:
         its messages carry no topic id.
         """
-        query = """
-            SELECT m.message_thread_id AS topic_id,
-                   COUNT(*) AS messages,
-                   MAX(m.date) AS last_date,
-                   COALESCE((SELECT e.content_type FROM messages e
-                             WHERE e.chat_id = m.chat_id
-                               AND e.message_thread_id = m.message_thread_id
-                               AND e.content_type IN ('forum_topic_closed',
-                                                      'forum_topic_reopened')
-                             ORDER BY e.date DESC, e.message_id DESC LIMIT 1
-                            ) = 'forum_topic_closed', 0) AS closed
-            FROM messages m
-            WHERE m.chat_id = ? AND m.message_thread_id IS NOT NULL
-            GROUP BY m.message_thread_id
-            ORDER BY last_date DESC
-        """
-        async with self.conn.execute(query, (chat_id,)) as cursor:
-            rows = [dict(row) for row in await cursor.fetchall()]
+        events = messages.alias("e")
+        last_gate = (
+            select(events.c.content_type)
+            .where(
+                events.c.chat_id == messages.c.chat_id,
+                events.c.message_thread_id == messages.c.message_thread_id,
+                events.c.content_type.in_(
+                    ("forum_topic_closed", "forum_topic_reopened")
+                ),
+            )
+            .order_by(events.c.date.desc(), events.c.message_id.desc())
+            .limit(1)
+            .scalar_subquery()
+        )
+        stmt = (
+            select(
+                messages.c.message_thread_id.label("topic_id"),
+                func.count().label("messages"),
+                func.max(messages.c.date).label("last_date"),
+                func.coalesce(last_gate == "forum_topic_closed", 0).label("closed"),
+            )
+            .where(
+                messages.c.chat_id == chat_id,
+                messages.c.message_thread_id.is_not(None),
+            )
+            .group_by(messages.c.message_thread_id)
+            .order_by(desc("last_date"))
+        )
+        async with self.engine.connect() as conn:
+            rows = [dict(row) for row in (await conn.execute(stmt)).mappings()]
         # Topic counts are tiny; a name lookup per row keeps the tricky
         # name-resolution logic in one place.
         for row in rows:
@@ -950,19 +836,29 @@ class Database:
         For private chats (no title) the name falls back to the peer's
         first name or username — a private chat's id equals the user's id.
         """
-        query = """
-            SELECT c.id AS chat_id, c.type,
-                   COALESCE(c.title, u.first_name, c.username, u.username) AS name,
-                   COUNT(m.message_id) AS messages,
-                   MAX(m.date) AS last_date
-            FROM chats c
-            LEFT JOIN users u ON u.id = c.id
-            LEFT JOIN messages m ON m.chat_id = c.id
-            GROUP BY c.id
-            ORDER BY last_date DESC
-        """
-        async with self.conn.execute(query) as cursor:
-            return [dict(row) for row in await cursor.fetchall()]
+        stmt = (
+            select(
+                chats.c.id.label("chat_id"),
+                chats.c.type,
+                func.coalesce(
+                    chats.c.title,
+                    users.c.first_name,
+                    chats.c.username,
+                    users.c.username,
+                ).label("name"),
+                func.count(messages.c.message_id).label("messages"),
+                func.max(messages.c.date).label("last_date"),
+            )
+            .select_from(
+                chats.outerjoin(users, users.c.id == chats.c.id).outerjoin(
+                    messages, messages.c.chat_id == chats.c.id
+                )
+            )
+            .group_by(chats.c.id)
+            .order_by(desc("last_date"))
+        )
+        async with self.engine.connect() as conn:
+            return [dict(row) for row in (await conn.execute(stmt)).mappings()]
 
     async def chat_members(self, chat_id: int) -> list[dict]:
         """Return users seen talking in a chat, most recently active first.
@@ -970,17 +866,22 @@ class Database:
         Built from stored history — Telegram doesn't let bots fetch a
         group's full roster, so this is who has actually said something.
         """
-        query = """
-            SELECT u.id AS user_id, u.username, u.first_name, u.last_name,
-                   COUNT(*) AS messages, MAX(m.date) AS last_date
-            FROM messages m
-            JOIN users u ON u.id = m.from_user_id
-            WHERE m.chat_id = ?
-            GROUP BY u.id
-            ORDER BY last_date DESC
-        """
-        async with self.conn.execute(query, (chat_id,)) as cursor:
-            return [dict(row) for row in await cursor.fetchall()]
+        stmt = (
+            select(
+                users.c.id.label("user_id"),
+                users.c.username,
+                users.c.first_name,
+                users.c.last_name,
+                func.count().label("messages"),
+                func.max(messages.c.date).label("last_date"),
+            )
+            .select_from(messages.join(users, users.c.id == messages.c.from_user_id))
+            .where(messages.c.chat_id == chat_id)
+            .group_by(users.c.id)
+            .order_by(desc("last_date"))
+        )
+        async with self.engine.connect() as conn:
+            return [dict(row) for row in (await conn.execute(stmt)).mappings()]
 
     async def known_stickers(
         self, limit: int, chat_ids: list[int] | None = None
@@ -993,46 +894,41 @@ class Database:
         """
         if chat_ids == []:
             return []
-        chat_filter = ""
-        params: list[object] = []
-        if chat_ids is not None:
-            placeholders = ", ".join("?" for _ in chat_ids)
-            chat_filter = f" AND chat_id IN ({placeholders})"
-            params.extend(chat_ids)
-        query = (
-            """
-            SELECT json_extract(raw, '$.sticker.file_id') AS file_id,
-                   json_extract(raw, '$.sticker.emoji') AS emoji,
-                   json_extract(raw, '$.sticker.set_name') AS set_name,
-                   MAX(date) AS last_date
-            FROM messages
-            WHERE content_type = 'sticker'
-            """
-            + chat_filter
-            + """
-            GROUP BY json_extract(raw, '$.sticker.file_unique_id')
-            ORDER BY last_date DESC
-            LIMIT ?
-        """
+        stmt = (
+            select(
+                func.json_extract(messages.c.raw, "$.sticker.file_id").label("file_id"),
+                func.json_extract(messages.c.raw, "$.sticker.emoji").label("emoji"),
+                func.json_extract(messages.c.raw, "$.sticker.set_name").label(
+                    "set_name"
+                ),
+                func.max(messages.c.date).label("last_date"),
+            )
+            .where(messages.c.content_type == "sticker")
+            .group_by(func.json_extract(messages.c.raw, "$.sticker.file_unique_id"))
+            .order_by(desc("last_date"))
+            .limit(limit)
         )
-        params.append(limit)
-        async with self.conn.execute(query, params) as cursor:
-            return [dict(row) for row in await cursor.fetchall()]
+        if chat_ids is not None:
+            stmt = stmt.where(messages.c.chat_id.in_(chat_ids))
+        async with self.engine.connect() as conn:
+            return [dict(row) for row in (await conn.execute(stmt)).mappings()]
 
     async def sticker_is_known(self, file_id: str, chat_ids: list[int]) -> bool:
         """Whether a sticker file id was observed in selected chats."""
         if not chat_ids:
             return False
-        placeholders = ", ".join("?" for _ in chat_ids)
-        query = f"""
-            SELECT 1 FROM messages
-            WHERE content_type = 'sticker'
-              AND json_extract(raw, '$.sticker.file_id') = ?
-              AND chat_id IN ({placeholders})
-            LIMIT 1
-        """
-        async with self.conn.execute(query, [file_id, *chat_ids]) as cursor:
-            return await cursor.fetchone() is not None
+        stmt = (
+            select(1)
+            .select_from(messages)
+            .where(
+                messages.c.content_type == "sticker",
+                func.json_extract(messages.c.raw, "$.sticker.file_id") == file_id,
+                messages.c.chat_id.in_(chat_ids),
+            )
+            .limit(1)
+        )
+        async with self.engine.connect() as conn:
+            return (await conn.execute(stmt)).first() is not None
 
     async def message_payload(self, chat_id: int, message_id: int) -> dict | None:
         """Return one stored message's raw Telegram payload, decoded.
@@ -1041,21 +937,20 @@ class Database:
         else — a sticker's set, a video's duration, the file ids behind
         either — only exists here.
         """
-        async with self.conn.execute(
-            "SELECT raw FROM messages WHERE chat_id = ? AND message_id = ?",
-            (chat_id, message_id),
-        ) as cursor:
-            row = await cursor.fetchone()
-        return json.loads(row["raw"]) if row else None
+        stmt = select(messages.c.raw).where(
+            messages.c.chat_id == chat_id, messages.c.message_id == message_id
+        )
+        async with self.engine.connect() as conn:
+            raw = (await conn.execute(stmt)).scalar_one_or_none()
+        return json.loads(raw) if raw else None
 
     async def media_note(self, file_unique_id: str) -> str | None:
         """Return what a media file was described as, if anyone has."""
-        async with self.conn.execute(
-            "SELECT note FROM media_notes WHERE file_unique_id = ?",
-            (file_unique_id,),
-        ) as cursor:
-            row = await cursor.fetchone()
-        return row["note"] if row else None
+        stmt = select(media_notes.c.note).where(
+            media_notes.c.file_unique_id == file_unique_id
+        )
+        async with self.engine.connect() as conn:
+            return (await conn.execute(stmt)).scalar_one_or_none()
 
     async def save_media_note(
         self, file_unique_id: str, kind: str, note: str, model: str
@@ -1066,37 +961,44 @@ class Database:
         only ever asked for deliberately (a better model, a bad note),
         and it should be the one that sticks.
         """
-        await self.conn.execute(
-            """
-            INSERT INTO media_notes (file_unique_id, kind, note, model)
-            VALUES (?, ?, ?, ?)
-            ON CONFLICT (file_unique_id) DO UPDATE SET
-                kind = excluded.kind,
-                note = excluded.note,
-                model = excluded.model,
-                created_at = datetime('now')
-            """,
-            (file_unique_id, kind, note, model),
+        stmt = sqlite_insert(media_notes).values(
+            file_unique_id=file_unique_id, kind=kind, note=note, model=model
         )
-        await self.conn.commit()
+        stmt = stmt.on_conflict_do_update(
+            index_elements=[media_notes.c.file_unique_id],
+            set_={
+                "kind": stmt.excluded.kind,
+                "note": stmt.excluded.note,
+                "model": stmt.excluded.model,
+                "created_at": func.datetime("now"),
+            },
+        )
+        async with self.engine.begin() as conn:
+            await conn.execute(stmt)
 
     async def set_message_media(
         self, chat_id: int, message_id: int, file_unique_id: str
     ) -> None:
         """Link a stored message to the media file it carries."""
-        await self.conn.execute(
-            "UPDATE messages SET media_uid = ? WHERE chat_id = ? AND message_id = ?",
-            (file_unique_id, chat_id, message_id),
-        )
-        await self.conn.commit()
+        async with self.engine.begin() as conn:
+            await conn.execute(
+                update(messages)
+                .where(
+                    messages.c.chat_id == chat_id,
+                    messages.c.message_id == message_id,
+                )
+                .values(media_uid=file_unique_id)
+            )
 
     async def message_exists(self, chat_id: int, message_id: int) -> bool:
         """Whether a message was observed and stored in one chat."""
-        async with self.conn.execute(
-            "SELECT 1 FROM messages WHERE chat_id = ? AND message_id = ?",
-            (chat_id, message_id),
-        ) as cursor:
-            return await cursor.fetchone() is not None
+        stmt = (
+            select(1)
+            .select_from(messages)
+            .where(messages.c.chat_id == chat_id, messages.c.message_id == message_id)
+        )
+        async with self.engine.connect() as conn:
+            return (await conn.execute(stmt)).first() is not None
 
     async def message_is_outgoing(self, chat_id: int, message_id: int) -> bool:
         """Whether a stored message was sent by the bot itself.
@@ -1104,20 +1006,21 @@ class Database:
         Unknown messages are not outgoing: every message the bot sends is
         persisted, so "not stored" means "not ours to touch".
         """
-        async with self.conn.execute(
-            "SELECT outgoing FROM messages WHERE chat_id = ? AND message_id = ?",
-            (chat_id, message_id),
-        ) as cursor:
-            row = await cursor.fetchone()
-        return bool(row and row["outgoing"])
+        stmt = select(messages.c.outgoing).where(
+            messages.c.chat_id == chat_id, messages.c.message_id == message_id
+        )
+        async with self.engine.connect() as conn:
+            return bool((await conn.execute(stmt)).scalar_one_or_none())
 
     async def delete_message(self, chat_id: int, message_id: int) -> None:
         """Remove a message row (mirrors a deletion done on Telegram)."""
-        await self.conn.execute(
-            "DELETE FROM messages WHERE chat_id = ? AND message_id = ?",
-            (chat_id, message_id),
-        )
-        await self.conn.commit()
+        async with self.engine.begin() as conn:
+            await conn.execute(
+                delete(messages).where(
+                    messages.c.chat_id == chat_id,
+                    messages.c.message_id == message_id,
+                )
+            )
 
     async def save_message(self, message: Message, *, outgoing: bool = False) -> None:
         """Persist a message together with its chat and sender.
@@ -1125,46 +1028,45 @@ class Database:
         Stores common fields in dedicated columns and the full serialized
         payload in ``raw``. Re-saving the same ``(chat_id, message_id)``
         (e.g. an edit) updates the mutable columns in place. Set
-        ``outgoing=True`` for messages the bot itself sent.
+        ``outgoing=True`` for messages the bot itself sent. The chat and
+        sender upserts share the message's transaction.
         """
-        await self.upsert_chat(message.chat)
-        if message.from_user is not None:
-            await self.upsert_user(message.from_user)
-        await self.conn.execute(
-            """
-            INSERT INTO messages (chat_id, message_id, from_user_id, date,
-                                  edit_date, content_type, text, caption,
-                                  reply_to_message_id, message_thread_id,
-                                  media_group_id, outgoing, raw)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-            ON CONFLICT (chat_id, message_id) DO UPDATE SET
-                edit_date = excluded.edit_date,
-                content_type = excluded.content_type,
-                text = excluded.text,
-                caption = excluded.caption,
-                raw = excluded.raw,
-                saved_at = datetime('now')
-            """,
-            (
-                message.chat.id,
-                message.message_id,
-                message.from_user.id if message.from_user else None,
-                message.date.isoformat(),
-                # Telegram sends edit_date as a unix timestamp; normalize to
-                # ISO so it compares with the `date` column.
-                datetime.fromtimestamp(message.edit_date, tz=UTC).isoformat()
-                if message.edit_date
-                else None,
-                message.content_type,
-                message.text,
-                message.caption,
-                effective_reply_to(message),
-                # Bot API also sets message_thread_id on plain reply chains;
-                # is_topic_message discriminates real forum topics.
-                message.message_thread_id if message.is_topic_message else None,
-                message.media_group_id,
-                int(outgoing),
-                message.model_dump_json(exclude_none=True),
-            ),
+        stmt = sqlite_insert(messages).values(
+            chat_id=message.chat.id,
+            message_id=message.message_id,
+            from_user_id=message.from_user.id if message.from_user else None,
+            date=message.date.isoformat(),
+            # Telegram sends edit_date as a unix timestamp; normalize to
+            # ISO so it compares with the `date` column.
+            edit_date=datetime.fromtimestamp(message.edit_date, tz=UTC).isoformat()
+            if message.edit_date
+            else None,
+            content_type=message.content_type,
+            text=message.text,
+            caption=message.caption,
+            reply_to_message_id=effective_reply_to(message),
+            # Bot API also sets message_thread_id on plain reply chains;
+            # is_topic_message discriminates real forum topics.
+            message_thread_id=message.message_thread_id
+            if message.is_topic_message
+            else None,
+            media_group_id=message.media_group_id,
+            outgoing=int(outgoing),
+            raw=message.model_dump_json(exclude_none=True),
         )
-        await self.conn.commit()
+        stmt = stmt.on_conflict_do_update(
+            index_elements=[messages.c.chat_id, messages.c.message_id],
+            set_={
+                "edit_date": stmt.excluded.edit_date,
+                "content_type": stmt.excluded.content_type,
+                "text": stmt.excluded.text,
+                "caption": stmt.excluded.caption,
+                "raw": stmt.excluded.raw,
+                "saved_at": func.datetime("now"),
+            },
+        )
+        async with self.engine.begin() as conn:
+            await conn.execute(self._chat_upsert(message.chat))
+            if message.from_user is not None:
+                await conn.execute(self._user_upsert(message.from_user))
+            await conn.execute(stmt)
