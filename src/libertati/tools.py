@@ -35,6 +35,7 @@ from libertati.chats import ChatRegistry
 from libertati.config import Settings
 from libertati.db import Database
 from libertati.loop import response_usage
+from libertati.media import MediaLens, media_ref
 from libertati.memory import Mind
 from libertati.prompts import Prompts
 from libertati.transcript import render_transcript
@@ -625,6 +626,43 @@ HISTORY_TOOLS: list[ToolParam] = [
 ]
 
 # ==========================================================
+#                          Media
+# ==========================================================
+#: Kept out of ``DREAM_API_TOOLS``: looking costs a model call and
+#: stores a description, and a dream is supposed to persist nothing but
+#: its mind files.
+MEDIA_TOOLS: list[ToolParam] = [
+    {
+        "type": "function",
+        "name": "look_at_media",
+        "description": (
+            "Look at a picture, sticker, gif or video someone sent — or "
+            "listen to a voice message — and get back a short "
+            "description in words. Most media is described for you "
+            "automatically and shows in transcripts as "
+            "`<sticker: …>`; use this for the ones still showing as a "
+            "bare `<photo>`, `<video>` or `<voice>`."
+        ),
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "chat_id": {
+                    "type": "integer",
+                    "description": "Chat the message is in.",
+                },
+                "message_id": {
+                    "type": "integer",
+                    "description": "Id of the message carrying the media.",
+                },
+            },
+            "required": ["chat_id", "message_id"],
+            "additionalProperties": False,
+        },
+        "strict": True,
+    },
+]
+
+# ==========================================================
 #                          Memory
 # ==========================================================
 MEMORY_TOOLS: list[ToolParam] = [
@@ -877,6 +915,7 @@ TOOLS: list[ToolParam] = [
     *MESSAGING_TOOLS,
     *SCHEDULING_TOOLS,
     *HISTORY_TOOLS,
+    *MEDIA_TOOLS,
     *MEMORY_TOOLS,
 ]
 
@@ -907,6 +946,11 @@ DREAM_TOOL_NAMES: frozenset[str] = function_names(DREAM_API_TOOLS)
 #: Everything a waking toolbox may dispatch. Dream-only file writers
 #: stay unreachable even if a provider returns an undeclared tool call.
 WAKING_TOOL_NAMES: frozenset[str] = function_names([*TOOLS, *SLEEP_TOOLS])
+
+#: Hidden when no media model is configured: the tool would have
+#: nothing to answer with, and an offered tool that always errors is
+#: worse than one that was never mentioned.
+MEDIA_TOOL_NAMES: frozenset[str] = function_names(MEDIA_TOOLS)
 
 #: Local copies of every function's parameter schema. Provider-side
 #: strict mode is not an authorization boundary: compatible endpoints
@@ -951,6 +995,7 @@ GATED_CHAT_ARGS: dict[str, tuple[str, ...]] = {
     "get_unread_messages_count": ("chat_id",),
     "get_message_thread": ("chat_id",),
     "search_messages": ("chat_id",),
+    "look_at_media": ("chat_id",),
 }
 
 
@@ -1002,14 +1047,22 @@ def valid_tool_arguments(name: str, args: object) -> bool:
     return True
 
 
-def build_tools(web_search: bool, *, dreaming: bool = False) -> list[ToolParam]:
+def build_tools(
+    web_search: bool, *, dreaming: bool = False, media: bool = False
+) -> list[ToolParam]:
     """Return the tool list for the API, optionally with built-in web search.
 
     Web search runs on OpenAI's side; it is opt-in because most
     OpenAI-compatible endpoints don't support it. ``dreaming`` adds the
-    ``dream`` tool, which only means anything when a dream budget exists.
+    ``dream`` tool, which only means anything when a dream budget
+    exists, and ``media`` keeps ``look_at_media``, which needs a
+    configured vision model to answer at all.
     """
-    tools = list(TOOLS)
+    tools = [
+        tool
+        for tool in TOOLS
+        if media or cast(dict[str, Any], tool)["name"] not in MEDIA_TOOL_NAMES
+    ]
     if dreaming:
         tools.extend(SLEEP_TOOLS)
     if web_search:
@@ -1053,6 +1106,7 @@ class Toolbox:
         registry: ChatRegistry,
         recall_effort: str | None = None,
         allowed: frozenset[str] | None = None,
+        lens: MediaLens | None = None,
         dream_gate: "DreamGate | None" = None,
         dream_min_steps: int = 0,
     ) -> None:
@@ -1068,6 +1122,7 @@ class Toolbox:
         self.recall_prompt = recall_prompt
         self.summary_prompt = summary_prompt
         self.recall_effort = recall_effort
+        self.lens = lens
         self.dream_gate = dream_gate
         self.dream_min_steps = dream_min_steps
         #: Tool calls dispatched so far; the dreaming loop resets it per
@@ -1105,6 +1160,8 @@ class Toolbox:
             "get_unread_messages_count": self._get_unread_messages_count,
             "get_message_thread": self._get_message_thread,
             "search_messages": self._search_messages,
+            # media
+            "look_at_media": self._look_at_media,
             # memory
             "remember": self._remember,
             "recall": self._recall,
@@ -1120,6 +1177,11 @@ class Toolbox:
             "wake_up": self._wake_up,
         }
         allowed_names = WAKING_TOOL_NAMES if allowed is None else allowed
+        if lens is None:
+            # Nothing to look with: the schema is withheld from the model
+            # too, so a call could only come from a provider inventing
+            # one, and it should read as the unknown tool it is.
+            allowed_names -= MEDIA_TOOL_NAMES
         self._handlers = {
             name: handler
             for name, handler in self._handlers.items()
@@ -1541,6 +1603,30 @@ class Toolbox:
         if not rows:
             return "no matches"
         return render_transcript(rows, self.tz, show_topic=thread_id is None)
+
+    # ==========================================================
+    #                          Media
+    # ==========================================================
+
+    async def _look_at_media(self, args: dict[str, Any]) -> str:
+        """Describe one stored message's media, and cache the description.
+
+        The note is stored against the file, so the same picture read
+        back later — here or in any transcript — costs nothing more.
+        """
+        chat_id, message_id = args["chat_id"], args["message_id"]
+        if self.lens is None:
+            return "error: you have no eyes configured"
+        payload = await self.db.message_payload(chat_id, message_id)
+        if payload is None:
+            return f"error: message {message_id} in chat {chat_id} was not observed"
+        ref = media_ref(payload)
+        if ref is None:
+            return f"error: message {message_id} in chat {chat_id} carries no media"
+        note = await self.lens.look(chat_id, message_id, payload)
+        if note is None:
+            return f"error: this {ref.kind} could not be described"
+        return note
 
     # ==========================================================
     #                          Memory

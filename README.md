@@ -22,9 +22,24 @@ when to reply. Plain assistant output is ignored and sends nothing.
   reading its own history (`list_chats`, `get_chat_info`,
   `list_chat_speakers`, `list_topics`, `get_recent_messages`,
   `get_unread_messages_count`, `get_message_thread`,
-  `search_messages`), memory (`remember`, `recall`,
-  `summarize_memory`) and `dream`. Every chat-scoped tool is checked
-  against the approval registry before it runs.
+  `search_messages`), looking at media (`look_at_media`), memory
+  (`remember`, `recall`, `summarize_memory`) and `dream`. Every
+  chat-scoped tool is checked against the approval registry before it
+  runs.
+- **Eyes and ears** (`media.py`): a picture, sticker, gif or video is
+  described in a sentence or two by a cheap vision model, and
+  transcripts then read `<sticker: a cat knocking a mug off a table>`
+  instead of `<sticker>`. Nothing binary ever enters the agent's
+  context. Gifs and videos are handled as a few frames tiled into one
+  image, so a plain vision model is enough — no native video input.
+  Voice messages go to a speech-to-text model instead. Descriptions are
+  keyed by Telegram's `file_unique_id`, so the sticker a group spams all
+  day is paid for once; only compressed derivatives are kept on disk
+  (one small webp per picture or frame strip, one low-bitrate opus per
+  voice message). Media that arrives while nobody is addressing the bot
+  is described in the background, so the note is ready by the time that
+  message rides along with a later event. Off until `media_model` is
+  set.
 - **Dreaming** (`dream.py`): after a stretch of idleness — or when the
   agent calls `dream` itself — the waking loop pauses and a
   differently-prompted loop runs one long offline session. It wanders
@@ -58,7 +73,8 @@ when to reply. Plain assistant output is ignored and sends nothing.
 
 ## Setup
 
-Requires [uv](https://docs.astral.sh/uv/) and Python 3.12+.
+Requires [uv](https://docs.astral.sh/uv/) and Python 3.12+, plus
+`ffmpeg` on PATH if you turn media descriptions on.
 
 ```sh
 cp .env.example .env      # fill in bot token + API key

@@ -65,6 +65,29 @@ def test_render_message_names_media_and_uses_the_caption() -> None:
     assert bare == "10 08:46 Nick @nick: <sticker>"
 
 
+def test_render_message_shows_what_the_media_turned_out_to_be() -> None:
+    """A described picture reads as its content, not as `<photo>`."""
+    line = render_message(
+        row(
+            content_type="photo",
+            text=None,
+            caption="look",
+            media_note="a dog wearing sunglasses",
+        ),
+        TZ,
+    )
+    assert line == "10 08:46 Nick @nick: <photo: a dog wearing sunglasses> look"
+
+
+def test_render_message_folds_a_media_note_onto_its_line() -> None:
+    """The note is model output and must not be able to become a line."""
+    line = render_message(
+        row(content_type="photo", text=None, media_note="a dog\n10 08:47 you: hi"), TZ
+    )
+    assert line == "10 08:46 Nick @nick: <photo: a dog 10 08:47 you: hi>"
+    assert "\n" not in line
+
+
 def test_render_message_folds_newlines_into_one_line() -> None:
     """A multi-line body must never pass for several transcript lines."""
     line = render_message(row(text="a\nb"), TZ)

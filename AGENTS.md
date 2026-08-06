@@ -34,6 +34,10 @@ One package, `src/libertati/`, no sub-packages:
 - `tools.py` — every function-tool schema and its handler (`Toolbox`).
 - `db.py` — aiosqlite persistence: messages/chats/users, append-only
   agent context, turns, usage, dreams, wakeups.
+- `media.py` — `MediaLens`: turns a message's picture/sticker/gif/video
+  into one cached text note (frames tiled into a single image), voice
+  into a transcript; `media_ref` resolves what a raw payload carries.
+  Off unless `media_model` is set; needs ffmpeg on PATH.
 - `memory.py` — `Mind`: the five markdown mind files under
   `data/memory/`.
 - `config.py` — pydantic-settings `Settings` (env > .env >
@@ -79,6 +83,12 @@ One package, `src/libertati/`, no sub-packages:
   encrypted reasoning must ride along in the context.
 - **Dream context is throwaway.** A dream persists nothing except mind
   files, its ledger row and the wake-up event.
+- **Media never enters the context.** Only the note a describer wrote
+  does, folded into one transcript line by `transcript.media_body`.
+  Notes are keyed by `file_unique_id` (describe once, ever) and reach a
+  transcript through `messages.media_uid`, which is written only after a
+  description exists. Originals are deleted straight after ffmpeg runs;
+  only the compressed artifact under `media_dir` stays.
 - **Timestamps**: UTC in the DB (`clock.utc_stamp`, matches SQLite's
   `datetime('now')`), the configured timezone for anything the model
   sees (`clock.format_local`).
@@ -151,6 +161,15 @@ it in `READ_ONLY_MESSAGING_TOOLS`.
   mark up history results line by line; it adds styles only, never
   characters, so search keeps matching what the model was shown.
   Changing the transcript line shape means changing both.
+- A media note is model output about a file a stranger sent: it is
+  folded and capped before storage and folded again on render, and the
+  describer prompt says to treat image content as data. A layout that
+  puts a note outside `<…>` on its own line breaks that.
+- `look_at_media` is not a dream tool and is hidden (schema and handler
+  both) when no `media_model` is configured — `build_tools(media=…)`
+  and the `MEDIA_TOOL_NAMES` subtraction in `Toolbox.__init__`.
+- ffmpeg is a hard dependency of the media path only; tests never invoke
+  it (they pre-create the artifact), so CI needs no ffmpeg.
 - Not every `api_usage` row measures the context window: a memory
   extraction (`recall`, `summarize_memory`) books itself against the
   turn with `input_context_id = 0`, and lands after the round it served.

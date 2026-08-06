@@ -498,6 +498,99 @@ async def test_deliver_wakeups_pushes_due_and_completes(db: Database) -> None:
     assert await db.pending_wakeups() == []
 
 
+#: A photo message payload, in the shape Telegram sends one.
+PHOTO = [{"file_id": "f", "file_unique_id": "u", "width": 320, "height": 240}]
+
+
+class FakeLens:
+    """Records which messages were waited for and which were not."""
+
+    def __init__(self, note: str | None = "a cat glaring at a mug") -> None:
+        """Answer every wait with ``note``."""
+        self.note = note
+        self.started: list[tuple[int, int]] = []
+        self.waited: list[tuple[int, int]] = []
+
+    def start(self, chat_id: int, message_id: int, payload: dict) -> None:
+        """Record a background description."""
+        self.started.append((chat_id, message_id))
+
+    async def look_briefly(
+        self, chat_id: int, message_id: int, payload: dict
+    ) -> str | None:
+        """Record a description the event waited for."""
+        self.waited.append((chat_id, message_id))
+        return self.note
+
+
+def test_format_event_carries_what_the_picture_turned_out_to_be() -> None:
+    """An event says what was sent, not merely that something was."""
+    message = make_message(text=None, photo=PHOTO, caption="look")
+    event = format_event(message, UTC_TZ, media_note="a dog in sunglasses")
+    assert event.endswith("(msg 42): <photo: a dog in sunglasses> look")
+
+
+def test_format_event_names_media_it_has_no_description_for() -> None:
+    """Undescribed media still reads as its Telegram kind."""
+    message = make_message(text=None, photo=PHOTO)
+    assert format_event(message, UTC_TZ).endswith("(msg 42): <photo>")
+
+
+async def test_addressed_media_is_described_before_the_event() -> None:
+    """A picture the agent is about to hear about is worth a short wait."""
+    agent = FakeAgent()
+    lens = FakeLens()
+    message = make_message(text=None, photo=PHOTO, caption="look @libertati_bot")
+    await on_message(
+        message,
+        agent,
+        UTC_TZ,
+        ME,
+        OPEN_REGISTRY,
+        FakeTopicDB(),  # type: ignore[arg-type]
+        cast(Any, lens),
+    )
+    assert lens.waited == [(100, 42)]
+    assert "<photo: a cat glaring at a mug> look" in agent.events[0]
+
+
+async def test_group_media_nobody_addressed_is_still_described() -> None:
+    """It rides along with a later event, and the note should be ready."""
+    agent = FakeAgent()
+    lens = FakeLens()
+    message = make_group_message(text=None, photo=PHOTO)
+    await on_message(
+        message,
+        agent,
+        UTC_TZ,
+        ME,
+        OPEN_REGISTRY,
+        FakeTopicDB(),  # type: ignore[arg-type]
+        cast(Any, lens),
+    )
+    assert agent.events == []
+    # Started, not awaited: nothing is waiting on this one.
+    assert lens.started == [(-500, 42)]
+    assert lens.waited == []
+
+
+async def test_media_in_an_unapproved_chat_is_never_looked_at(tmp_path: Path) -> None:
+    """Approval gates the eyes too, not just what reaches the agent."""
+    registry = ChatRegistry(tmp_path / "chats.toml", enabled=True)
+    lens = FakeLens()
+    await on_message(
+        make_message(text=None, photo=PHOTO),
+        FakeAgent(),
+        UTC_TZ,
+        ME,
+        registry,
+        FakeTopicDB(),  # type: ignore[arg-type]
+        cast(Any, lens),
+    )
+    assert lens.started == []
+    assert lens.waited == []
+
+
 async def test_on_message_approval_gate(tmp_path: Path) -> None:
     """In approval mode a new chat is registered and its events dropped."""
     registry = ChatRegistry(tmp_path / "chats.toml", enabled=True)

@@ -21,6 +21,13 @@ RUN --mount=type=cache,target=/root/.cache/uv \
 
 FROM python:3.12-slim-bookworm
 
+# ffmpeg turns incoming pictures, stickers and video frames into the
+# small artifacts the media describer looks at. Unused (and idle) when
+# no media model is configured, but the feature cannot work without it.
+RUN apt-get update \
+    && apt-get install -y --no-install-recommends ffmpeg \
+    && rm -rf /var/lib/apt/lists/*
+
 # uid/gid 1000 matches the typical host user so the bind-mounted ./data
 # stays readable/writable on both sides.
 RUN groupadd --gid 1000 app \

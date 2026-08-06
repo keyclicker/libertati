@@ -66,6 +66,26 @@ def test_pruning_requires_current_turn_reasoning() -> None:
         make_settings(reasoning_context="omit", prune_completed_reasoning=True)
 
 
+def test_media_is_off_until_a_model_is_named() -> None:
+    """Media description is opt-in; without a model nothing looks at all."""
+    settings = make_settings()
+    # The shipped file names them as empty strings, which are the same
+    # "no model" the unset default is.
+    assert not settings.media_model
+    assert not settings.transcribe_model
+    assert settings.media_dir == Path("data/media")
+
+
+def test_media_frames_and_note_length_must_be_positive() -> None:
+    """Zero frames or a zero-length note would describe nothing."""
+    with pytest.raises(ValidationError):
+        Settings(bot_token="t", api_key="k", model="m", media_max_frames=0)
+    with pytest.raises(ValidationError):
+        Settings(bot_token="t", api_key="k", model="m", media_note_chars=0)
+    with pytest.raises(ValidationError):
+        Settings(bot_token="t", api_key="k", model="m", media_wait_seconds=-1)
+
+
 def test_dream_defaults_valid() -> None:
     """The shipped dream knobs pass validation."""
     settings = make_settings()

@@ -26,6 +26,11 @@ db_path = "data/libertati.db"
 # rewrite).
 memory_dir = "data/memory"
 
+# Directory holding compressed media artifacts: one small webp per
+# described picture, sticker or video frame strip, one low-bitrate opus
+# per voice message. Originals are never kept.
+media_dir = "data/media"
+
 
 # ==========================================================
 #                     Model & reasoning
@@ -71,6 +76,41 @@ dream_model = "gpt-5.6-luna"
 # (jittered), budgeted per round — the agent waits at most that long
 # before giving the turn up, whatever fallbacks the round also tried.
 api_retries = 3
+
+
+# ==========================================================
+#                          Media
+# ==========================================================
+
+# Pictures, stickers, gifs and videos are described by a cheap vision
+# model in a sentence or two, once per file, and transcripts then read
+# "<sticker: a cat knocking a mug off a table>" instead of "<sticker>".
+# Empty leaves media undescribed. Videos and gifs are handled as a few
+# frames tiled into one image, so a plain vision model is enough.
+# Needs ffmpeg on PATH.
+media_model = ""
+
+# Endpoint for the media models; empty reuses base_url. A different
+# provider also needs LIBERTATI_MEDIA_API_KEY in .env.
+media_base_url = ""
+
+# Speech-to-text model transcribing voice messages (e.g. "whisper-1");
+# empty leaves them undescribed. Needs an endpoint with a transcription
+# API — not every OpenAI-compatible one has it.
+transcribe_model = ""
+
+# Frames sampled from a gif or video and tiled into the one image the
+# vision model sees.
+media_max_frames = 3
+
+# Cap on one stored description. Notes ride along in transcripts and
+# events, so a rambling one is paid for on every later turn.
+media_note_chars = 220
+
+# How long an incoming message waits for its own description before the
+# event goes out without one (the work continues in the background, so
+# later transcripts still have it).
+media_wait_seconds = 6.0
 
 
 # ==========================================================
