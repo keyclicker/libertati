@@ -88,7 +88,9 @@ One package, `src/libertati/`, no sub-packages:
   Notes are keyed by `file_unique_id` (describe once, ever) and reach a
   transcript through `messages.media_uid`, which is written only after a
   description exists. Originals are deleted straight after ffmpeg runs;
-  only the compressed artifact under `media_dir` stays.
+  only the compressed artifact under `media_dir` stays, and it gets there
+  by rename — ffmpeg writes into `media_dir/tmp`, because anything in
+  `media_dir` is described again without being looked at.
 - **Events arrive in the order they were sent.** aiogram runs every
   update in its own task and `on_message` waits up to
   `media_wait_seconds` for a description, so the push happens under

@@ -5,6 +5,7 @@ from pathlib import Path
 from types import SimpleNamespace
 from typing import Any, cast
 
+import pytest
 from aiogram import Bot
 from openai import AsyncOpenAI
 
@@ -405,3 +406,31 @@ async def test_media_without_eyes_is_never_looked_at(
         MediaLens.from_settings(settings, prompts, db=db, bot=cast(Bot, FakeBot()))
         is None
     )
+
+
+async def test_an_artifact_is_published_only_once_it_is_whole(
+    db: Database, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Anything in media_dir is described unseen, so it must be complete.
+
+    ffmpeg therefore never writes there: it fills a temporary the caller
+    renames into place, and a run killed halfway leaves the work undone
+    rather than a truncated picture every later look would trust.
+    """
+    lens = make_lens(db, tmp_path)
+    artifact = lens.media_dir / artifact_name("sticker-uid", ".webp")
+    targets: list[Path] = []
+
+    async def fake_run(command: list[str]) -> bytes | None:
+        """Encode into whatever the command was told to write."""
+        target = Path(command[-1])
+        targets.append(target)
+        target.write_bytes(b"webp")
+        return b""
+
+    monkeypatch.setattr("libertati.media._run", fake_run)
+    assert await lens.look(10, 1, {"sticker": STICKER}) == "a cat knocking a mug over"
+
+    assert targets == [lens._tmp_dir / artifact.name]
+    assert artifact.exists()
+    assert list(lens._tmp_dir.iterdir()) == []

@@ -14,7 +14,9 @@ a speech-to-text endpoint.
 
 Only compressed derivatives are kept (under ``media_dir``): one small
 webp per picture or frame strip, one low-bitrate opus per voice message.
-Originals live in ``tmp/`` for exactly as long as ffmpeg needs them.
+Originals live in ``tmp/`` for exactly as long as ffmpeg needs them, and
+so does the artifact until it is whole — what lands in ``media_dir`` is
+described without a second look, so it may never be half-written.
 """
 
 import asyncio
@@ -444,9 +446,10 @@ class MediaLens:
     def ensure(self) -> None:
         """Create the media directories, emptying leftover temporaries.
 
-        Originals are only ever meant to exist between a download and the
-        ffmpeg run that consumes them, so anything still in ``tmp/`` is
-        debris from a killed process.
+        Nothing in ``tmp/`` is meant to outlive the job that put it
+        there — an original waiting for ffmpeg, an artifact waiting to be
+        whole — so whatever is still there is debris from a killed
+        process.
         """
         self.media_dir.mkdir(parents=True, exist_ok=True)
         shutil.rmtree(self._tmp_dir, ignore_errors=True)
@@ -454,7 +457,7 @@ class MediaLens:
 
     @property
     def _tmp_dir(self) -> Path:
-        """Directory holding originals for the length of one job."""
+        """Directory holding a job's files until they are wanted."""
         return self.media_dir / "tmp"
 
     # ---------------------- entry points ----------------------
@@ -560,26 +563,31 @@ class MediaLens:
     async def _build(self, ref: MediaRef, artifact: Path) -> bool:
         """Download the original and compress it into ``artifact``.
 
-        The original is deleted whatever happens: it is the one file here
-        nobody wants on disk, and a failed conversion must not leave it
-        behind.
+        Both intermediate files live in ``tmp/`` and neither survives the
+        call: the original because it is the one file here nobody wants
+        on disk, the half-encoded artifact because everything in
+        ``media_dir`` is trusted and described without a second look. A
+        process killed mid-encode therefore loses the work, rather than
+        leaving behind a truncated picture it would describe forever.
         """
         original = self._tmp_dir / artifact_name(ref.file_unique_id, ".bin")
+        staged = self._tmp_dir / artifact.name
         self._tmp_dir.mkdir(parents=True, exist_ok=True)
         try:
             await self.bot.download(ref.file_id, destination=original)
             if ref.source == "video":
                 duration = await probe_duration(original)
-                command = frames_command(original, artifact, self.max_frames, duration)
+                command = frames_command(original, staged, self.max_frames, duration)
             elif ref.source == "audio":
-                command = audio_command(original, artifact)
+                command = audio_command(original, staged)
             else:
-                command = image_command(original, artifact)
-            if await _run(command) is None:
-                artifact.unlink(missing_ok=True)
+                command = image_command(original, staged)
+            if await _run(command) is None or not staged.exists():
                 return False
+            staged.replace(artifact)
         finally:
             original.unlink(missing_ok=True)
+            staged.unlink(missing_ok=True)
         return artifact.exists()
 
     async def _describe_image(self, ref: MediaRef, artifact: Path) -> str | None:
