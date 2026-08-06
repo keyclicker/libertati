@@ -16,6 +16,7 @@ from libertati.bot import (
     EVENT_CONTEXT_TEXT_LIMIT,
     EVENT_TEXT_LIMIT,
     HEARTBEAT_DIGEST_LIMIT,
+    ChatOrder,
     deliver_steering,
     deliver_wakeups,
     event_context,
@@ -553,6 +554,156 @@ async def test_deliver_wakeups_pushes_due_and_completes(db: Database) -> None:
     assert len(agent.events) == 1
     assert "ping alice" in agent.events[0]
     assert await db.pending_wakeups() == []
+
+
+#: A photo message payload, in the shape Telegram sends one.
+PHOTO = [{"file_id": "f", "file_unique_id": "u", "width": 320, "height": 240}]
+
+
+class FakeLens:
+    """Records which messages were described and which were waited for."""
+
+    def __init__(
+        self, note: str | None = "a cat glaring at a mug", delay: float = 0.0
+    ) -> None:
+        """Answer every wait with ``note``, after ``delay``."""
+        self.note = note
+        self.delay = delay
+        self.started: list[tuple[int, int]] = []
+        self.waited: list[tuple[int, int]] = []
+
+    def start(self, chat_id: int, message_id: int, payload: dict) -> tuple[int, int]:
+        """Record a started description, standing in for its task."""
+        self.started.append((chat_id, message_id))
+        return (chat_id, message_id)
+
+    async def wait_briefly(self, job: tuple[int, int]) -> str | None:
+        """Record what an event waited for, taking its time about it."""
+        self.waited.append(job)
+        if self.delay:
+            await asyncio.sleep(self.delay)
+        return self.note
+
+
+def test_format_event_carries_what_the_picture_turned_out_to_be() -> None:
+    """An event says what was sent, not merely that something was."""
+    message = make_message(text=None, photo=PHOTO, caption="look")
+    event = format_event(message, UTC_TZ, media_note="a dog in sunglasses")
+    assert event.endswith("(msg 42): <photo: a dog in sunglasses> look")
+
+
+def test_format_event_names_media_it_has_no_description_for() -> None:
+    """Undescribed media still reads as its Telegram kind."""
+    message = make_message(text=None, photo=PHOTO)
+    assert format_event(message, UTC_TZ).endswith("(msg 42): <photo>")
+
+
+async def test_addressed_media_is_described_before_the_event() -> None:
+    """A picture the agent is about to hear about is worth a short wait."""
+    agent = FakeAgent()
+    lens = FakeLens()
+    message = make_message(text=None, photo=PHOTO, caption="look @libertati_bot")
+    await on_message(
+        message,
+        agent,
+        UTC_TZ,
+        ME,
+        OPEN_REGISTRY,
+        FakeTopicDB(),  # type: ignore[arg-type]
+        cast(Any, lens),
+    )
+    assert lens.waited == [(100, 42)]
+    assert "<photo: a cat glaring at a mug> look" in agent.events[0]
+
+
+async def test_a_message_carrying_no_media_never_reaches_the_lens() -> None:
+    """Every message passes here; only some are worth serializing."""
+    lens = FakeLens()
+    await on_message(
+        make_message(text="hello"),
+        FakeAgent(),
+        UTC_TZ,
+        ME,
+        OPEN_REGISTRY,
+        FakeTopicDB(),  # type: ignore[arg-type]
+        cast(Any, lens),
+    )
+    assert lens.started == []
+    assert lens.waited == []
+
+
+async def test_a_slow_look_does_not_let_the_next_message_overtake() -> None:
+    """The picture must reach the agent before the question about it."""
+    agent = FakeAgent()
+    lens = FakeLens(delay=0.05)
+    order = ChatOrder()
+    photo = make_message(text=None, photo=PHOTO, caption="look @libertati_bot")
+    question = make_message(message_id=43, text="what is it? @libertati_bot")
+    first = asyncio.create_task(
+        on_message(
+            photo,
+            agent,
+            UTC_TZ,
+            ME,
+            OPEN_REGISTRY,
+            FakeTopicDB(),  # type: ignore[arg-type]
+            cast(Any, lens),
+            order,
+        )
+    )
+    # Long enough for the photo's handler to be waiting on its note.
+    await asyncio.sleep(0.01)
+    await on_message(
+        question,
+        agent,
+        UTC_TZ,
+        ME,
+        OPEN_REGISTRY,
+        FakeTopicDB(),  # type: ignore[arg-type]
+        cast(Any, lens),
+        order,
+    )
+    await first
+
+    assert "<photo: a cat glaring at a mug> look" in agent.events[0]
+    assert "what is it?" in agent.events[1]
+
+
+async def test_group_media_nobody_addressed_is_still_described() -> None:
+    """It rides along with a later event, and the note should be ready."""
+    agent = FakeAgent()
+    lens = FakeLens()
+    message = make_group_message(text=None, photo=PHOTO)
+    await on_message(
+        message,
+        agent,
+        UTC_TZ,
+        ME,
+        OPEN_REGISTRY,
+        FakeTopicDB(),  # type: ignore[arg-type]
+        cast(Any, lens),
+    )
+    assert agent.events == []
+    # Started, not awaited: nothing is waiting on this one.
+    assert lens.started == [(-500, 42)]
+    assert lens.waited == []
+
+
+async def test_media_in_an_unapproved_chat_is_never_looked_at(tmp_path: Path) -> None:
+    """Approval gates the eyes too, not just what reaches the agent."""
+    registry = ChatRegistry(tmp_path / "chats.toml", enabled=True)
+    lens = FakeLens()
+    await on_message(
+        make_message(text=None, photo=PHOTO),
+        FakeAgent(),
+        UTC_TZ,
+        ME,
+        registry,
+        FakeTopicDB(),  # type: ignore[arg-type]
+        cast(Any, lens),
+    )
+    assert lens.started == []
+    assert lens.waited == []
 
 
 async def test_on_message_approval_gate(tmp_path: Path) -> None:

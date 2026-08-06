@@ -66,6 +66,39 @@ def test_pruning_requires_current_turn_reasoning() -> None:
         make_settings(reasoning_context="omit", prune_completed_reasoning=True)
 
 
+def test_media_models_are_named_and_share_the_one_endpoint() -> None:
+    """The shipped file describes media, over base_url like everything."""
+    settings = make_settings()
+    assert settings.media_model
+    assert settings.transcribe_model
+    assert settings.media_dir == Path("data/media")
+    # An answer is asked for, read once and thrown away, so it may run
+    # longer than the note every transcript carries.
+    assert settings.media_answer_chars > settings.media_note_chars
+    # There is no second route or key to get them wrong: whatever is
+    # named here has to be a model the configured provider serves.
+    assert not hasattr(settings, "media_base_url")
+    assert not hasattr(settings, "media_api_key")
+
+
+def test_media_is_off_until_a_model_is_named() -> None:
+    """Leaving the model unset is what turns the whole path off."""
+    settings = Settings(bot_token="t", api_key="k", model="m", media_model=None)
+    assert settings.media_model is None
+
+
+def test_media_frames_and_note_length_must_be_positive() -> None:
+    """Zero frames or a zero-length note would describe nothing."""
+    with pytest.raises(ValidationError):
+        Settings(bot_token="t", api_key="k", model="m", media_max_frames=0)
+    with pytest.raises(ValidationError):
+        Settings(bot_token="t", api_key="k", model="m", media_note_chars=0)
+    with pytest.raises(ValidationError):
+        Settings(bot_token="t", api_key="k", model="m", media_wait_seconds=-1)
+    with pytest.raises(ValidationError):
+        Settings(bot_token="t", api_key="k", model="m", media_answer_chars=0)
+
+
 def test_dream_defaults_valid() -> None:
     """The shipped dream knobs pass validation."""
     settings = make_settings()

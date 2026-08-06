@@ -25,6 +25,7 @@ from libertati.tools import (
     DREAM_API_TOOLS,
     DREAM_TOOL_NAMES,
     GATED_CHAT_ARGS,
+    MEDIA_TOOLS,
     MESSAGING_TOOLS,
     SLEEP_TOOLS,
     TOOL_PARAMETER_SCHEMAS,
@@ -89,6 +90,11 @@ class FakeDB:
         self.topics: list[dict] = []
         self.observed_topics: set[tuple[int, int]] = set()
         self.usage: list[dict] = []
+        self.payloads: dict[tuple[int, int], dict] = {}
+
+    async def message_payload(self, chat_id: int, message_id: int) -> dict | None:
+        """Return the canned raw payload of one stored message."""
+        return self.payloads.get((chat_id, message_id))
 
     async def recent_messages(
         self,
@@ -1108,6 +1114,130 @@ async def test_list_chats() -> None:
 
 
 # ==========================================================
+#                          Media
+# ==========================================================
+
+
+class FakeLens:
+    """Media lens that answers with one canned note."""
+
+    def __init__(self, note: str | None = "a cat glaring at a mug") -> None:
+        """Answer every look with ``note`` and record what was asked."""
+        self.note = note
+        self.calls: list[tuple[int, int]] = []
+        self.questions: list[str] = []
+
+    async def look(self, chat_id: int, message_id: int, payload: dict) -> str | None:
+        """Record the request and return the canned note."""
+        self.calls.append((chat_id, message_id))
+        return self.note
+
+    async def ask(
+        self, chat_id: int, message_id: int, payload: dict, question: str
+    ) -> str | None:
+        """Record the question and answer it in the canned way."""
+        self.questions.append(question)
+        return None if self.note is None else f"{self.note} — asked {question!r}"
+
+
+PHOTO_PAYLOAD = {
+    "photo": [{"file_id": "f", "file_unique_id": "u", "width": 320, "height": 240}]
+}
+
+
+async def test_look_at_media_describes_a_stored_message() -> None:
+    """The tool hands back what the lens made of the file."""
+    fake_db = FakeDB()
+    fake_db.payloads[(100, 7)] = PHOTO_PAYLOAD
+    lens = FakeLens()
+    box = make_toolbox(db=fake_db, lens=cast(Any, lens))
+
+    result = await box.run(
+        "look_at_media",
+        json.dumps({"chat_id": 100, "message_id": 7, "question": None}),
+    )
+
+    assert result == "a cat glaring at a mug"
+    assert lens.calls == [(100, 7)]
+    assert lens.questions == []
+
+
+async def test_look_at_media_takes_a_question_without_touching_the_note() -> None:
+    """A second look answers the asker; the stored line is unchanged."""
+    fake_db = FakeDB()
+    fake_db.payloads[(100, 7)] = PHOTO_PAYLOAD
+    lens = FakeLens()
+    box = make_toolbox(db=fake_db, lens=cast(Any, lens))
+
+    result = await box.run(
+        "look_at_media",
+        json.dumps(
+            {"chat_id": 100, "message_id": 7, "question": "what does the sign say?"}
+        ),
+    )
+
+    assert "asked 'what does the sign say?'" in result
+    # The describing path is what writes a note, and it never ran.
+    assert lens.calls == []
+    assert lens.questions == ["what does the sign say?"]
+
+
+async def test_look_at_media_needs_the_message_and_some_media() -> None:
+    """A message nobody stored, or one with only text, is refused."""
+    fake_db = FakeDB()
+    fake_db.payloads[(100, 8)] = {"text": "hi"}
+    box = make_toolbox(db=fake_db, lens=cast(Any, FakeLens()))
+
+    missing = await box.run(
+        "look_at_media",
+        json.dumps({"chat_id": 100, "message_id": 7, "question": None}),
+    )
+    textual = await box.run(
+        "look_at_media",
+        json.dumps({"chat_id": 100, "message_id": 8, "question": None}),
+    )
+
+    assert "was not observed" in missing
+    assert "carries no media" in textual
+
+
+async def test_look_at_media_reports_a_file_it_could_not_read() -> None:
+    """A failed description is an error string, never an exception."""
+    fake_db = FakeDB()
+    fake_db.payloads[(100, 7)] = PHOTO_PAYLOAD
+    box = make_toolbox(db=fake_db, lens=cast(Any, FakeLens(note=None)))
+
+    result = await box.run(
+        "look_at_media",
+        json.dumps({"chat_id": 100, "message_id": 7, "question": None}),
+    )
+
+    assert result.startswith("error:")
+    assert "photo" in result
+
+
+async def test_look_at_media_does_not_exist_without_eyes() -> None:
+    """No media model configured means the tool is not there at all."""
+    result = await make_toolbox().run(
+        "look_at_media",
+        json.dumps({"chat_id": 100, "message_id": 7, "question": None}),
+    )
+    assert result == "error: unknown tool 'look_at_media'"
+
+
+def test_dreams_cannot_look_at_media() -> None:
+    """A dream persists nothing but its mind files — notes included."""
+    assert not (function_names(MEDIA_TOOLS) & DREAM_TOOL_NAMES)
+    assert not (function_names(MEDIA_TOOLS) & function_names(DREAM_API_TOOLS))
+
+
+def test_build_tools_media_toggle() -> None:
+    """Looking is offered only when something can answer."""
+    assert all(tool not in build_tools(False) for tool in MEDIA_TOOLS)
+    assert all(tool in build_tools(False, media=True) for tool in MEDIA_TOOLS)
+
+
+# ==========================================================
 #                    Chat approval gating
 # ==========================================================
 
@@ -1389,8 +1519,8 @@ async def test_summarize_memory_overviews_notes(tmp_path: Path) -> None:
 
 def test_build_tools_web_search_toggle() -> None:
     """Web search is appended only when enabled."""
-    assert build_tools(False) == TOOLS
-    assert build_tools(True) == [*TOOLS, {"type": "web_search"}]
+    assert build_tools(False, media=True) == TOOLS
+    assert build_tools(True, media=True) == [*TOOLS, {"type": "web_search"}]
 
 
 # ==========================================================
@@ -1465,8 +1595,8 @@ async def test_dream_tool_absent_without_a_gate() -> None:
 
 def test_build_tools_dreaming_toggle() -> None:
     """The `dream` tool only appears when a dream budget exists."""
-    assert build_tools(False) == TOOLS
-    assert build_tools(False, dreaming=True) == [*TOOLS, *SLEEP_TOOLS]
+    assert build_tools(False, media=True) == TOOLS
+    assert build_tools(False, media=True, dreaming=True) == [*TOOLS, *SLEEP_TOOLS]
 
 
 # ==========================================================

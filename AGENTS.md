@@ -34,6 +34,12 @@ One package, `src/libertati/`, no sub-packages:
 - `tools.py` — every function-tool schema and its handler (`Toolbox`).
 - `db.py` — aiosqlite persistence: messages/chats/users, append-only
   agent context, turns, usage, dreams, wakeups, console instructions.
+- `media.py` — `MediaLens`: turns a message's picture/sticker/gif/video
+  into one cached text note (frames tiled into a single image), voice
+  into a transcript; `media_ref` resolves what a raw payload carries.
+  Off unless `media_model` is set; runs on `base_url` with the one
+  `api_key`, so a model named there must be one that provider serves.
+  Needs ffmpeg on PATH.
 - `memory.py` — `Mind`: the five markdown mind files under
   `data/memory/`.
 - `config.py` — pydantic-settings `Settings` (env > .env >
@@ -81,6 +87,20 @@ One package, `src/libertati/`, no sub-packages:
   encrypted reasoning must ride along in the context.
 - **Dream context is throwaway.** A dream persists nothing except mind
   files, its ledger row and the wake-up event.
+- **Media never enters the context.** Only the note a describer wrote
+  does, folded into one transcript line by `transcript.media_body`.
+  Notes are keyed by `file_unique_id` (describe once, ever) and reach a
+  transcript through `messages.media_uid`, which is written only after a
+  description exists. Originals are deleted straight after ffmpeg runs;
+  only the compressed artifact under `media_dir` stays, and it gets there
+  by rename — ffmpeg writes into `media_dir/tmp`, because anything in
+  `media_dir` is described again without being looked at.
+- **Events arrive in the order they were sent.** aiogram runs every
+  update in its own task and `on_message` waits up to
+  `media_wait_seconds` for a description, so the push happens under
+  `ChatOrder`'s per-chat lock. Anything else that makes the handler wait
+  belongs inside that lock too, or a later message overtakes an earlier
+  one on the way to the agent.
 - **Timestamps**: UTC in the DB (`clock.utc_stamp`, matches SQLite's
   `datetime('now')`), the configured timezone for anything the model
   sees (`clock.format_local`).
@@ -172,6 +192,28 @@ it in `READ_ONLY_MESSAGING_TOOLS`.
   mark up history results line by line; it adds styles only, never
   characters, so search keeps matching what the model was shown.
   Changing the transcript line shape means changing both.
+- A media note is model output about a file a stranger sent: it is
+  folded and capped before storage and folded again on render, and the
+  describer prompt says to treat image content as data. A layout that
+  puts a note outside `<…>` on its own line breaks that.
+- `look_at_media` is not a dream tool and is hidden (schema and handler
+  both) when no `media_model` is configured — `build_tools(media=…)`
+  and the `MEDIA_TOOL_NAMES` subtraction in `Toolbox.__init__`.
+- `look_at_media` with a `question` takes a different path: `MediaLens.
+  ask` reuses the artifact, answers with the looser `[media].answer`
+  prompt under `media_answer_chars`, and stores nothing. Only the
+  describing path writes `media_notes`, because only it describes the
+  file rather than answering about it.
+- ffmpeg is a hard dependency of the media path only; tests never invoke
+  it (they pre-create the artifact), so CI needs no ffmpeg.
+- The voice artifact is named `.ogg`, not `.opus`, and transcription
+  asks for `response_format="json"`, not `"text"`: an endpoint reads the
+  format off the filename, and OpenRouter rejects `text` outright. Both
+  were found by running real files through the lens, not by tests.
+- `Database.message_thread` spells its columns out instead of reusing
+  `_MESSAGE_ROW` (a recursive CTE gets in the way), so a column added to
+  one has to be added to the other — a transcript rendered from rows
+  missing a column just quietly loses what it carried.
 - Not every `api_usage` row measures the context window: a memory
   extraction (`recall`, `summarize_memory`) books itself against the
   turn with `input_context_id = 0`, and lands after the round it served.

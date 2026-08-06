@@ -15,6 +15,8 @@ class Prompts:
     web_search: str
     recall: str
     summary: str
+    media_describe: str
+    media_answer: str
     dream: str
     dream_nudge: str
     dream_tool: str
@@ -41,6 +43,8 @@ def load_prompts(path: Path) -> Prompts:
         web_search=_required(data, "agent", "web_search"),
         recall=_required(data, "memory", "recall"),
         summary=_required(data, "memory", "summary"),
+        media_describe=_required(data, "media", "describe"),
+        media_answer=_required(data, "media", "answer"),
         dream=_required(data, "dream", "system"),
         dream_nudge=_required(data, "dream", "nudge"),
         dream_tool=_required(data, "dream", "tool"),

@@ -55,6 +55,9 @@ class Settings(BaseSettings):
     db_path: Path = Path("data/libertati.db")
     # Directory holding SOUL.md / MEMORY.md / INBOX.md / DREAMS.md.
     memory_dir: Path = Path("data/memory")
+    # Directory holding the compressed media artifacts (one small webp
+    # or opus per described file); originals are never kept.
+    media_dir: Path = Path("data/media")
 
     # ==========================================================
     #                     Model & reasoning
@@ -89,6 +92,29 @@ class Settings(BaseSettings):
     # event that triggered the turn is not re-queued, so giving up early
     # loses it — and retrying forever holds the turn lock.
     api_retries: int = 3
+
+    # ==========================================================
+    #                          Media
+    # ==========================================================
+
+    # Vision model describing pictures, stickers and video frames in a
+    # sentence or two, on the same endpoint as everything else; None
+    # leaves media undescribed (``<photo>``).
+    media_model: str | None = None
+    # Speech-to-text model for voice messages; None leaves them
+    # undescribed. Needs a provider with a transcription endpoint.
+    transcribe_model: str | None = None
+    # Frames sampled from a gif/video and tiled into one image.
+    media_max_frames: int = 3
+    # Cap on one stored description. Notes ride along in transcripts and
+    # events, so a rambling one would be paid for on every later turn.
+    media_note_chars: int = 220
+    # Cap on one answer to a look_at_media question. Longer than a note:
+    # it is read once, by the agent that asked, and never stored.
+    media_answer_chars: int = 700
+    # How long an event waits for the description of the media that
+    # triggered it before going out without one (the work continues).
+    media_wait_seconds: float = 6.0
 
     # ==========================================================
     #                      Context window
@@ -159,6 +185,19 @@ class Settings(BaseSettings):
             raise ValueError(
                 "prune_completed_reasoning requires reasoning_context='current_turn'"
             )
+        return self
+
+    @model_validator(mode="after")
+    def _validate_media(self) -> "Settings":
+        """Reject media settings that would describe nothing usefully."""
+        if self.media_max_frames < 1:
+            raise ValueError("media_max_frames must be positive")
+        if self.media_note_chars < 1:
+            raise ValueError("media_note_chars must be positive")
+        if self.media_answer_chars < 1:
+            raise ValueError("media_answer_chars must be positive")
+        if self.media_wait_seconds < 0:
+            raise ValueError("media_wait_seconds must not be negative")
         return self
 
     @model_validator(mode="after")

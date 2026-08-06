@@ -60,6 +60,17 @@ CREATE INDEX IF NOT EXISTS idx_messages_chat_date
 CREATE INDEX IF NOT EXISTS idx_messages_from_user
     ON messages (from_user_id);
 
+-- What a media file turned out to depict, in words. Keyed by Telegram's
+-- file_unique_id rather than by message: the same sticker or forwarded
+-- photo appears in many chats and is worth describing exactly once.
+CREATE TABLE IF NOT EXISTS media_notes (
+    file_unique_id TEXT PRIMARY KEY,
+    kind           TEXT NOT NULL,
+    note           TEXT NOT NULL,
+    model          TEXT NOT NULL,
+    created_at     TEXT NOT NULL DEFAULT (datetime('now'))
+);
+
 -- Last message exposed through get_recent_messages, per chat/topic.  Zero
 -- represents a whole-chat cursor; Telegram topic ids are positive.
 CREATE TABLE IF NOT EXISTS message_read_cursors (
@@ -223,6 +234,10 @@ class Database:
         )
         await self._ensure_column("api_usage", "dream_id", "INTEGER")
         await self._ensure_column("messages", "message_thread_id", "INTEGER")
+        # Filled when a message's media is described, not when it is
+        # saved: it is the join key to media_notes, and a message whose
+        # file nobody has looked at has no note to join to.
+        await self._ensure_column("messages", "media_uid", "TEXT")
         # Backfill topic ids for rows saved before the column existed, and
         # strip Telegram's forum pseudo-replies (every non-reply message in
         # a topic "replies to" the topic-creation service message, which
@@ -632,12 +647,16 @@ class Database:
         async with self.conn.execute(query) as cursor:
             return [dict(row) for row in await cursor.fetchall()]
 
-    #: Message columns returned to the LLM as chat context.
+    #: Message columns returned to the LLM as chat context. The media
+    #: note rides along so a picture reads as what it depicts wherever a
+    #: transcript is rendered, instead of as a bare ``<photo>``.
     _MESSAGE_ROW = """
         SELECT m.message_id, m.date, m.outgoing, u.username, u.first_name,
                m.text, m.caption, m.content_type, m.message_thread_id,
-               m.reply_to_message_id
-        FROM messages m LEFT JOIN users u ON u.id = m.from_user_id
+               m.reply_to_message_id, n.note AS media_note
+        FROM messages m
+        LEFT JOIN users u ON u.id = m.from_user_id
+        LEFT JOIN media_notes n ON n.file_unique_id = m.media_uid
     """
 
     async def recent_messages(
@@ -818,6 +837,11 @@ class Database:
         :meth:`recent_messages` plus ``reply_to_message_id`` so the
         reply structure is visible. When the thread exceeds ``limit``
         the newest messages are kept. Unknown messages yield no rows.
+
+        The recursive CTE keeps this query from reusing
+        :data:`_MESSAGE_ROW`, so its column list has to track that one by
+        hand — a transcript rendered from rows missing a column silently
+        loses what the column carried.
         """
         query = r"""
             WITH RECURSIVE thread (message_id, reply_to_message_id) AS (
@@ -832,8 +856,10 @@ class Database:
             )
             SELECT m.message_id, m.date, m.outgoing, u.username, u.first_name,
                    m.text, m.caption, m.content_type, m.message_thread_id,
-                   m.reply_to_message_id
-            FROM messages m LEFT JOIN users u ON u.id = m.from_user_id
+                   m.reply_to_message_id, n.note AS media_note
+            FROM messages m
+            LEFT JOIN users u ON u.id = m.from_user_id
+            LEFT JOIN media_notes n ON n.file_unique_id = m.media_uid
             WHERE m.chat_id = :chat_id
               AND m.message_id IN (SELECT message_id FROM thread)
             ORDER BY m.date DESC, m.message_id DESC
@@ -1007,6 +1033,62 @@ class Database:
         """
         async with self.conn.execute(query, [file_id, *chat_ids]) as cursor:
             return await cursor.fetchone() is not None
+
+    async def message_payload(self, chat_id: int, message_id: int) -> dict | None:
+        """Return one stored message's raw Telegram payload, decoded.
+
+        The dedicated columns cover what a transcript needs; everything
+        else — a sticker's set, a video's duration, the file ids behind
+        either — only exists here.
+        """
+        async with self.conn.execute(
+            "SELECT raw FROM messages WHERE chat_id = ? AND message_id = ?",
+            (chat_id, message_id),
+        ) as cursor:
+            row = await cursor.fetchone()
+        return json.loads(row["raw"]) if row else None
+
+    async def media_note(self, file_unique_id: str) -> str | None:
+        """Return what a media file was described as, if anyone has."""
+        async with self.conn.execute(
+            "SELECT note FROM media_notes WHERE file_unique_id = ?",
+            (file_unique_id,),
+        ) as cursor:
+            row = await cursor.fetchone()
+        return row["note"] if row else None
+
+    async def save_media_note(
+        self, file_unique_id: str, kind: str, note: str, model: str
+    ) -> None:
+        """Store a media file's description, replacing any older one.
+
+        Replacing rather than ignoring the conflict: a re-description is
+        only ever asked for deliberately (a better model, a bad note),
+        and it should be the one that sticks.
+        """
+        await self.conn.execute(
+            """
+            INSERT INTO media_notes (file_unique_id, kind, note, model)
+            VALUES (?, ?, ?, ?)
+            ON CONFLICT (file_unique_id) DO UPDATE SET
+                kind = excluded.kind,
+                note = excluded.note,
+                model = excluded.model,
+                created_at = datetime('now')
+            """,
+            (file_unique_id, kind, note, model),
+        )
+        await self.conn.commit()
+
+    async def set_message_media(
+        self, chat_id: int, message_id: int, file_unique_id: str
+    ) -> None:
+        """Link a stored message to the media file it carries."""
+        await self.conn.execute(
+            "UPDATE messages SET media_uid = ? WHERE chat_id = ? AND message_id = ?",
+            (file_unique_id, chat_id, message_id),
+        )
+        await self.conn.commit()
 
     async def message_exists(self, chat_id: int, message_id: int) -> bool:
         """Whether a message was observed and stored in one chat."""

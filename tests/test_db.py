@@ -857,3 +857,78 @@ async def test_last_dream_end_reports_the_newest_finish(db: Database) -> None:
     dream_id = await db.start_dream("idle")
     await db.finish_dream(dream_id, "woke", 3, "nothing much")
     assert await db.last_dream_end() is not None
+
+
+async def test_message_payload_returns_the_raw_telegram_fields(db: Database) -> None:
+    """File ids live only in the payload, and media lookups need them."""
+    sticker = {
+        "file_id": "f",
+        "file_unique_id": "u",
+        "width": 512,
+        "height": 512,
+        "is_animated": False,
+        "is_video": False,
+        "type": "regular",
+    }
+    await db.save_message(make_message(1, None, sticker=sticker))
+
+    payload = await db.message_payload(100, 1)
+    assert payload is not None
+    assert payload["sticker"]["file_id"] == "f"
+    assert await db.message_payload(100, 2) is None
+
+
+async def test_a_media_note_reaches_every_message_of_that_file(db: Database) -> None:
+    """Notes are keyed by file, so one description serves every copy."""
+    sticker = {
+        "file_id": "f",
+        "file_unique_id": "u",
+        "width": 512,
+        "height": 512,
+        "is_animated": False,
+        "is_video": False,
+        "type": "regular",
+    }
+    await db.save_message(make_message(1, None, sticker=sticker))
+    await db.save_message(make_message(2, None, date=STAMP + 60, sticker=sticker))
+    await db.save_media_note("u", "sticker", "a cat glaring", "eyes")
+    await db.set_message_media(100, 1, "u")
+    await db.set_message_media(100, 2, "u")
+
+    rows = await db.recent_messages(100, 10)
+    assert [row["media_note"] for row in rows] == ["a cat glaring"] * 2
+    assert await db.media_note("u") == "a cat glaring"
+
+
+async def test_a_thread_shows_what_its_media_turned_out_to_be(db: Database) -> None:
+    """A reply thread renders through the same transcript as the rest."""
+    sticker = {
+        "file_id": "f",
+        "file_unique_id": "u",
+        "width": 512,
+        "height": 512,
+        "is_animated": False,
+        "is_video": False,
+        "type": "regular",
+    }
+    await db.save_message(make_message(1, None, sticker=sticker))
+    await db.save_message(make_reply(2, "what is that?", 1, STAMP + 60))
+    await db.save_media_note("u", "sticker", "a cat glaring", "eyes")
+    await db.set_message_media(100, 1, "u")
+
+    rows = await db.message_thread(100, 2, 10)
+    assert [row["media_note"] for row in rows] == ["a cat glaring", None]
+
+
+async def test_an_undescribed_message_carries_no_note(db: Database) -> None:
+    """Nothing joins until a description exists for what it carries."""
+    await db.save_message(make_message(1, "hi"))
+    rows = await db.recent_messages(100, 10)
+    assert rows[0]["media_note"] is None
+
+
+async def test_re_describing_a_file_replaces_its_note(db: Database) -> None:
+    """A second look is only ever asked for to correct the first."""
+    await db.save_media_note("u", "photo", "a blurry shape", "eyes")
+    await db.save_media_note("u", "photo", "a lighthouse at dusk", "better-eyes")
+    assert await db.media_note("u") == "a lighthouse at dusk"
