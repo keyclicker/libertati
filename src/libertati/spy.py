@@ -20,10 +20,10 @@ dream directly.
 
 Per-item token figures are estimates from UTF-8 byte length, scaled per
 content shape (dense JSON framing, multi-byte prose, base64 reasoning
-blobs). The projected next context is anchored on the newest
-authoritative API usage row plus the estimate of everything appended
-since it, so the fixed instructions/tool overhead comes from real
-numbers instead of a guess. Requires the ``textual`` and ``rich`` dev
+blobs). The projected next context is anchored on the newest API usage
+row that measured the context window plus the estimate of everything
+appended since it, so the fixed instructions/tool overhead comes from
+real numbers instead of a guess. Requires the ``textual`` and ``rich`` dev
 dependencies; run via ``uv run libertati-spy``.
 """
 
@@ -223,13 +223,19 @@ def fetch_usage(
     """Return exact usage from the newest API response of one mode.
 
     Waking usage excludes dreaming rows explicitly, so a dream's cost
-    never shows up under the waking context.
+    never shows up under the waking context. Calls that answer from
+    their own input rather than from the context window — a memory
+    extraction, which books itself as ``input_context_id = 0`` — are
+    skipped too: they say nothing about the window this viewer shows,
+    and one of them lands after the round that made it.
     """
     scope = "dream_id IS NULL" if dream_id is None else "dream_id = ?"
     params = () if dream_id is None else (dream_id,)
     try:
         row = conn.execute(
-            f"{USAGE_SELECT} WHERE {scope} ORDER BY id DESC LIMIT 1", params
+            f"{USAGE_SELECT} WHERE {scope} AND input_context_id > 0"
+            " ORDER BY id DESC LIMIT 1",
+            params,
         ).fetchone()
     except sqlite3.OperationalError:
         if dream_id is not None:

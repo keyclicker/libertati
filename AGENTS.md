@@ -147,3 +147,7 @@ it in `READ_ONLY_MESSAGING_TOOLS`.
   rendered body — so a layout that moves text between the two changes
   what is findable. Highlight numbering follows the same order
   (headline first), and `spy.Match.index` is an index into it.
+- Not every `api_usage` row measures the context window: a memory
+  extraction (`recall`, `summarize_memory`) books itself against the
+  turn with `input_context_id = 0`, and lands after the round it served.
+  Anything reading "the latest usage" must skip those.
