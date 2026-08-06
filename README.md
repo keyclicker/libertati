@@ -15,8 +15,16 @@ when to reply. Plain assistant output is ignored and sends nothing.
   is persisted append-only in SQLite, with a capped tail window sent to
   the model. The model/tool round engine itself lives in `loop.py` and
   is shared with the dreaming loop.
-- **Tools** (`tools.py`): `send_message`, `get_recent_messages`, and
-  `schedule_wakeup` — the agent can set alarms for its future self.
+- **Tools** (`tools.py`): the only way the agent acts. Messaging
+  (`send_message`, `send_sticker`, `forward_message`, `react`,
+  `edit_message`, `delete_message`, `list_stickers`), alarms for its
+  future self (`schedule_wakeup`, `list_wakeups`, `cancel_wakeup`),
+  reading its own history (`list_chats`, `get_chat_info`,
+  `list_chat_speakers`, `list_topics`, `get_recent_messages`,
+  `get_unread_messages_count`, `get_message_thread`,
+  `search_messages`), memory (`remember`, `recall`,
+  `summarize_memory`) and `dream`. Every chat-scoped tool is checked
+  against the approval registry before it runs.
 - **Dreaming** (`dream.py`): after a stretch of idleness — or when the
   agent calls `dream` itself — the waking loop pauses and a
   differently-prompted loop runs one long offline session. It wanders
