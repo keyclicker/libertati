@@ -72,11 +72,6 @@ BASE64_BYTES_PER_TOKEN = 1.5
 
 _NON_ASCII = re.compile(r"[^\x00-\x7f]")
 
-#: Offset used to show UTC row timestamps in local time.
-_LOCAL_OFFSET = int(
-    (datetime.now().astimezone().utcoffset() or UTC.utcoffset(None)).total_seconds()
-)
-
 Row = tuple[int, str, str]
 
 
@@ -152,25 +147,31 @@ def body_text(kind: str, item: dict[str, Any]) -> str:
     return json.dumps(item, ensure_ascii=False)
 
 
-def local_clock(created_at: str) -> str:
-    """Render a UTC ``datetime('now')`` timestamp as local wall time."""
+def parse_stamp(created_at: str) -> datetime | None:
+    """Parse a UTC ``datetime('now')`` column, or ``None`` if malformed."""
     try:
-        seconds = (
-            int(created_at[11:13]) * 3600
-            + int(created_at[14:16]) * 60
-            + int(created_at[17:19])
-            + _LOCAL_OFFSET
-        ) % 86400
+        return datetime.strptime(created_at, "%Y-%m-%d %H:%M:%S").replace(tzinfo=UTC)
     except ValueError:
+        return None
+
+
+def local_clock(created_at: str) -> str:
+    """Render a UTC ``datetime('now')`` timestamp as local wall time.
+
+    Converted per row rather than through one offset captured at import:
+    the TUI is left running for hours, and a DST change would otherwise
+    shift every timestamp it shows by an hour.
+    """
+    stamp = parse_stamp(created_at)
+    if stamp is None:
         return "??:??:??"
-    return f"{seconds // 3600:02d}:{seconds // 60 % 60:02d}:{seconds % 60:02d}"
+    return stamp.astimezone().strftime("%H:%M:%S")
 
 
 def age_text(created_at: str) -> str:
     """Format how long ago a UTC ``datetime('now')`` timestamp was."""
-    try:
-        then = datetime.strptime(created_at, "%Y-%m-%d %H:%M:%S").replace(tzinfo=UTC)
-    except ValueError:
+    then = parse_stamp(created_at)
+    if then is None:
         return "?"
     seconds = max(0, int((datetime.now(UTC) - then).total_seconds()))
     if seconds < 60:
