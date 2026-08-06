@@ -149,6 +149,10 @@ class ModelLoop:
                     log.warning(
                         "server tool failed; disabling built-in tools and retrying"
                     )
+                    # Only for this round: a server tool usually fails
+                    # because its backend hiccuped, not because the
+                    # endpoint lacks it, and self._api_tools is what the
+                    # next round offers the model again.
                     request_tools = local_tools
                     continue
                 raise
