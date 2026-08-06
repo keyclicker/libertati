@@ -1,5 +1,6 @@
 """Tests for event formatting and routing of incoming Telegram messages."""
 
+from collections.abc import Sequence
 from pathlib import Path
 from typing import Any, cast
 from zoneinfo import ZoneInfo
@@ -8,9 +9,12 @@ from aiogram import Dispatcher
 from aiogram.types import Message, MessageReactionUpdated, User
 
 from libertati.bot import (
+    EVENT_CONTEXT_LIMIT,
+    EVENT_CONTEXT_TEXT_LIMIT,
     EVENT_TEXT_LIMIT,
     HEARTBEAT_DIGEST_LIMIT,
     deliver_wakeups,
+    event_context,
     format_event,
     format_reaction_event,
     heartbeat_digest,
@@ -189,10 +193,19 @@ class FakeAgent:
     def __init__(self) -> None:
         """Start with an empty event list."""
         self.events: list[str] = []
+        self.read_marks: list[tuple[int, int, int | None] | None] = []
 
-    async def push(self, event: str, *, activity: bool = True) -> None:
-        """Store the event."""
-        self.events.append(event)
+    async def push(
+        self,
+        event: str | Sequence[str],
+        *,
+        activity: bool = True,
+        read_mark: tuple[int, int, int | None] | None = None,
+    ) -> None:
+        """Store the event the way the agent joins its lines."""
+        lines = [event] if isinstance(event, str) else event
+        self.events.append("\n".join(lines))
+        self.read_marks.append(read_mark)
 
 
 def make_group_message(**overrides: Any) -> Message:
@@ -257,6 +270,20 @@ class FakeTopicDB:
     async def message_is_outgoing(self, chat_id: int, message_id: int) -> bool:
         """Treat message 42 as the bot's own stored message."""
         return (chat_id, message_id) == (100, 42)
+
+    async def messages_since_read(
+        self,
+        chat_id: int,
+        limit: int,
+        before_message_id: int | None = None,
+        message_thread_id: int | None = None,
+    ) -> list[dict]:
+        """Report nothing pending; the real query is tested in test_db."""
+        return []
+
+    async def message_row(self, chat_id: int, message_id: int) -> dict | None:
+        """Report the reply target as unknown."""
+        return None
 
 
 def make_reaction(**overrides: Any) -> MessageReactionUpdated:
@@ -364,6 +391,101 @@ async def test_on_message_resolves_topic_name() -> None:
     assert len(agent.events) == 1
     assert "topic 12 “Ideas”" in agent.events[0]
     assert fake_db.calls == [(-1001, 12)]
+
+
+async def test_on_message_hands_the_read_mark_to_the_agent() -> None:
+    """The cursor rides with the event, so a lost event loses no messages."""
+    agent = FakeAgent()
+    fake_db = FakeTopicDB()
+    message = make_topic_message(text="ping @libertati_bot")
+    await on_message(message, agent, UTC_TZ, ME, OPEN_REGISTRY, fake_db)  # type: ignore[arg-type]
+    assert agent.read_marks == [(-1001, 42, 12)]
+
+
+async def test_event_context_carries_what_the_agent_missed(db: Database) -> None:
+    """Messages nobody addressed the agent about ride along with the event."""
+    await db.save_message(make_message(message_id=1, text="first"))
+    await db.save_message(make_message(message_id=2, text="second"))
+    trigger = make_message(message_id=3, text="ping @libertati_bot")
+    await db.save_message(trigger)
+    lines = await event_context(db, trigger, UTC_TZ)
+    assert lines[0] == "[earlier here, not shown to you yet]"
+    assert [line for line in lines if line.startswith("1 ")] == ["1 12:00 Alice: first"]
+    assert any(line.startswith("2 ") for line in lines)
+    assert not any(line.startswith("3 ") for line in lines)
+
+
+async def test_event_context_stops_at_the_read_cursor(db: Database) -> None:
+    """Whatever an earlier event or history read already showed stays out."""
+    await db.save_message(make_message(message_id=1, text="first"))
+    await db.save_message(make_message(message_id=2, text="second"))
+    await db.mark_messages_read(100, 1)
+    trigger = make_message(message_id=3)
+    await db.save_message(trigger)
+    lines = await event_context(db, trigger, UTC_TZ)
+    assert not any(line.startswith("1 ") for line in lines)
+    assert any(line.startswith("2 ") for line in lines)
+
+
+async def test_event_context_quotes_the_reply_target(db: Database) -> None:
+    """A reply is answered against the message it answers, however old."""
+    await db.save_message(make_message(message_id=1, text="what do you think?"))
+    await db.mark_messages_read(100, 1)
+    trigger = make_message(
+        message_id=2,
+        reply_to_message={
+            "message_id": 1,
+            "date": STAMP,
+            "chat": {"id": 100, "type": "private", "first_name": "Alice"},
+            "text": "what do you think?",
+        },
+    )
+    await db.save_message(trigger)
+    lines = await event_context(db, trigger, UTC_TZ)
+    assert lines == ["[replies to] 1 12:00 Alice: what do you think?"]
+
+
+async def test_event_context_does_not_quote_a_target_it_already_shows(
+    db: Database,
+) -> None:
+    """The reply target is quoted once, not twice."""
+    await db.save_message(make_message(message_id=1, text="what do you think?"))
+    trigger = make_message(
+        message_id=2,
+        reply_to_message={
+            "message_id": 1,
+            "date": STAMP,
+            "chat": {"id": 100, "type": "private", "first_name": "Alice"},
+            "text": "what do you think?",
+        },
+    )
+    await db.save_message(trigger)
+    lines = await event_context(db, trigger, UTC_TZ)
+    assert not any(line.startswith("[replies to]") for line in lines)
+
+
+async def test_event_context_caps_what_it_quotes(db: Database) -> None:
+    """A long backlog is announced instead of copied into the event."""
+    for i in range(1, EVENT_CONTEXT_LIMIT + 4):
+        await db.save_message(make_message(message_id=i, text=f"msg {i}"))
+    trigger = make_message(message_id=EVENT_CONTEXT_LIMIT + 4)
+    await db.save_message(trigger)
+    lines = await event_context(db, trigger, UTC_TZ)
+    assert "[older ones skipped — get_recent_messages has them]" in lines
+    quoted = [line for line in lines if not line.startswith(("[", "—"))]
+    assert len(quoted) == EVENT_CONTEXT_LIMIT
+    assert quoted[-1].startswith(f"{EVENT_CONTEXT_LIMIT + 3} ")
+
+
+async def test_event_context_truncates_long_bodies(db: Database) -> None:
+    """One rambling message must not dominate the event it rides along."""
+    await db.save_message(
+        make_message(message_id=1, text="x" * (EVENT_CONTEXT_TEXT_LIMIT + 50))
+    )
+    trigger = make_message(message_id=2)
+    await db.save_message(trigger)
+    lines = await event_context(db, trigger, UTC_TZ)
+    assert any("[…50 chars]" in line for line in lines)
 
 
 async def test_deliver_wakeups_pushes_due_and_completes(db: Database) -> None:

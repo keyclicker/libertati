@@ -34,8 +34,11 @@ when to reply. Plain assistant output is ignored and sends nothing.
   but never read back — the agent wakes to a `[dream ended …]` event
   carrying its summary, and nothing else carries over. Budgeted per 24h.
 - **Wiring** (`bot.py`): aiogram handlers persist every message and push
-  it as an event; background loops deliver due wakeups, periodic
-  heartbeat status digests, and hand the agent over to a dream.
+  it as an event, together with the messages of that chat nobody has
+  shown the agent yet and the message a reply answers — so a turn
+  starts knowing the conversation instead of looking it up. Background
+  loops deliver due wakeups, periodic heartbeat status digests, and
+  hand the agent over to a dream.
 - **Storage** (`db.py`): SQLite (WAL) with full raw Telegram payloads,
   append-only model context (waking and dreaming kept apart), and exact
   API token/cache usage per turn or dream.
