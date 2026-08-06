@@ -629,7 +629,10 @@ class Database:
     async def unread_messages_count(
         self, chat_id: int, message_thread_id: int | None = None
     ) -> int:
-        """Count messages newer than the last history read for a chat/topic.
+        """Count messages past the read cursor of a chat/topic.
+
+        Events advance that cursor too, so this counts what nobody has
+        put in front of the agent — not what it neglected to fetch.
 
         Only incoming messages count: the agent's own replies are stored
         in the same table, and reporting them back as unread would make

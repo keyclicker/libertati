@@ -526,9 +526,11 @@ HISTORY_TOOLS: list[ToolParam] = [
         "type": "function",
         "name": "get_unread_messages_count",
         "description": (
-            "Count stored messages added since you last fetched recent "
-            "messages from a chat or forum topic. Call this before "
-            "get_recent_messages to choose the smallest useful limit."
+            "Count the stored messages of a chat or forum topic that "
+            "nobody has shown you yet — neither an event nor a history "
+            "read. Usually zero for a chat you have just heard from, "
+            "since an event carries its own context; a large count means "
+            "a conversation ran on without you."
         ),
         "parameters": {
             "type": "object",
