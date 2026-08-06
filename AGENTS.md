@@ -82,6 +82,9 @@ listed in `required`. Handlers return plain strings (JSON for lists)
 and never raise — `Toolbox.run` converts exceptions to `error: …`
 strings. Decide whether the dreaming loop may use it: dream tools come
 from `DREAM_API_TOOLS`, and execution is gated by `DREAM_TOOL_NAMES`.
+A new tool in `MESSAGING_TOOLS` counts as outward activity by default
+and so resets the dream idle clock; if it only looks something up, list
+it in `READ_ONLY_MESSAGING_TOOLS`.
 
 ## Conventions
 
