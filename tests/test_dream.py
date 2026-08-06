@@ -25,6 +25,12 @@ WAKE_CALL = {
     "name": "wake_up",
     "arguments": json.dumps({"summary": "say hi to Bob"}),
 }
+HABITS_CALL = {
+    "type": "function_call",
+    "call_id": "call_habits",
+    "name": "write_habits",
+    "arguments": json.dumps({"text": "answer Bob within the day"}),
+}
 READ_CALL = {
     "type": "function_call",
     "call_id": "call_read",
@@ -252,6 +258,33 @@ async def test_dream_opens_with_the_mind_files(db: Database, tmp_path: Path) -> 
     assert "Alice likes tea" in opening
     assert "Bob moved city" in opening
     assert "# Dreams\n(empty)" in opening
+
+
+async def test_dream_carries_habits_and_leaves_the_rewrite_in_its_trace(
+    db: Database, tmp_path: Path
+) -> None:
+    """Habits ride in the instructions; the old text stays recoverable.
+
+    Like a memory fold, nothing snapshots the replaced file — the dream's
+    own context trace is what a rollback would be read out of.
+    """
+    dreamer, agent, client = make_dreamer(db, tmp_path, [[HABITS_CALL], [WAKE_CALL]])
+    agent.mind.write_habits("keep it short with Anna")
+
+    await dreamer.maybe_dream()
+
+    assert "## Habits\nkeep it short with Anna" in client.calls[0]["instructions"]
+    assert agent.mind.habits() == "answer Bob within the day"
+    async with db.conn.execute(
+        "SELECT item FROM dream_context WHERE dream_id = 1 ORDER BY id"
+    ) as cursor:
+        items = [json.loads(row["item"]) for row in await cursor.fetchall()]
+    written = [
+        json.loads(item["arguments"])["text"]
+        for item in items
+        if item.get("name") == "write_habits"
+    ]
+    assert written == ["answer Bob within the day"]
 
 
 async def test_settling_early_nudges_instead_of_ending(

@@ -1,4 +1,4 @@
-"""Tests for the file-based mind (SOUL.md / MEMORY.md / INBOX.md / DREAMS.md)."""
+"""Tests for the file-based mind (SOUL.md / HABITS.md / MEMORY.md / …)."""
 
 import stat
 from pathlib import Path
@@ -7,6 +7,7 @@ import pytest
 
 from libertati.memory import (
     DEFAULT_SOUL,
+    HABITS_MAX_CHARS,
     MEMORY_MAX_CHARS,
     SOUL_MAX_CHARS,
     Mind,
@@ -24,6 +25,7 @@ def test_ensure_creates_and_seeds(tmp_path: Path) -> None:
     """First run creates the directory, seeds SOUL.md, touches the rest."""
     mind = make_mind(tmp_path)
     assert mind.soul_path.read_text(encoding="utf-8") == DEFAULT_SOUL
+    assert mind.habits_path.read_text(encoding="utf-8") == ""
     assert mind.memory_path.read_text(encoding="utf-8") == ""
     assert mind.inbox_path.read_text(encoding="utf-8") == ""
     assert mind.dreams_path.read_text(encoding="utf-8") == ""
@@ -35,6 +37,7 @@ def test_mind_files_are_private_to_their_owner(tmp_path: Path) -> None:
     assert stat.S_IMODE(mind.path.stat().st_mode) == 0o700
     for file in (
         mind.soul_path,
+        mind.habits_path,
         mind.memory_path,
         mind.inbox_path,
         mind.dreams_path,
@@ -162,6 +165,42 @@ def test_fold_inbox_failed_encoding_preserves_both_files(tmp_path: Path) -> None
 
     assert mind.read("memory") == "keep me"
     assert "fresh fact" in mind.read("inbox")
+
+
+def test_resident_omits_habits_until_there_are_any(tmp_path: Path) -> None:
+    """An empty habits file leaves no header for the model to fill."""
+    mind = make_mind(tmp_path)
+
+    assert mind.resident() == f"## Soul\n{DEFAULT_SOUL.strip()}"
+
+    mind.write_habits("keep it short with Anna")
+
+    assert mind.resident() == (
+        f"## Soul\n{DEFAULT_SOUL.strip()}\n\n## Habits\nkeep it short with Anna"
+    )
+
+
+def test_write_habits_replaces_and_can_clear(tmp_path: Path) -> None:
+    """A dream may rewrite the whole file, or decide none of it held."""
+    mind = make_mind(tmp_path)
+
+    mind.write_habits("  ask before calling  ")
+    assert mind.habits_path.read_text(encoding="utf-8") == "ask before calling\n"
+
+    mind.write_habits("   ")
+    assert mind.habits() == ""
+    assert mind.habits_path.read_text(encoding="utf-8") == ""
+
+
+def test_write_habits_rejects_oversized(tmp_path: Path) -> None:
+    """A habit list past the cap leaves the current one in place."""
+    mind = make_mind(tmp_path)
+    mind.write_habits("one real habit")
+
+    with pytest.raises(ValueError, match="over the"):
+        mind.write_habits("x" * (HABITS_MAX_CHARS + 1))
+
+    assert mind.habits() == "one real habit"
 
 
 def test_write_soul_snapshots_the_previous_version(tmp_path: Path) -> None:

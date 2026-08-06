@@ -21,8 +21,9 @@ timezone = "Europe/Kyiv"
 # SQLite database location (all chats/users/messages are stored here).
 db_path = "data/libertati.db"
 
-# Directory holding the mind files SOUL.md / MEMORY.md / INBOX.md /
-# DREAMS.md (plus soul/ snapshots written before every soul rewrite).
+# Directory holding the mind files SOUL.md / HABITS.md / MEMORY.md /
+# INBOX.md / DREAMS.md (plus soul/ snapshots written before every soul
+# rewrite).
 memory_dir = "data/memory"
 
 
@@ -117,8 +118,8 @@ typing_chars_per_second = 15.0
 # ==========================================================
 
 # While the agent sleeps the waking loop pauses and a differently-prompted
-# loop wanders, then rewrites MEMORY.md from INBOX.md, writes DREAMS.md and
-# may revise SOUL.md. A dream starts after dream_idle_minutes of quiet, or
+# loop wanders, then rewrites MEMORY.md from INBOX.md, writes DREAMS.md,
+# updates HABITS.md and may revise SOUL.md. A dream starts after dream_idle_minutes of quiet, or
 # when the agent calls the `dream` tool itself. Heartbeat turns count as
 # quiet unless the agent reached out during one. Budget 0 disables
 # dreaming entirely and hides the tool.

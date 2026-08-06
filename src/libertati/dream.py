@@ -4,8 +4,8 @@ When nothing has needed the agent for a while (or it asked to sleep), the
 waking loop is paused and this one takes over for a single long session.
 It is handed its mind files, wanders wherever its curiosity and the
 read-only tools take it, then before waking writes a reflection into
-DREAMS.md, folds INBOX.md into a rewritten MEMORY.md and may revise
-SOUL.md.
+DREAMS.md, folds INBOX.md into a rewritten MEMORY.md, updates HABITS.md
+and may revise SOUL.md.
 
 A dream's context is written to ``dream_context`` for inspection but
 never read back: the live window is dropped on waking and nothing from it
@@ -213,7 +213,7 @@ class Dreamer(ModelLoop):
         """
         self._context = []
         await self._remember({"role": "user", "content": self._opening(dream_id, note)})
-        instructions = f"{self.prompt}\n\n## Soul\n{self.mind.soul()}"
+        instructions = f"{self.prompt}\n\n{self.mind.resident()}"
         for _ in range(self.max_rounds):
             acted = await self._round(instructions, turn_id=None)
             if self.tools.wake_summary is not None:
@@ -228,8 +228,9 @@ class Dreamer(ModelLoop):
     def _opening(self, dream_id: int, note: str | None) -> str:
         """Build the event that opens a dream, mind files included.
 
-        Handing over all four files up front costs one prompt instead of
-        four rounds spent reading them back.
+        Handing over the three non-resident files up front costs one
+        prompt instead of three rounds spent reading them back; soul and
+        habits already ride in the instructions.
         """
         idle = round(self._idle_minutes())
         opening = (
