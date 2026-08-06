@@ -22,8 +22,9 @@ CI runs all four checks plus tests; keep every one green.
 One package, `src/libertati/`, no sub-packages:
 
 - `bot.py` — aiogram wiring, entry point `run()`: handlers persist every
-  message and push events to the agent; background loops for wakeups,
-  heartbeats and dream handover.
+  message and push events to the agent (with the chat context it has
+  not been shown); background loops for wakeups, heartbeats and dream
+  handover.
 - `agent.py` — `Agent(ModelLoop)`: the single waking loop; event queue,
   turn lock, context-window trimming/restore invariants.
 - `loop.py` — `ModelLoop`: one Responses-API round (model call + tool
@@ -62,6 +63,15 @@ One package, `src/libertati/`, no sub-packages:
   `_trim_dangling`; keep new code paths behind them.
 - **Append-only history.** Every context item is written through to the
   `context` table; the DB is the source of truth, the window a view.
+- **Events are composed, never quoted whole.** `Agent.push` folds each
+  line it is handed, so an event may span several lines — but only ones
+  the code built. Anything sender-controlled (a body, a name, a title)
+  goes inside a line, never becomes one, or a message could forge an
+  event of its own.
+- **What an event shows counts as read.** `on_message` advances the
+  chat/topic read cursor past everything it carried, including what the
+  cap left out; otherwise the same messages ride along with every later
+  event.
 - **`store=False` everywhere.** Nothing is stored server-side;
   encrypted reasoning must ride along in the context.
 - **Dream context is throwaway.** A dream persists nothing except mind
