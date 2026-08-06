@@ -302,15 +302,15 @@ def make_toolbox(
 ) -> Toolbox:
     """Build a Toolbox around fakes."""
     return Toolbox(
-        cast(Database, db or FakeDB()),
-        cast(Bot, bot or ExplodingBot()),
-        UTC_TZ,
-        cast(AsyncOpenAI, client or FakeClient()),
-        "recall-model",
-        cast(Mind, mind),
-        15.0,
-        RECALL_PROMPT,
-        SUMMARY_PROMPT,
+        db=cast(Database, db or FakeDB()),
+        bot=cast(Bot, bot or ExplodingBot()),
+        tz=UTC_TZ,
+        client=cast(AsyncOpenAI, client or FakeClient()),
+        recall_model="recall-model",
+        mind=cast(Mind, mind),
+        typing_chars_per_second=15.0,
+        recall_prompt=RECALL_PROMPT,
+        summary_prompt=SUMMARY_PROMPT,
         registry=registry or OPEN_REGISTRY,
         **dream,
     )

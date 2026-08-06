@@ -987,10 +987,16 @@ class Toolbox:
     explicit ``chat_id`` argument from the model. Default dispatch is
     restricted to waking tools; the dreaming loop passes its narrower
     ``allowed`` set, sharing handlers but no messaging capability.
+
+    Every dependency is keyword-only: several are same-typed strings
+    (two prompts, two model names) that a positional call could swap
+    silently, and the waking and dreaming call sites differ only in the
+    last few arguments.
     """
 
     def __init__(
         self,
+        *,
         db: Database,
         bot: Bot,
         tz: ZoneInfo,
@@ -1000,7 +1006,6 @@ class Toolbox:
         typing_chars_per_second: float,
         recall_prompt: str,
         summary_prompt: str,
-        *,
         registry: ChatRegistry,
         recall_effort: str | None = None,
         allowed: frozenset[str] | None = None,
