@@ -771,7 +771,7 @@ class SpyApp(App[None]):
         self.dream_id = dream_id
         # Newest row already on screen for the mode being viewed;
         # re-anchored to a tail on every switch.
-        self.cursor = last_id
+        self.last_id = last_id
         # Opening straight into a dream is a deliberate choice; don't
         # then drag the view somewhere else.
         self.auto = dream_id is None
@@ -787,11 +787,6 @@ class SpyApp(App[None]):
     def view(self) -> ContextView:
         """The context view widget."""
         return self.query_one(ContextView)
-
-    @property
-    def last_id(self) -> int:
-        """Newest row seen in the mode currently on screen."""
-        return self.cursor
 
     def compose(self) -> ComposeResult:
         """Create the context view, the search prompt and the status."""
@@ -811,9 +806,9 @@ class SpyApp(App[None]):
     def poll(self) -> None:
         """Append rows added since the last poll and refresh the status."""
         self.follow_dream()
-        rows = fetch_after(self.conn, self.cursor, self.dream_id)
+        rows = fetch_after(self.conn, self.last_id, self.dream_id)
         if rows:
-            self.cursor = rows[-1][0]
+            self.last_id = rows[-1][0]
             self.last_activity = rows[-1][1]
             self.view.append(rows)
         usage = fetch_usage(self.conn, self.dream_id)
@@ -854,7 +849,7 @@ class SpyApp(App[None]):
         if dream_id == self.dream_id:
             return
         self.dream_id = dream_id
-        self.cursor = tail_anchor(self.conn, self.page_size, dream_id)
+        self.last_id = tail_anchor(self.conn, self.page_size, dream_id)
         self.hint = ""
         self.last_activity = None
         self.usage = None

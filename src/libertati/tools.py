@@ -32,8 +32,10 @@ from openai.types.shared_params import Reasoning
 
 from libertati import clock
 from libertati.chats import ChatRegistry
+from libertati.config import Settings
 from libertati.db import Database
 from libertati.memory import Mind
+from libertati.prompts import Prompts
 
 if TYPE_CHECKING:  # pragma: no cover - import cycle broken for runtime
     from libertati.dream import DreamGate
@@ -68,12 +70,14 @@ def strip_citation_artifacts(text: str) -> str:
 def typing_delay(text: str, chars_per_second: float) -> float:
     """How long to pretend to type a message, with human jitter.
 
-    A non-positive speed disables the emulation (returns 0).
+    A non-positive speed disables the emulation (returns 0). The cap is
+    applied after the jitter, so it really is a cap: multiplying a capped
+    value by up to 1.2 let a long message stall the turn for 9.6s.
     """
     if chars_per_second <= 0:
         return 0.0
     seconds = TYPING_MIN_SECONDS + len(text) / chars_per_second
-    return min(seconds, TYPING_MAX_SECONDS) * random.uniform(0.8, 1.2)
+    return min(seconds * random.uniform(0.8, 1.2), TYPING_MAX_SECONDS)
 
 
 # ==========================================================
@@ -1076,6 +1080,42 @@ class Toolbox:
             if name in allowed_names
         }
 
+    @classmethod
+    def from_settings(
+        cls,
+        settings: Settings,
+        prompts: Prompts,
+        *,
+        db: Database,
+        bot: Bot,
+        tz: ZoneInfo,
+        client: AsyncOpenAI,
+        mind: Mind,
+        registry: ChatRegistry,
+        **extra: Any,
+    ) -> "Toolbox":
+        """Build a toolbox from the config the waking and dreaming loops share.
+
+        Both loops read the same settings the same way — including the
+        fallbacks from an unset recall model — and differ only in
+        ``extra`` (a dream gate on one side, a restricted tool set on the
+        other). Deriving that once keeps the two from drifting apart.
+        """
+        return cls(
+            db=db,
+            bot=bot,
+            tz=tz,
+            client=client,
+            recall_model=settings.recall_model or settings.model,
+            mind=mind,
+            typing_chars_per_second=settings.typing_chars_per_second,
+            recall_prompt=prompts.recall,
+            summary_prompt=prompts.summary,
+            registry=registry,
+            recall_effort=settings.recall_reasoning_effort,
+            **extra,
+        )
+
     async def run(self, name: str, arguments: str | None) -> str:
         """Execute one tool call and return its result as a string.
 
@@ -1093,9 +1133,12 @@ class Toolbox:
             return "error: invalid tool arguments"
         if not valid_tool_arguments(name, args):
             return "error: invalid tool arguments"
-        for key in GATED_CHAT_ARGS.get(name, ()):
-            chat_id = args[key]
-            if not self.registry.check(chat_id):
+        gated = [args[key] for key in GATED_CHAT_ARGS.get(name, ())]
+        # One read for the whole call: the registry re-parses its file on
+        # every query, and forward_message names two chats.
+        approved = self.registry.approved(gated)
+        for chat_id in gated:
+            if chat_id not in approved:
                 return f"error: chat {chat_id} is not approved"
         self.steps += 1
         if name in OUTWARD_TOOL_NAMES:

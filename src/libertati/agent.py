@@ -40,6 +40,11 @@ PRIVATE_OUTPUT_NUDGE_PREFIX = "[delivery correction]"
 EPHEMERAL_TYPES = ("reasoning", "message")
 
 
+def one_line(text: str | None) -> str:
+    """Collapse whitespace runs (newlines included) to single spaces."""
+    return " ".join((text or "").split())
+
+
 def private_output_nudge(text: str) -> str:
     """Build an internal retry message carrying the undelivered text."""
     return f"""{PRIVATE_OUTPUT_NUDGE_PREFIX}
@@ -94,18 +99,15 @@ class Agent(ModelLoop):
             client=client,
             model=settings.model,
             db=db,
-            tools=Toolbox(
+            tools=Toolbox.from_settings(
+                settings,
+                self.prompts,
                 db=db,
                 bot=bot,
                 tz=self.tz,
                 client=client,
-                recall_model=settings.recall_model or settings.model,
                 mind=self.mind,
-                typing_chars_per_second=settings.typing_chars_per_second,
-                recall_prompt=self.prompts.recall,
-                summary_prompt=self.prompts.summary,
                 registry=registry,
-                recall_effort=settings.recall_reasoning_effort,
                 dream_gate=dream_gate if dreaming else None,
             ),
             api_tools=build_tools(settings.web_search, dreaming=dreaming),
@@ -160,11 +162,18 @@ class Agent(ModelLoop):
     async def push(self, event: str, *, activity: bool = True) -> None:
         """Queue an external event (formatted as text) for the agent.
 
+        An event is always exactly one line. Every caller interpolates
+        text it does not control — a chat title, a sender's name, the
+        agent's own wakeup note, a dream summary — and a newline in any
+        of them would read as a second event: a message from a chat
+        nobody wrote in, a wakeup nobody scheduled. Collapsing here
+        rather than at each caller is what makes that structural.
+
         ``activity=False`` marks events (heartbeats) that should not by
         themselves reset the dream idle clock; the clock still moves
         when the turn they trigger reaches out to anyone.
         """
-        await self._queue.put((event, activity))
+        await self._queue.put((one_line(event), activity))
 
     async def run_forever(self) -> None:
         """Consume events forever; cancel the task to stop.

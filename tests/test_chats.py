@@ -82,6 +82,35 @@ def test_broken_file_denies_and_preserves(tmp_path: Path) -> None:
     assert registry.path.read_text(encoding="utf-8") == "100 = maybe???\n"
 
 
+def test_unreadable_file_denies_instead_of_raising(tmp_path: Path) -> None:
+    """An I/O error is as denying as a syntax error, never an exception.
+
+    check() runs inside Toolbox.run, which is documented never to raise,
+    and register() inside a Telegram handler.
+    """
+    registry = make_registry(tmp_path)
+    registry.path.write_text("100 = true\n", encoding="utf-8")
+    registry.path.chmod(0o000)
+    try:
+        assert registry.check(100) is False
+        assert registry.approved([100]) == set()
+        assert registry.register(100, "Alice (private)") is False
+    finally:
+        registry.path.chmod(0o600)
+
+
+def test_unwritable_directory_denies_instead_of_raising(tmp_path: Path) -> None:
+    """A registry that cannot be appended to still denies the new chat."""
+    directory = tmp_path / "locked"
+    directory.mkdir()
+    registry = ChatRegistry(directory / "chats.toml", True)
+    directory.chmod(0o500)
+    try:
+        assert registry.register(-500, "friends (group)") is False
+    finally:
+        directory.chmod(0o700)
+
+
 def test_label_whitespace_is_collapsed(tmp_path: Path) -> None:
     """Newlines in a chat name can't break the TOML file."""
     registry = make_registry(tmp_path)
