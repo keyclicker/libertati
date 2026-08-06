@@ -278,6 +278,23 @@ def test_waking_usage_ignores_dreaming_rows() -> None:
     conn.close()
 
 
+def test_usage_ignores_calls_that_never_read_the_context() -> None:
+    """A memory extraction booked after a round does not hide the round.
+
+    `recall` bills its own call to the same turn with no context id, and
+    it lands last — so the newest row is not the one that measured the
+    window the viewer is showing.
+    """
+    conn = make_context_db(0)
+    append_usage(conn, 18400, context_id=1)
+    append_usage(conn, 900, context_id=0)
+
+    usage = fetch_usage(conn)
+
+    assert usage == Usage(18400, 9200, 100, 1200, 900, 1)
+    conn.close()
+
+
 def test_usage_survives_a_database_without_the_dream_column() -> None:
     """An unmigrated database still shows its waking usage."""
     conn = sqlite3.connect(":memory:")
