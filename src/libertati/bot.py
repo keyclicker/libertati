@@ -48,6 +48,11 @@ DREAM_POLL_SECONDS = 60
 #: Max message body length quoted into an event (rest is elided).
 EVENT_TEXT_LIMIT = 1000
 
+#: Most chats/topics and pending wakeups one heartbeat spells out. Every
+#: heartbeat is appended to the agent's context for good, so an unbounded
+#: digest would grow the prompt with each one; the rest is counted.
+HEARTBEAT_DIGEST_LIMIT = 20
+
 
 def one_line(text: str | None) -> str:
     """Collapse whitespace runs (newlines included) to single spaces."""
@@ -266,12 +271,24 @@ async def wakeup_loop(agent: Agent, db: Database, tz: ZoneInfo) -> None:
         await asyncio.sleep(WAKEUP_POLL_SECONDS)
 
 
+def and_more(rendered: list[str], total: int, separator: str) -> str:
+    """Join the entries that fit and count the ones left out."""
+    hidden = total - len(rendered)
+    text = separator.join(rendered)
+    return f"{text} (+{hidden} more)" if hidden > 0 else text
+
+
 async def heartbeat_digest(db: Database, tz: ZoneInfo, registry: ChatRegistry) -> str:
     """Build the status text attached to a heartbeat event.
 
     Unapproved chats are left out — the agent shouldn't be nudged
     towards chats it isn't allowed to see. Forum chats report per topic,
     so an answered topic can't hide an unanswered one.
+
+    Both lists are capped at :data:`HEARTBEAT_DIGEST_LIMIT` entries. They
+    arrive longest-waiting and soonest-due first, so the cap keeps what
+    actually needs the agent — and the entries beyond it, whose topic
+    names are never looked up, only cost a count.
     """
     parts = []
     unanswered = [
@@ -279,7 +296,7 @@ async def heartbeat_digest(db: Database, tz: ZoneInfo, registry: ChatRegistry) -
     ]
     if unanswered:
         chats = []
-        for row in unanswered:
+        for row in unanswered[:HEARTBEAT_DIGEST_LIMIT]:
             name = row["title"] or row["first_name"] or "?"
             when = clock.format_local(datetime.fromisoformat(row["date"]), tz)
             where = f"chat {row['chat_id']}, {row['type']}"
@@ -290,18 +307,21 @@ async def heartbeat_digest(db: Database, tz: ZoneInfo, registry: ChatRegistry) -
                 if topic_name:
                     where += f" “{one_line(topic_name)}”"
             chats.append(f"“{name}” ({where}, last {when})")
-        parts.append("chats with unanswered last message: " + "; ".join(chats))
+        parts.append(
+            "chats with unanswered last message: "
+            + and_more(chats, len(unanswered), "; ")
+        )
     else:
         parts.append("no unanswered chats")
     pending = await db.pending_wakeups()
     if pending:
-        alarms = ", ".join(
+        alarms = [
             f"#{row['id']} at "
             f"{clock.format_local(clock.parse_utc_stamp(row['due_at']), tz)}: "
             f"{row['note']}"
-            for row in pending
-        )
-        parts.append(f"pending wakeups: {alarms}")
+            for row in pending[:HEARTBEAT_DIGEST_LIMIT]
+        ]
+        parts.append(f"pending wakeups: {and_more(alarms, len(pending), ', ')}")
     return ". ".join(parts)
 
 

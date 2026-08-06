@@ -9,6 +9,7 @@ from aiogram.types import Message, MessageReactionUpdated, User
 
 from libertati.bot import (
     EVENT_TEXT_LIMIT,
+    HEARTBEAT_DIGEST_LIMIT,
     deliver_wakeups,
     format_event,
     format_reaction_event,
@@ -411,3 +412,22 @@ async def test_heartbeat_digest_names_unanswered_topics(db: Database) -> None:
     digest = await heartbeat_digest(db, UTC_TZ, OPEN_REGISTRY)
     assert "topic 12 “Ideas”" in digest
     assert "topic 13" not in digest
+
+
+async def test_heartbeat_digest_caps_both_lists(db: Database) -> None:
+    """A long backlog is summarized, not spelled out into the context."""
+    over = HEARTBEAT_DIGEST_LIMIT + 3
+    for index in range(over):
+        await db.save_message(
+            make_message(
+                message_id=index,
+                chat={"id": 1000 + index, "type": "private", "first_name": "Alice"},
+            )
+        )
+        await db.add_wakeup(f"2000-01-01 00:{index:02d}:00", f"note {index}")
+
+    digest = await heartbeat_digest(db, UTC_TZ, OPEN_REGISTRY)
+
+    assert digest.count("private, last ") == HEARTBEAT_DIGEST_LIMIT
+    assert digest.count("note ") == HEARTBEAT_DIGEST_LIMIT
+    assert digest.count("(+3 more)") == 2
