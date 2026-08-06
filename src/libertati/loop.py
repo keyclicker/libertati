@@ -12,7 +12,7 @@ lives here.
 import asyncio
 import logging
 import random
-from typing import TYPE_CHECKING, Any, cast
+from typing import TYPE_CHECKING, Any, TypedDict, cast
 
 from openai import (
     APIConnectionError,
@@ -55,6 +55,44 @@ TRANSIENT_ERRORS = (APIConnectionError, RateLimitError, InternalServerError)
 #: doubles it, with jitter so a burst of turns does not resynchronize on
 #: the provider.
 RETRY_BACKOFF_SECONDS = 4.0
+
+
+class Usage(TypedDict):
+    """What one API call reported, in ``append_api_usage`` keyword shape."""
+
+    response_id: str | None
+    model: str
+    input_tokens: int
+    cached_tokens: int
+    cache_write_tokens: int
+    output_tokens: int
+    reasoning_tokens: int
+    total_tokens: int
+
+
+def response_usage(response: Any, default_model: str) -> Usage | None:
+    """Pull the token counts out of a Responses-API result.
+
+    ``None`` when the endpoint reported none at all. Compatible
+    endpoints also omit individual sections of the usage object, so each
+    nested field is read defensively; ``default_model`` names the model
+    for one that does not echo the name back.
+    """
+    usage = getattr(response, "usage", None)
+    if usage is None:
+        return None
+    input_details = getattr(usage, "input_tokens_details", None)
+    output_details = getattr(usage, "output_tokens_details", None)
+    return Usage(
+        response_id=getattr(response, "id", None),
+        model=getattr(response, "model", None) or default_model,
+        input_tokens=usage.input_tokens,
+        cached_tokens=getattr(input_details, "cached_tokens", 0) or 0,
+        cache_write_tokens=getattr(input_details, "cache_write_tokens", 0) or 0,
+        output_tokens=usage.output_tokens,
+        reasoning_tokens=getattr(output_details, "reasoning_tokens", 0) or 0,
+        total_tokens=usage.total_tokens,
+    )
 
 
 class ModelLoop:
@@ -206,6 +244,10 @@ class ModelLoop:
                     len(response.output_text),
                 )
             return False
+        # A handler may call the API itself (memory extraction does), and
+        # what it spends belongs to the same turn or dream as this round.
+        self.tools.turn_id = turn_id
+        self.tools.dream_id = self.dream_id
         for call in calls:
             result = await self.tools.run(call.name, call.arguments)
             await self._remember(
@@ -224,35 +266,23 @@ class ModelLoop:
         input_context_id: int,
     ) -> None:
         """Log authoritative usage; persist it against its turn or dream."""
-        usage = getattr(response, "usage", None)
+        usage = response_usage(response, self.model)
         if usage is None:
             return
-        input_details = getattr(usage, "input_tokens_details", None)
-        output_details = getattr(usage, "output_tokens_details", None)
-        cached_tokens = getattr(input_details, "cached_tokens", 0) or 0
-        cache_write_tokens = getattr(input_details, "cache_write_tokens", 0) or 0
-        reasoning_tokens = getattr(output_details, "reasoning_tokens", 0) or 0
         if turn_id is not None or self.dream_id is not None:
             await self.db.append_api_usage(
-                response_id=getattr(response, "id", None),
                 turn_id=turn_id,
                 dream_id=self.dream_id,
                 input_context_id=input_context_id,
-                model=getattr(response, "model", None) or self.model,
-                input_tokens=usage.input_tokens,
-                cached_tokens=cached_tokens,
-                cache_write_tokens=cache_write_tokens,
-                output_tokens=usage.output_tokens,
-                reasoning_tokens=reasoning_tokens,
-                total_tokens=usage.total_tokens,
+                **usage,
             )
         log.info(
             "api usage: input=%d cached=%d cache_write=%d "
             "output=%d reasoning=%d total=%d",
-            usage.input_tokens,
-            cached_tokens,
-            cache_write_tokens,
-            usage.output_tokens,
-            reasoning_tokens,
-            usage.total_tokens,
+            usage["input_tokens"],
+            usage["cached_tokens"],
+            usage["cache_write_tokens"],
+            usage["output_tokens"],
+            usage["reasoning_tokens"],
+            usage["total_tokens"],
         )

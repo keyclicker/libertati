@@ -34,6 +34,7 @@ from libertati import clock
 from libertati.chats import ChatRegistry
 from libertati.config import Settings
 from libertati.db import Database
+from libertati.loop import response_usage
 from libertati.memory import Mind
 from libertati.prompts import Prompts
 from libertati.transcript import render_transcript
@@ -1072,6 +1073,11 @@ class Toolbox:
         self.outward_calls = 0
         #: Set by ``wake_up`` to the summary that ends the dream.
         self.wake_summary: str | None = None
+        #: Which turn or dream the calls being dispatched belong to; the
+        #: loop sets them each round so a handler's own API calls land on
+        #: the same ledger row as the round that asked for them.
+        self.turn_id: int | None = None
+        self.dream_id: int | None = None
         self._handlers = {
             # messaging
             "send_message": self._send_message,
@@ -1558,7 +1564,26 @@ class Toolbox:
             reasoning=reasoning,
             store=False,
         )
+        await self._record_memory_usage(response)
         return response.output_text or "recall came back empty"
+
+    async def _record_memory_usage(self, response: Any) -> None:
+        """Bill one memory-extraction call to the turn or dream that made it.
+
+        These calls bypass the round engine, so without this the ledger
+        would miss them entirely — and a recall can happen on every turn.
+        They answer from their own input rather than from the context
+        window, which is what ``input_context_id = 0`` records.
+        """
+        usage = response_usage(response, self.recall_model)
+        if usage is None or (self.turn_id is None and self.dream_id is None):
+            return
+        await self.db.append_api_usage(
+            turn_id=self.turn_id,
+            dream_id=self.dream_id,
+            input_context_id=0,
+            **usage,
+        )
 
     async def _recall(self, args: dict[str, Any]) -> str:
         """Answer a query from memory + inbox via a one-shot extraction call."""

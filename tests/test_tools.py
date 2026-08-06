@@ -88,6 +88,7 @@ class FakeDB:
         self.outgoing_rows: set[tuple[int, int]] = set()
         self.topics: list[dict] = []
         self.observed_topics: set[tuple[int, int]] = set()
+        self.usage: list[dict] = []
 
     async def recent_messages(
         self,
@@ -173,6 +174,10 @@ class FakeDB:
     async def message_is_outgoing(self, chat_id: int, message_id: int) -> bool:
         """Report ownership from the canned outgoing set."""
         return (chat_id, message_id) in self.outgoing_rows
+
+    async def append_api_usage(self, **usage: Any) -> None:
+        """Collect one usage record."""
+        self.usage.append(usage)
 
     async def add_wakeup(self, due_at: str, note: str) -> int:
         """Record the wakeup and return a fixed id."""
@@ -306,13 +311,18 @@ class RecordingBot:
 class FakeClient:
     """Records recall extraction calls and returns a canned answer."""
 
-    def __init__(self) -> None:
+    def __init__(self, usage: Any = None) -> None:
         """Expose a responses.create stub that logs its kwargs."""
         self.calls: list[dict[str, Any]] = []
 
         async def create(**kwargs: Any) -> Any:
             self.calls.append(kwargs)
-            return SimpleNamespace(output_text="the cat is named Bober")
+            return SimpleNamespace(
+                id="resp",
+                model=None,
+                output_text="the cat is named Bober",
+                usage=usage,
+            )
 
         self.responses = SimpleNamespace(create=create)
 
@@ -1287,6 +1297,48 @@ async def test_recall_extracts_from_notes(tmp_path: Path) -> None:
     assert "cat named Bober" in call["input"]
     assert "cat name?" in call["input"]
     assert call["store"] is False
+
+
+async def test_recall_bills_its_own_tokens_to_the_turn(tmp_path: Path) -> None:
+    """A memory read bypasses the round engine, so it books itself."""
+    mind = make_mind(tmp_path)
+    mind.append_inbox("cat named Bober", "Sun 2026-08-02 12:00")
+    client = FakeClient(
+        usage=SimpleNamespace(
+            input_tokens=900,
+            output_tokens=40,
+            total_tokens=940,
+            input_tokens_details=SimpleNamespace(cached_tokens=800),
+            output_tokens_details=None,
+        )
+    )
+    db = FakeDB()
+    toolbox = make_toolbox(db=db, client=client, mind=mind)
+    toolbox.turn_id = 5
+
+    await toolbox.run("recall", json.dumps({"query": "cat name?"}))
+
+    (usage,) = db.usage
+    assert usage["turn_id"] == 5
+    assert usage["model"] == "recall-model"
+    assert usage["input_tokens"] == 900
+    assert usage["cached_tokens"] == 800
+    assert usage["reasoning_tokens"] == 0
+    # The notes are the whole input; no context row backs this call.
+    assert usage["input_context_id"] == 0
+
+
+async def test_recall_outside_a_turn_records_nothing(tmp_path: Path) -> None:
+    """With no turn or dream to bill, there is no row to write."""
+    mind = make_mind(tmp_path)
+    mind.append_inbox("cat named Bober", "Sun 2026-08-02 12:00")
+    db = FakeDB()
+    client = FakeClient(usage=SimpleNamespace(input_tokens=1, output_tokens=1))
+    toolbox = make_toolbox(db=db, client=client, mind=mind)
+
+    await toolbox.run("recall", json.dumps({"query": "cat name?"}))
+
+    assert db.usage == []
 
 
 async def test_recall_omits_reasoning_by_default(tmp_path: Path) -> None:

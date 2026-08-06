@@ -496,6 +496,29 @@ async def test_turn_retries_encrypted_reasoning_with_provider_neutral_context() 
     assert agent._context == [EVENT, EVENT]
 
 
+async def test_round_tells_the_toolbox_whose_turn_it_is() -> None:
+    """A handler that calls the API itself bills the turn that asked."""
+
+    class FakeTools:
+        """Answer one call, having been told where its cost belongs."""
+
+        turn_id: int | None = None
+        dream_id: int | None = None
+
+        async def run(self, name: str, arguments: str) -> str:
+            """Report the identifiers visible while the call runs."""
+            return f"turn={self.turn_id} dream={self.dream_id}"
+
+    agent, _, _ = make_turn_agent(
+        [api_response([CALL])], [EVENT], tools=FakeTools(), max_rounds=1
+    )
+    agent.dream_id = None
+
+    await agent._round("instructions", turn_id=7)
+
+    assert agent._context[-1]["output"] == "turn=7 dream=None"
+
+
 def rate_limited() -> RateLimitError:
     """Build the 429 a provider returns when it is overloaded."""
     request = httpx.Request("POST", "https://api.openai.com/v1/responses")
