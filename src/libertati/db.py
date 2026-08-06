@@ -229,6 +229,16 @@ class Database:
                   IS NOT NULL
             """
         )
+        # Indexed here rather than in SCHEMA: that runs before the column
+        # exists, so an older database would fail to open. Covers the
+        # per-topic lookups (topic_observed, topic_name, list_topics,
+        # topic-scoped history), which otherwise walk a chat by date.
+        await self._conn.execute(
+            """
+            CREATE INDEX IF NOT EXISTS idx_messages_chat_thread
+                ON messages (chat_id, message_thread_id, date)
+            """
+        )
         await self._conn.commit()
 
     async def _ensure_column(
@@ -519,6 +529,14 @@ class Database:
         await self.conn.commit()
         return cursor.rowcount > 0
 
+    #: Forum housekeeping messages, which nobody is waiting on an answer
+    #: to. Inlined into SQL rather than bound, so the planner can see the
+    #: literal set; the values are this module's own constants.
+    _FORUM_SERVICE_TYPES = (
+        "('forum_topic_created', 'forum_topic_edited',"
+        " 'forum_topic_closed', 'forum_topic_reopened')"
+    )
+
     async def unanswered_chats(self) -> list[dict]:
         """Chats whose latest message is incoming (i.e. awaiting the agent).
 
@@ -528,30 +546,29 @@ class Database:
         sender's name and the date of that last message. Forum service
         messages never count as the awaiting message, so a freshly
         created topic doesn't nag forever.
+
+        Ranking each chat/topic once beats asking "is anything newer?"
+        per message: the correlated form re-scanned the chat for every
+        row it considered, which is quadratic in history length and runs
+        on the connection every other loop shares.
         """
-        query = """
-            SELECT c.id AS chat_id, c.type, c.title, m.message_thread_id,
-                   u.first_name, u.username, m.date
-            FROM messages m
-            JOIN chats c ON c.id = m.chat_id
-            LEFT JOIN users u ON u.id = m.from_user_id
-            WHERE m.outgoing = 0
-              AND m.content_type NOT IN ('forum_topic_created',
-                                         'forum_topic_edited',
-                                         'forum_topic_closed',
-                                         'forum_topic_reopened')
-              AND NOT EXISTS (
-                  SELECT 1 FROM messages n
-                  WHERE n.chat_id = m.chat_id
-                    AND COALESCE(n.message_thread_id, 0)
-                        = COALESCE(m.message_thread_id, 0)
-                    AND n.content_type NOT IN ('forum_topic_created',
-                                               'forum_topic_edited',
-                                               'forum_topic_closed',
-                                               'forum_topic_reopened')
-                    AND (n.date, n.message_id) > (m.date, m.message_id)
-              )
-            ORDER BY m.date
+        query = f"""
+            WITH latest AS (
+                SELECT chat_id, message_thread_id, from_user_id, date, outgoing,
+                       ROW_NUMBER() OVER (
+                           PARTITION BY chat_id, COALESCE(message_thread_id, 0)
+                           ORDER BY date DESC, message_id DESC
+                       ) AS position
+                FROM messages
+                WHERE content_type NOT IN {self._FORUM_SERVICE_TYPES}
+            )
+            SELECT c.id AS chat_id, c.type, c.title, l.message_thread_id,
+                   u.first_name, u.username, l.date
+            FROM latest l
+            JOIN chats c ON c.id = l.chat_id
+            LEFT JOIN users u ON u.id = l.from_user_id
+            WHERE l.position = 1 AND l.outgoing = 0
+            ORDER BY l.date
         """
         async with self.conn.execute(query) as cursor:
             return [dict(row) for row in await cursor.fetchall()]
