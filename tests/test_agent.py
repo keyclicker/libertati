@@ -615,6 +615,40 @@ async def test_round_gives_up_after_the_configured_retries(
     assert len(calls) == 2
 
 
+async def test_round_shares_one_retry_budget_across_fallbacks(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A fallback does not hand the endpoint a fresh set of retries.
+
+    Otherwise a flapping provider holds the turn lock for the sum of
+    every fallback's backoff, and nothing else gets a turn meanwhile.
+    """
+
+    async def no_sleep(delay: float) -> None:
+        """Skip the backoff entirely."""
+
+    monkeypatch.setattr(loop.asyncio, "sleep", no_sleep)
+    function_tool = {"type": "function", "name": "send_message"}
+    agent, calls, _ = make_turn_agent(
+        [
+            rate_limited(),
+            bad_request("Server tool request failed"),
+            rate_limited(),
+            api_response(),
+        ],
+        [EVENT],
+        api_tools=[function_tool, {"type": "web_search"}],
+        api_retries=1,
+    )
+
+    with pytest.raises(RateLimitError):
+        await agent._round("instructions", turn_id=None)
+
+    # The one retry was spent before the fallback; the rate limit after
+    # it is final, so the fourth scripted response is never reached.
+    assert len(calls) == 3
+
+
 async def test_round_does_not_retry_a_rejected_request() -> None:
     """A 400 is about the request itself; sending it again changes nothing."""
     agent, calls, _ = make_turn_agent(

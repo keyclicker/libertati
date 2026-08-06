@@ -159,9 +159,14 @@ class ModelLoop:
         """
         input_context_id = await self._anchor_id()
         request_context = self._context
+        # One retry budget for the whole round, not one per call: the
+        # BadRequestError fallbacks below re-enter create(), and a
+        # per-call counter would let a flapping endpoint hold the turn
+        # lock for the sum of every fallback's backoff.
+        attempt = 0
 
         async def create(tools: list[ToolParam], context: list[dict[str, Any]]) -> Any:
-            attempt = 0
+            nonlocal attempt
             while True:
                 try:
                     return await self.client.responses.create(
