@@ -300,6 +300,18 @@ def newest_id(conn: sqlite3.Connection, dream_id: int | None = None) -> int:
     return row[0] if row else 0
 
 
+def tail_anchor(
+    conn: sqlite3.Connection, tail: int, dream_id: int | None = None
+) -> int:
+    """Row id a view opens just after, to start on its newest ``tail`` rows.
+
+    Always measured against the table actually being viewed: dream ids
+    run independently of the waking ones, so anchoring a dream on the
+    waking history would skip past everything the dream recorded.
+    """
+    return max(0, newest_id(conn, dream_id) - tail)
+
+
 def latest_dream(conn: sqlite3.Connection) -> tuple[int, str] | None:
     """Return the newest dream's id and status, if the ledger has one."""
     try:
@@ -842,7 +854,7 @@ class SpyApp(App[None]):
         if dream_id == self.dream_id:
             return
         self.dream_id = dream_id
-        self.cursor = max(0, newest_id(self.conn, dream_id) - self.page_size)
+        self.cursor = tail_anchor(self.conn, self.page_size, dream_id)
         self.hint = ""
         self.last_activity = None
         self.usage = None
@@ -988,9 +1000,9 @@ def main() -> None:
     ):
         conn.close()
         parser.error(f"no dream #{args.dream} in {db_path}")
-    row = conn.execute("SELECT COALESCE(MAX(id), 0) FROM context").fetchone()
+    anchor = tail_anchor(conn, args.tail, args.dream)
     try:
-        SpyApp(conn, max(0, row[0] - args.tail), args.tail, max_items, args.dream).run()
+        SpyApp(conn, anchor, args.tail, max_items, args.dream).run()
     except KeyboardInterrupt:
         pass
     finally:
