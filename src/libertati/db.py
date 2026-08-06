@@ -576,7 +576,8 @@ class Database:
     #: Message columns returned to the LLM as chat context.
     _MESSAGE_ROW = """
         SELECT m.message_id, m.date, m.outgoing, u.username, u.first_name,
-               m.text, m.caption, m.content_type, m.message_thread_id
+               m.text, m.caption, m.content_type, m.message_thread_id,
+               m.reply_to_message_id
         FROM messages m LEFT JOIN users u ON u.id = m.from_user_id
     """
 
@@ -616,6 +617,15 @@ class Database:
             rows = list(await cursor.fetchall())
         return [dict(row) for row in reversed(rows)]
 
+    #: Newest message of a chat/topic the agent has already been shown.
+    #: A topic honours the whole-chat cursor too — a chat-wide history
+    #: read exposed that topic's older messages just the same.
+    _READ_CURSOR = """
+        SELECT COALESCE(MAX(message_id), 0)
+        FROM message_read_cursors
+        WHERE chat_id = ? AND message_thread_id IN (0, ?)
+    """
+
     async def unread_messages_count(
         self, chat_id: int, message_thread_id: int | None = None
     ) -> int:
@@ -623,27 +633,68 @@ class Database:
 
         Only incoming messages count: the agent's own replies are stored
         in the same table, and reporting them back as unread would make
-        every answered chat look like it still needs reading. A topic
-        also honours the whole-chat cursor — a chat-wide history read
-        exposed that topic's older messages just the same.
+        every answered chat look like it still needs reading.
         """
         thread_key = message_thread_id or 0
-        query = """
+        query = f"""
             SELECT COUNT(*)
             FROM messages m
             WHERE m.chat_id = ?
               AND m.outgoing = 0
               AND (? IS NULL OR m.message_thread_id = ?)
-              AND m.message_id > (
-                  SELECT COALESCE(MAX(message_id), 0)
-                  FROM message_read_cursors
-                  WHERE chat_id = ? AND message_thread_id IN (0, ?)
-              )
+              AND m.message_id > ({self._READ_CURSOR})
         """
         params = (chat_id, message_thread_id, message_thread_id, chat_id, thread_key)
         async with self.conn.execute(query, params) as cursor:
             row = await cursor.fetchone()
         return int(row[0]) if row else 0
+
+    async def messages_since_read(
+        self,
+        chat_id: int,
+        limit: int,
+        before_message_id: int | None = None,
+        message_thread_id: int | None = None,
+    ) -> list[dict]:
+        """Return messages past the chat/topic read cursor, oldest first.
+
+        The transcript an event carries, so the agent starts a turn
+        already knowing what it missed. Unlike
+        :meth:`unread_messages_count` this keeps the agent's own replies:
+        the point is a readable conversation, and a group exchange with
+        one side deleted reads as if nobody answered. Rows have the shape
+        of :meth:`recent_messages`; when more than ``limit`` are pending,
+        the newest are kept.
+        """
+        query = (
+            self._MESSAGE_ROW
+            + f"""
+            WHERE m.chat_id = ? AND (? IS NULL OR m.message_id < ?)
+              AND (? IS NULL OR m.message_thread_id = ?)
+              AND m.message_id > ({self._READ_CURSOR})
+            ORDER BY m.date DESC, m.message_id DESC LIMIT ?
+        """
+        )
+        params = (
+            chat_id,
+            before_message_id,
+            before_message_id,
+            message_thread_id,
+            message_thread_id,
+            chat_id,
+            message_thread_id or 0,
+            limit,
+        )
+        async with self.conn.execute(query, params) as cursor:
+            rows = list(await cursor.fetchall())
+        return [dict(row) for row in reversed(rows)]
+
+    async def message_row(self, chat_id: int, message_id: int) -> dict | None:
+        """Return one stored message in :meth:`recent_messages` shape."""
+        query = self._MESSAGE_ROW + "WHERE m.chat_id = ? AND m.message_id = ?"
+        async with self.conn.execute(query, (chat_id, message_id)) as cursor:
+            row = await cursor.fetchone()
+        return dict(row) if row else None
 
     async def mark_messages_read(
         self,

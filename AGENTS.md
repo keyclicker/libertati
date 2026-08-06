@@ -41,6 +41,8 @@ One package, `src/libertati/`, no sub-packages:
   key in `Prompts` is required and validated at startup.
 - `chats.py` — chat approval registry (`data/chats.toml`).
 - `clock.py` — the only place timestamp formats live.
+- `transcript.py` — the only place stored messages are rendered for the
+  model (history tools and the context events carry).
 - `spy.py` — standalone read-only TUI; must not import aiogram/openai
   at module level (keeps `libertati-spy` startup fast).
 - `render.py` — how the spy lays out one context item: a layout per

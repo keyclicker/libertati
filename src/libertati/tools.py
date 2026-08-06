@@ -36,6 +36,7 @@ from libertati.config import Settings
 from libertati.db import Database
 from libertati.memory import Mind
 from libertati.prompts import Prompts
+from libertati.transcript import render_transcript
 
 if TYPE_CHECKING:  # pragma: no cover - import cycle broken for runtime
     from libertati.dream import DreamGate
@@ -476,9 +477,11 @@ HISTORY_TOOLS: list[ToolParam] = [
         "type": "function",
         "name": "get_recent_messages",
         "description": (
-            "Fetch messages stored for a chat, newest last. Use to recall "
-            "context beyond what you remember; page further into the past "
-            "with before_message_id."
+            "Fetch messages stored for a chat as a transcript "
+            "(`id HH:MM sender: text`, `↩id` marks a reply), newest last. "
+            "Use to recall context beyond what you remember and what the "
+            "event already showed you; page further into the past with "
+            "before_message_id."
         ),
         "parameters": {
             "type": "object",
@@ -549,8 +552,10 @@ HISTORY_TOOLS: list[ToolParam] = [
         "description": (
             "Fetch the reply thread a message belongs to: what it "
             "replies to, replies to those, and every branch off any of "
-            "them, oldest first. Use to follow one conversation strand "
-            "in a busy group without paging through unrelated messages."
+            "them, oldest first, as a transcript. Use to follow a long "
+            "conversation strand in a busy group without paging through "
+            "unrelated messages — an event already quotes the one "
+            "message its own is replying to."
         ),
         "parameters": {
             "type": "object",
@@ -581,8 +586,9 @@ HISTORY_TOOLS: list[ToolParam] = [
         "name": "search_messages",
         "description": (
             "Search one chat's whole history for messages containing a "
-            "text fragment (case-insensitive), newest first. Use to find "
-            "what was said long ago without paging through everything."
+            "text fragment (case-insensitive), newest first, as a "
+            "transcript. Use to find what was said long ago without "
+            "paging through everything."
         ),
         "parameters": {
             "type": "object",
@@ -1474,21 +1480,24 @@ class Toolbox:
         return json.dumps(rows, ensure_ascii=False)
 
     async def _get_recent_messages(self, args: dict[str, Any]) -> str:
-        """Return a page of a chat's messages as JSON, oldest first."""
+        """Return a page of a chat's messages as a transcript, oldest first."""
         limit = max(1, min(args.get("limit") or 20, 50))
+        thread_id = args.get("message_thread_id")
         rows = await self.db.recent_messages(
             args["chat_id"],
             limit,
             args.get("before_message_id"),
-            args.get("message_thread_id"),
+            thread_id,
         )
-        if args.get("before_message_id") is None and rows:
+        if not rows:
+            return "no messages stored for this chat"
+        if args.get("before_message_id") is None:
             await self.db.mark_messages_read(
                 args["chat_id"],
                 max(row["message_id"] for row in rows),
-                args.get("message_thread_id"),
+                thread_id,
             )
-        return json.dumps(rows, ensure_ascii=False)
+        return render_transcript(rows, self.tz, show_topic=thread_id is None)
 
     async def _get_unread_messages_count(self, args: dict[str, Any]) -> str:
         """Return unread stored-message count for a chat or topic."""
@@ -1498,15 +1507,15 @@ class Toolbox:
         return str(count)
 
     async def _get_message_thread(self, args: dict[str, Any]) -> str:
-        """Return the reply thread around a message as JSON, oldest first."""
+        """Return the reply thread around a message as a transcript."""
         limit = max(1, min(args.get("limit") or 20, 50))
         rows = await self.db.message_thread(args["chat_id"], args["message_id"], limit)
         if not rows:
             return "no such message stored"
-        return json.dumps(rows, ensure_ascii=False)
+        return render_transcript(rows, self.tz, show_topic=True)
 
     async def _search_messages(self, args: dict[str, Any]) -> str:
-        """Return a chat's messages matching a substring as JSON.
+        """Return a chat's messages matching a substring as a transcript.
 
         An empty needle is refused rather than passed down: SQLite's
         ``instr`` reports it as a match in every row, so the search would
@@ -1516,15 +1525,11 @@ class Toolbox:
         if not query:
             return "error: query must not be empty"
         limit = max(1, min(args.get("limit") or 20, 50))
-        rows = await self.db.search_messages(
-            args["chat_id"],
-            query,
-            limit,
-            args.get("message_thread_id"),
-        )
+        thread_id = args.get("message_thread_id")
+        rows = await self.db.search_messages(args["chat_id"], query, limit, thread_id)
         if not rows:
             return "no matches"
-        return json.dumps(rows, ensure_ascii=False)
+        return render_transcript(rows, self.tz, show_topic=thread_id is None)
 
     # ==========================================================
     #                          Memory

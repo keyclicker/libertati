@@ -47,6 +47,23 @@ SUMMARY_PROMPT = "test summary prompt"
 OPEN_REGISTRY = ChatRegistry(Path("unused-chats.toml"), enabled=False)
 
 
+def message_row(**overrides: Any) -> dict:
+    """Build a stored-message row in the shape history queries return."""
+    return {
+        "message_id": 10,
+        "date": "2026-08-04T05:46:31+00:00",
+        "outgoing": 0,
+        "username": "nick",
+        "first_name": "Nick",
+        "text": "hi",
+        "caption": None,
+        "content_type": "text",
+        "message_thread_id": None,
+        "reply_to_message_id": None,
+        **overrides,
+    }
+
+
 class FakeDB:
     """Records calls made by tool handlers."""
 
@@ -57,7 +74,9 @@ class FakeDB:
         self.read_marks: list[tuple[int, int, int | None]] = []
         self.recent_rows: list[dict] = []
         self.search_calls: list[tuple[int, str, int, int | None]] = []
+        self.search_rows: list[dict] = []
         self.thread_calls: list[tuple[int, int, int]] = []
+        self.thread_rows: list[dict] = []
         self.wakeups: list[tuple[str, str]] = []
         self.pending: list[dict] = []
         self.chats: list[dict] = []
@@ -77,7 +96,7 @@ class FakeDB:
         before_message_id: int | None = None,
         message_thread_id: int | None = None,
     ) -> list[dict]:
-        """Record the query and return no rows."""
+        """Record the query and return the canned page."""
         self.recent_calls.append((chat_id, limit, before_message_id, message_thread_id))
         return self.recent_rows
 
@@ -103,9 +122,9 @@ class FakeDB:
         limit: int,
         message_thread_id: int | None = None,
     ) -> list[dict]:
-        """Record the query and return no rows."""
+        """Record the query and return the canned matches."""
         self.search_calls.append((chat_id, needle, limit, message_thread_id))
-        return []
+        return self.search_rows
 
     async def list_topics(self, chat_id: int) -> list[dict]:
         """Return the canned topic list."""
@@ -118,9 +137,9 @@ class FakeDB:
     async def message_thread(
         self, chat_id: int, message_id: int, limit: int
     ) -> list[dict]:
-        """Record the query and return no rows."""
+        """Record the query and return the canned thread."""
         self.thread_calls.append((chat_id, message_id, limit))
-        return []
+        return self.thread_rows
 
     async def list_chats(self) -> list[dict]:
         """Return the canned chat list."""
@@ -961,7 +980,7 @@ async def test_unread_count_and_recent_read_cursor() -> None:
     """Unread count is exposed and newest-history reads advance its cursor."""
     db = FakeDB()
     db.read_count = 3
-    db.recent_rows = [{"message_id": 9}]
+    db.recent_rows = [message_row(message_id=9)]
     toolbox = make_toolbox(db=db)
     count_args = {"chat_id": 1, "message_thread_id": 12}
     assert await toolbox.run("get_unread_messages_count", json.dumps(count_args)) == "3"
@@ -973,6 +992,71 @@ async def test_unread_count_and_recent_read_cursor() -> None:
     }
     await toolbox.run("get_recent_messages", json.dumps(recent_args))
     assert db.read_marks == [(1, 9, 12)]
+
+
+async def test_get_recent_messages_renders_a_transcript() -> None:
+    """History comes back as transcript lines, not as JSON rows."""
+    db = FakeDB()
+    db.recent_rows = [
+        message_row(message_id=9, text="what's up"),
+        message_row(message_id=10, outgoing=1, text="nothing", reply_to_message_id=9),
+    ]
+    args = {
+        "chat_id": 1,
+        "limit": None,
+        "before_message_id": None,
+        "message_thread_id": 72,
+    }
+    result = await make_toolbox(db=db).run("get_recent_messages", json.dumps(args))
+    assert result == (
+        "— Tue 2026-08-04 —\n9 05:46 Nick @nick: what's up\n10 05:46 you: nothing ↩9"
+    )
+
+
+async def test_get_recent_messages_shows_topics_when_not_scoped() -> None:
+    """A chat-wide read tags each line with the topic it came from."""
+    db = FakeDB()
+    db.recent_rows = [message_row(message_thread_id=72)]
+    args = {
+        "chat_id": 1,
+        "limit": None,
+        "before_message_id": None,
+        "message_thread_id": None,
+    }
+    result = await make_toolbox(db=db).run("get_recent_messages", json.dumps(args))
+    assert result.endswith("#72")
+
+
+async def test_get_recent_messages_reports_an_empty_chat() -> None:
+    """Nothing stored says so instead of returning an empty transcript."""
+    db = FakeDB()
+    args = {
+        "chat_id": 1,
+        "limit": None,
+        "before_message_id": None,
+        "message_thread_id": None,
+    }
+    result = await make_toolbox(db=db).run("get_recent_messages", json.dumps(args))
+    assert result == "no messages stored for this chat"
+    assert db.read_marks == []
+
+
+async def test_get_message_thread_renders_a_transcript() -> None:
+    """A reply chain renders with its topics, which may differ per branch."""
+    db = FakeDB()
+    db.thread_rows = [message_row(message_id=9, message_thread_id=72)]
+    args = {"chat_id": 1, "message_id": 9, "limit": None}
+    result = await make_toolbox(db=db).run("get_message_thread", json.dumps(args))
+    assert result.endswith("9 05:46 Nick @nick: hi #72")
+
+
+async def test_search_messages_renders_a_transcript() -> None:
+    """Matches render as transcript lines in the order the query returned."""
+    db = FakeDB()
+    db.search_rows = [message_row(message_id=9, text="cat")]
+    args = {"chat_id": 1, "query": "cat", "limit": None, "message_thread_id": 72}
+    result = await make_toolbox(db=db).run("search_messages", json.dumps(args))
+    assert result == "— Tue 2026-08-04 —\n9 05:46 Nick @nick: cat"
 
 
 async def test_get_message_thread_clamps_limit_and_reports_missing() -> None:
