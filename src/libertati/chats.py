@@ -30,6 +30,10 @@ class ChatRegistry:
     including negative group ids, are valid bare keys). A file that
     fails to parse denies everything and is never appended to, so a
     user typo can't be silently clobbered.
+
+    Every path through here fails closed and never raises: an approval
+    registry that could throw would take a Telegram update or an agent
+    turn down with it, which is a worse outcome than denying a chat.
     """
 
     def __init__(self, path: Path, enabled: bool) -> None:
@@ -38,13 +42,20 @@ class ChatRegistry:
         self.enabled = enabled
 
     def _load(self) -> dict[str, object] | None:
-        """Parse the approvals file; {} when absent, None when broken."""
+        """Parse the approvals file; {} when absent, None when unusable.
+
+        An unreadable file is as good as a broken one: both mean the
+        registry cannot say a chat is approved, and both must deny rather
+        than raise. Callers are a Telegram handler and ``Toolbox.run``,
+        which is documented never to raise — an OSError escaping here
+        would kill an update or fail a whole agent turn.
+        """
         if not self.path.exists():
             return {}
         try:
             return tomllib.loads(self.path.read_text(encoding="utf-8"))
-        except tomllib.TOMLDecodeError as exc:
-            log.error("cannot parse %s: %s — denying all chats", self.path, exc)
+        except (tomllib.TOMLDecodeError, OSError, UnicodeDecodeError) as exc:
+            log.error("cannot read %s: %s — denying all chats", self.path, exc)
             return None
 
     def check(self, chat_id: int) -> bool:
@@ -79,8 +90,6 @@ class ChatRegistry:
             return False
         if str(chat_id) in approvals:
             return approvals[str(chat_id)] is True
-        self.path.parent.mkdir(parents=True, exist_ok=True)
-        header = "" if self.path.exists() else HEADER
         # The label is attacker-controlled (chat title / sender name).
         # Collapsing whitespace kills line injection; dropping the
         # remaining unprintable characters keeps a crafted name from
@@ -89,9 +98,18 @@ class ChatRegistry:
         comment = "".join(
             char for char in " ".join(label.split()) if char.isprintable()
         )
-        with self.path.open("a", encoding="utf-8") as file:
-            file.write(f"{header}{chat_id} = false  # {comment}\n")
-        self.path.chmod(0o600)
+        try:
+            self.path.parent.mkdir(parents=True, exist_ok=True)
+            header = "" if self.path.exists() else HEADER
+            with self.path.open("a", encoding="utf-8") as file:
+                file.write(f"{header}{chat_id} = false  # {comment}\n")
+            self.path.chmod(0o600)
+        except OSError as exc:
+            # A chat that could not be written down is still unapproved,
+            # and this runs inside a Telegram handler: raising would drop
+            # the update rather than deny it.
+            log.error("cannot record chat %s in %s: %s", chat_id, self.path, exc)
+            return False
         log.info(
             "new chat %s (%s) awaiting approval in %s", chat_id, comment, self.path
         )
