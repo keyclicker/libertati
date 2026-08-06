@@ -168,6 +168,26 @@ async def test_dream_runs_a_session_and_wakes_the_agent(
     assert rows[0]["steps"] == 1
 
 
+async def test_a_dream_that_dies_on_the_way_in_reports_nothing(
+    db: Database, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A dream never inherits the previous one's summary or step count."""
+    dreamer, agent, _ = make_dreamer(db, tmp_path, [[WAKE_CALL]])
+    await dreamer.maybe_dream()
+    assert dreamer.tools.wake_summary == "say hi to Bob"
+
+    async def explode(dream_id: int, note: str | None) -> str:
+        raise RuntimeError("the dream never started")
+
+    monkeypatch.setattr(dreamer, "_session", explode)
+    await dreamer.dream("requested", None)
+
+    assert "say hi to Bob" not in agent.pushed[1]
+    assert "ran out before waking" in agent.pushed[1]
+    async with db.conn.execute("SELECT steps FROM dreams ORDER BY id") as cursor:
+        assert [row["steps"] for row in await cursor.fetchall()] == [1, 0]
+
+
 async def test_dream_records_its_own_context_only(db: Database, tmp_path: Path) -> None:
     """A dream's context lands in its own table, not the agent's."""
     dreamer, _, _ = make_dreamer(db, tmp_path, [[WAKE_CALL]])

@@ -23,6 +23,19 @@ if TYPE_CHECKING:  # pragma: no cover - import cycle broken for runtime
 
 log = logging.getLogger(__name__)
 
+#: Provider complaints about context this loop can still salvage: both
+#: mean the window carries envelopes the endpoint won't take back (short
+#: tool-call ids reused across turns, reasoning encrypted for another
+#: provider), and both are answered by shedding history.
+STALE_CONTEXT_ERRORS = (
+    "Duplicate tool call id in assistant message",
+    "Could not decrypt the provided encrypted_content",
+)
+
+#: Provider complaint about a built-in (server-side) tool, answered by
+#: retrying with the locally executed function tools alone.
+SERVER_TOOL_ERROR = "Server tool request failed"
+
 
 class ModelLoop:
     """One model call plus its tool calls, and the usage bookkeeping.
@@ -101,18 +114,21 @@ class ModelLoop:
             )
 
         request_tools = self._api_tools
-        for _ in range(3):
+        # Each fallback is worth exactly one attempt: a second rejection
+        # of the same kind means the shed did not help, and retrying it
+        # would only spend another request to reach the same error.
+        compacted = False
+        dropped_server_tools = False
+        while True:
             try:
                 response = await create(request_tools, request_context)
                 break
             except BadRequestError as exc:
                 error = str(exc)
-                if (
-                    "Duplicate tool call id in assistant message" in error
-                    or "Could not decrypt the provided encrypted_content" in error
-                ):
+                if not compacted and any(m in error for m in STALE_CONTEXT_ERRORS):
+                    compacted = True
                     fallback_context = self._provider_fallback_context()
-                    if request_context == fallback_context:
+                    if fallback_context == request_context:
                         raise
                     log.warning(
                         "provider rejected historical context; "
@@ -123,21 +139,23 @@ class ModelLoop:
                     self._context = fallback_context
                     request_context = fallback_context
                     continue
-                local_tools = [
-                    tool for tool in request_tools if tool["type"] == "function"
-                ]
-                if (
-                    "Server tool request failed" in error
-                    and local_tools != request_tools
-                ):
+                if not dropped_server_tools and SERVER_TOOL_ERROR in error:
+                    dropped_server_tools = True
+                    local_tools = [
+                        tool for tool in request_tools if tool["type"] == "function"
+                    ]
+                    if local_tools == request_tools:
+                        raise
                     log.warning(
                         "server tool failed; disabling built-in tools and retrying"
                     )
+                    # Only for this round: a server tool usually fails
+                    # because its backend hiccuped, not because the
+                    # endpoint lacks it, and self._api_tools is what the
+                    # next round offers the model again.
                     request_tools = local_tools
                     continue
                 raise
-        else:  # pragma: no cover - each fallback can apply only once
-            raise RuntimeError("provider compatibility retries exhausted")
         self._last_output_text = response.output_text or ""
         await self._record_usage(response, turn_id, input_context_id)
         for item in response.output:

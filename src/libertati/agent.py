@@ -34,6 +34,11 @@ log = logging.getLogger(__name__)
 
 PRIVATE_OUTPUT_NUDGE_PREFIX = "[delivery correction]"
 
+#: Context item types ``prune_completed_reasoning`` drops once a turn has
+#: settled: reasoning is only needed to reach the turn's own tool calls,
+#: and the final message was never anything but private thinking.
+EPHEMERAL_TYPES = ("reasoning", "message")
+
 
 def private_output_nudge(text: str) -> str:
     """Build an internal retry message carrying the undelivered text."""
@@ -90,15 +95,15 @@ class Agent(ModelLoop):
             model=settings.model,
             db=db,
             tools=Toolbox(
-                db,
-                bot,
-                self.tz,
-                client,
-                settings.recall_model or settings.model,
-                self.mind,
-                settings.typing_chars_per_second,
-                self.prompts.recall,
-                self.prompts.summary,
+                db=db,
+                bot=bot,
+                tz=self.tz,
+                client=client,
+                recall_model=settings.recall_model or settings.model,
+                mind=self.mind,
+                typing_chars_per_second=settings.typing_chars_per_second,
+                recall_prompt=self.prompts.recall,
+                summary_prompt=self.prompts.summary,
                 registry=registry,
                 recall_effort=settings.recall_reasoning_effort,
                 dream_gate=dream_gate if dreaming else None,
@@ -115,7 +120,6 @@ class Agent(ModelLoop):
         self.max_context_items = settings.context_max_items
         self.trim_context_items = settings.context_trim_items
         self._queue: asyncio.Queue[tuple[str, bool]] = asyncio.Queue()
-        self._active_turn_start: int | None = None
         # Held for the whole of a turn. The dreaming loop takes the same
         # lock, which is how "the agent sleeps while it dreams" works:
         # a dream waits for the turn in flight and blocks the next one.
@@ -138,20 +142,17 @@ class Agent(ModelLoop):
         has no encrypted content to send, and a function call whose
         paired reasoning is missing is rejected just the same.
         """
-        excluded_types = (
-            ("reasoning", "message") if self.prune_completed_reasoning else ()
-        )
+        excluded_types = EPHEMERAL_TYPES if self.prune_completed_reasoning else ()
         items = await self.db.load_context(
             self.trim_context_items,
             exclude_types=excluded_types,
         )
         items = [self._normalize_internal_nudge(item) for item in items]
-        if self.prune_completed_reasoning:
-            items = [
-                item
-                for item in items
-                if item.get("type") not in {"reasoning", "message"}
-            ]
+        if excluded_types:
+            # Normalization gives legacy delivery nudges the `message`
+            # type they were persisted without, so the SQL filter could
+            # not have seen them; catch them on this side instead.
+            items = [item for item in items if item.get("type") not in excluded_types]
         items = self._drop_legacy_reasoning(items)
         self._context = self._trim_dangling(self._trim_to_boundary(items))
         log.info("restored %d context items", len(self._context))
@@ -189,7 +190,6 @@ class Agent(ModelLoop):
         """
         outward_before = self.tools.outward_calls
         async with self.turn_lock:
-            self._active_turn_start = len(self._context)
             for event, _ in batch:
                 await self._remember({"role": "user", "content": event})
             try:
@@ -197,8 +197,6 @@ class Agent(ModelLoop):
             except Exception:
                 log.exception("agent turn failed")
                 self._context = self._trim_dangling(self._context)
-            finally:
-                self._active_turn_start = None
         acted = self.tools.outward_calls > outward_before
         if acted or any(activity for _, activity in batch):
             self.last_active = datetime.now(UTC)
@@ -208,26 +206,20 @@ class Agent(ModelLoop):
         await super()._remember(item)
         await self.db.append_context(item)
         if len(self._context) > self.max_context_items:
-            active_head = None
-            active_turn_start = getattr(self, "_active_turn_start", None)
-            if active_turn_start is not None and active_turn_start < len(self._context):
-                active_head = self._context[active_turn_start]
             self._context = self._trim_to_boundary(
                 self._context[-self.trim_context_items :]
             )
-            if active_head is not None:
-                self._active_turn_start = next(
-                    (
-                        i
-                        for i, context_item in enumerate(self._context)
-                        if context_item is active_head
-                    ),
-                    len(self._context),
-                )
 
     @staticmethod
     def _is_external_event(item: dict[str, Any]) -> bool:
-        """Return whether an item is a real event rather than model dialogue."""
+        """Return whether an item is a real event rather than model dialogue.
+
+        The ``type`` marker settles it for anything this version wrote.
+        The prefix check behind it covers untyped nudges persisted by
+        older versions: :meth:`load` normalizes those, but a window that
+        started at one would open on a delivery correction addressed to
+        nobody, so the second guard stays.
+        """
         content = item.get("content")
         return (
             item.get("role") == "user"
@@ -254,36 +246,38 @@ class Agent(ModelLoop):
             }
         return item
 
-    def _provider_fallback_context(self) -> list[dict[str, Any]]:
-        """Keep external history plus every item in the active turn."""
-        start = getattr(self, "_active_turn_start", None)
-        if start is None:
-            start = next(
-                (
-                    i
-                    for i in range(len(self._context) - 1, -1, -1)
-                    if self._is_external_event(self._context[i])
-                ),
-                len(self._context),
-            )
-        history = [
-            item for item in self._context[:start] if self._is_external_event(item)
-        ]
-        if getattr(self, "_active_turn_start", None) is not None:
-            self._active_turn_start = len(history)
-        return [*history, *self._context[start:]]
+    def _active_turn_start(self) -> int:
+        """Index of the first window item the turn in flight produced.
 
-    def _current_output_start(self) -> int:
-        """Return first model-produced item after current external event batch."""
+        Everything below it is settled history, everything from it on is
+        this turn's own reasoning, tool calls and output. Derived from
+        the window on every call rather than tracked across appends, so
+        a mid-turn trim can't leave a stale index behind.
+        """
         last_event = next(
             (
                 i
                 for i in range(len(self._context) - 1, -1, -1)
                 if self._is_external_event(self._context[i])
             ),
-            len(self._context) - 1,
+            -1,
         )
         return last_event + 1
+
+    def _provider_fallback_context(self) -> list[dict[str, Any]]:
+        """Keep external history plus every item of the turn in flight.
+
+        Historical tool calls and encrypted reasoning are what a
+        compatible provider chokes on; the events themselves are plain
+        text nothing rejects. The active turn survives whole — dropping
+        the call the round is in the middle of answering would strand
+        its result.
+        """
+        start = self._active_turn_start()
+        history = [
+            item for item in self._context[:start] if self._is_external_event(item)
+        ]
+        return [*history, *self._context[start:]]
 
     @staticmethod
     def _trim_to_boundary(items: list[dict[str, Any]]) -> list[dict[str, Any]]:
@@ -396,7 +390,7 @@ class Agent(ModelLoop):
                     turn_status,
                 )
             finally:
-                self._finish_turn(self._current_output_start())
+                self._finish_turn(self._active_turn_start())
 
     def _finish_turn(self, start: int) -> None:
         """Prune ephemeral outputs from one settled live-context turn."""
@@ -405,7 +399,7 @@ class Agent(ModelLoop):
         kept = [
             item
             for item in self._context[start:]
-            if item.get("type") not in {"reasoning", "message"}
+            if item.get("type") not in EPHEMERAL_TYPES
         ]
         removed = len(self._context) - start - len(kept)
         self._context[start:] = kept

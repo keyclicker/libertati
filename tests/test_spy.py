@@ -18,6 +18,7 @@ from libertati.spy import (
     latest_dream,
     latest_recorded_dream,
     predict_context,
+    tail_anchor,
 )
 
 
@@ -309,6 +310,20 @@ def test_latest_recorded_dream_ignores_dreams_with_no_context() -> None:
     append_dream_event(conn, second, "wandering")
 
     assert latest_recorded_dream(conn) == second
+    conn.close()
+
+
+def test_tail_anchor_measures_the_context_being_viewed() -> None:
+    """A dream anchors on its own rows, not on the waking history's ids."""
+    conn = make_context_db(0)
+    for index in range(200):
+        append_event(conn, f"awake {index}")
+    dream = start_dream(conn)
+    append_dream_event(conn, dream, "wandering")
+
+    assert tail_anchor(conn, 50) == 150
+    # The dream has one row; a waking anchor would hide it entirely.
+    assert tail_anchor(conn, 50, dream) == 0
     conn.close()
 
 
