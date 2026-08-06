@@ -121,6 +121,7 @@ class Dreamer(ModelLoop):
             ),
             api_tools=build_dream_tools(settings.web_search),
             reasoning=agent.reasoning,
+            api_retries=settings.api_retries,
         )
         self.agent = agent
         self.gate = gate

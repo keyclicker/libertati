@@ -13,8 +13,9 @@ pruned tail window is kept in memory and sent to the API.
 
 import asyncio
 import logging
+from collections.abc import Sequence
 from datetime import UTC, datetime
-from typing import Any, cast
+from typing import Any, NamedTuple, cast
 from zoneinfo import ZoneInfo
 
 from aiogram import Bot
@@ -43,6 +44,21 @@ EPHEMERAL_TYPES = ("reasoning", "message")
 def one_line(text: str | None) -> str:
     """Collapse whitespace runs (newlines included) to single spaces."""
     return " ".join((text or "").split())
+
+
+class Event(NamedTuple):
+    """One queued external event and what delivering it settles.
+
+    ``activity`` marks whether the event alone should reset the dream
+    idle clock. ``read_mark`` is the ``mark_messages_read`` argument
+    tuple for an event that carries chat history: the cursor moves only
+    once the event is safely in the persisted context, so an event lost
+    with the process leaves its messages unread and recoverable.
+    """
+
+    text: str
+    activity: bool = True
+    read_mark: tuple[int, int, int | None] | None = None
 
 
 def private_output_nudge(text: str) -> str:
@@ -112,6 +128,7 @@ class Agent(ModelLoop):
             ),
             api_tools=build_tools(settings.web_search, dreaming=dreaming),
             reasoning=cast(Reasoning, reasoning) if reasoning else omit,
+            api_retries=settings.api_retries,
         )
         # Max model/tool rounds per turn (one turn per batch of events).
         self.max_rounds = settings.max_rounds
@@ -121,7 +138,7 @@ class Agent(ModelLoop):
         # append. Cache keys/breakpoints still determine actual hits.
         self.max_context_items = settings.context_max_items
         self.trim_context_items = settings.context_trim_items
-        self._queue: asyncio.Queue[tuple[str, bool]] = asyncio.Queue()
+        self._queue: asyncio.Queue[Event] = asyncio.Queue()
         # Held for the whole of a turn. The dreaming loop takes the same
         # lock, which is how "the agent sleeps while it dreams" works:
         # a dream waits for the turn in flight and blocks the next one.
@@ -159,21 +176,34 @@ class Agent(ModelLoop):
         self._context = self._trim_dangling(self._trim_to_boundary(items))
         log.info("restored %d context items", len(self._context))
 
-    async def push(self, event: str, *, activity: bool = True) -> None:
-        """Queue an external event (formatted as text) for the agent.
+    async def push(
+        self,
+        event: str | Sequence[str],
+        *,
+        activity: bool = True,
+        read_mark: tuple[int, int, int | None] | None = None,
+    ) -> None:
+        """Queue an external event (one line, or a block of them) for the agent.
 
-        An event is always exactly one line. Every caller interpolates
-        text it does not control — a chat title, a sender's name, the
-        agent's own wakeup note, a dream summary — and a newline in any
-        of them would read as a second event: a message from a chat
-        nobody wrote in, a wakeup nobody scheduled. Collapsing here
-        rather than at each caller is what makes that structural.
+        Every line is collapsed to a single line first. Every caller
+        interpolates text it does not control — a chat title, a sender's
+        name, a quoted message body, the agent's own wakeup note — and a
+        newline in any of them would read as one more line: a message
+        from a chat nobody wrote in, a wakeup nobody scheduled. Callers
+        may therefore pass several lines, but only ones they built
+        themselves; folding here rather than at each caller is what makes
+        that structural.
 
         ``activity=False`` marks events (heartbeats) that should not by
         themselves reset the dream idle clock; the clock still moves
         when the turn they trigger reaches out to anyone.
+
+        ``read_mark`` names the chat history this event carries; see
+        :class:`Event` for why the cursor only moves on delivery.
         """
-        await self._queue.put((one_line(event), activity))
+        lines = [event] if isinstance(event, str) else event
+        text = "\n".join(one_line(line) for line in lines)
+        await self._queue.put(Event(text, activity, read_mark))
 
     async def run_forever(self) -> None:
         """Consume events forever; cancel the task to stop.
@@ -189,25 +219,32 @@ class Agent(ModelLoop):
                 batch.append(self._queue.get_nowait())
             await self._process(batch)
 
-    async def _process(self, batch: list[tuple[str, bool]]) -> None:
+    async def _process(self, batch: list[Event]) -> None:
         """Run one turn over a batch of events and update the idle clock.
 
         Failures are logged, dangling context is repaired and the caller
         moves on. ``last_active`` moves only when the batch held real
         activity or the turn acted outward — a heartbeat turn spent just
         reading leaves it alone, so idleness can actually accumulate.
+
+        An event's read cursor moves right after the event itself is
+        persisted, not before: from there on the agent has been shown
+        those messages whatever the turn does, while a crash earlier
+        leaves them unread for the next event to carry.
         """
         outward_before = self.tools.outward_calls
         async with self.turn_lock:
-            for event, _ in batch:
-                await self._remember({"role": "user", "content": event})
+            for event in batch:
+                await self._remember({"role": "user", "content": event.text})
+                if event.read_mark is not None:
+                    await self.db.mark_messages_read(*event.read_mark)
             try:
                 await self._turn()
             except Exception:
                 log.exception("agent turn failed")
                 self._context = self._trim_dangling(self._context)
         acted = self.tools.outward_calls > outward_before
-        if acted or any(activity for _, activity in batch):
+        if acted or any(event.activity for event in batch):
             self.last_active = datetime.now(UTC)
 
     async def _remember(self, item: dict[str, Any]) -> None:

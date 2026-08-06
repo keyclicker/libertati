@@ -70,6 +70,72 @@ async def test_delete_message(db: Database) -> None:
     assert [row["text"] for row in rows] == ["keep"]
 
 
+async def test_recent_messages_expose_reply_links(db: Database) -> None:
+    """History rows carry the reply target, so transcripts can mark it."""
+    await db.save_message(make_message(1, "first"))
+    await db.save_message(
+        make_message(
+            2,
+            "answer",
+            date=STAMP + 60,
+            reply_to_message={
+                "message_id": 1,
+                "date": STAMP,
+                "chat": {"id": 100, "type": "private", "first_name": "Alice"},
+            },
+        )
+    )
+    rows = await db.recent_messages(100, 10)
+    assert [row["reply_to_message_id"] for row in rows] == [None, 1]
+
+
+async def test_message_row_returns_one_message_or_nothing(db: Database) -> None:
+    """A single lookup answers what an event's reply target said."""
+    await db.save_message(make_message(1, "first"))
+    row = await db.message_row(100, 1)
+    assert row is not None
+    assert row["text"] == "first"
+    assert await db.message_row(100, 2) is None
+
+
+async def test_messages_since_read_stops_at_the_cursor(db: Database) -> None:
+    """Only messages the agent has not been shown come back, oldest first."""
+    for i in range(1, 5):
+        await db.save_message(make_message(i, f"msg {i}", date=STAMP + i))
+    await db.mark_messages_read(100, 2)
+    rows = await db.messages_since_read(100, 10)
+    assert [row["message_id"] for row in rows] == [3, 4]
+    rows = await db.messages_since_read(100, 10, before_message_id=4)
+    assert [row["message_id"] for row in rows] == [3]
+
+
+async def test_messages_since_read_keeps_the_newest_and_own_replies(
+    db: Database,
+) -> None:
+    """Over the limit the newest survive, and the agent's own words stay."""
+    await db.save_message(make_message(1, "theirs"))
+    await db.save_message(make_message(2, "mine", date=STAMP + 1), outgoing=True)
+    await db.save_message(make_message(3, "theirs again", date=STAMP + 2))
+    assert [row["message_id"] for row in await db.messages_since_read(100, 10)] == [
+        1,
+        2,
+        3,
+    ]
+    assert [row["message_id"] for row in await db.messages_since_read(100, 2)] == [2, 3]
+
+
+async def test_messages_since_read_honours_topic_scope(db: Database) -> None:
+    """A topic read cursor governs that topic, the chat cursor governs all."""
+    await db.save_message(make_topic_message(12, "one"))
+    await db.save_message(make_topic_message(13, "two", date=STAMP + 1))
+    await db.save_message(make_topic_message(14, "elsewhere", 34, date=STAMP + 2))
+    await db.mark_messages_read(-1001, 12, 12)
+    rows = await db.messages_since_read(-1001, 10, message_thread_id=12)
+    assert [row["message_id"] for row in rows] == [13]
+    rows = await db.messages_since_read(-1001, 10, message_thread_id=34)
+    assert [row["message_id"] for row in rows] == [14]
+
+
 async def test_recent_messages_pagination(db: Database) -> None:
     """before_message_id pages into the past, excluding the cursor itself."""
     for i in range(1, 6):

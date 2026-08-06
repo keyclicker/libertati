@@ -64,6 +64,14 @@ recall_reasoning_effort = "none"
 # Model used while dreaming.
 dream_model = "gpt-5.6-luna"
 
+# Extra attempts for a model call that failed for a transient reason:
+# the endpoint was unreachable, overloaded or rate limiting. Nothing
+# re-queues the event whose turn failed, so a provider hiccup that is
+# not waited out costs a message. Retries back off 4s, 8s, 16s
+# (jittered), budgeted per round — the agent waits at most that long
+# before giving the turn up, whatever fallbacks the round also tried.
+api_retries = 3
+
 
 # ==========================================================
 #                      Context window

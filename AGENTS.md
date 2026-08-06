@@ -22,8 +22,9 @@ CI runs all four checks plus tests; keep every one green.
 One package, `src/libertati/`, no sub-packages:
 
 - `bot.py` — aiogram wiring, entry point `run()`: handlers persist every
-  message and push events to the agent; background loops for wakeups,
-  heartbeats and dream handover.
+  message and push events to the agent (with the chat context it has
+  not been shown); background loops for wakeups, heartbeats and dream
+  handover.
 - `agent.py` — `Agent(ModelLoop)`: the single waking loop; event queue,
   turn lock, context-window trimming/restore invariants.
 - `loop.py` — `ModelLoop`: one Responses-API round (model call + tool
@@ -41,6 +42,8 @@ One package, `src/libertati/`, no sub-packages:
   key in `Prompts` is required and validated at startup.
 - `chats.py` — chat approval registry (`data/chats.toml`).
 - `clock.py` — the only place timestamp formats live.
+- `transcript.py` — the only place stored messages are rendered for the
+  model (history tools and the context events carry).
 - `spy.py` — standalone read-only TUI; must not import aiogram/openai
   at module level (keeps `libertati-spy` startup fast).
 - `render.py` — how the spy lays out one context item: a layout per
@@ -60,6 +63,18 @@ One package, `src/libertati/`, no sub-packages:
   `_trim_dangling`; keep new code paths behind them.
 - **Append-only history.** Every context item is written through to the
   `context` table; the DB is the source of truth, the window a view.
+- **Events are composed, never quoted whole.** `Agent.push` folds each
+  line it is handed, so an event may span several lines — but only ones
+  the code built. Anything sender-controlled (a body, a name, a title)
+  goes inside a line, never becomes one, or a message could forge an
+  event of its own.
+- **What an event shows counts as read — once it is delivered.**
+  `on_message` hands the chat/topic cursor to `Agent.push` as
+  `read_mark`, and `_process` advances it right after the event is
+  persisted, past everything the event carried and what the cap left
+  out. Moving it any earlier would mark messages read that a crash or a
+  dead turn means nobody ever saw; any later, and the same messages ride
+  along with every following event.
 - **`store=False` everywhere.** Nothing is stored server-side;
   encrypted reasoning must ride along in the context.
 - **Dream context is throwaway.** A dream persists nothing except mind

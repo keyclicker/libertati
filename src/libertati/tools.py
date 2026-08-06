@@ -34,8 +34,10 @@ from libertati import clock
 from libertati.chats import ChatRegistry
 from libertati.config import Settings
 from libertati.db import Database
+from libertati.loop import response_usage
 from libertati.memory import Mind
 from libertati.prompts import Prompts
+from libertati.transcript import render_transcript
 
 if TYPE_CHECKING:  # pragma: no cover - import cycle broken for runtime
     from libertati.dream import DreamGate
@@ -88,8 +90,10 @@ MESSAGING_TOOLS: list[ToolParam] = [
         "type": "function",
         "name": "send_message",
         "description": (
-            "Send a Telegram message to a chat. This is the ONLY way to "
-            "actually say something; plain text output sends nothing."
+            "Send a Telegram message to a chat. The ONLY way to say "
+            "anything to anyone: text you write outside this tool is "
+            "private thinking that reaches nobody, however it is "
+            "phrased. If you meant it for a person, it goes here."
         ),
         "parameters": {
             "type": "object",
@@ -476,9 +480,11 @@ HISTORY_TOOLS: list[ToolParam] = [
         "type": "function",
         "name": "get_recent_messages",
         "description": (
-            "Fetch messages stored for a chat, newest last. Use to recall "
-            "context beyond what you remember; page further into the past "
-            "with before_message_id."
+            "Fetch messages stored for a chat as a transcript "
+            "(`id HH:MM sender: text`, `↩id` marks a reply), newest last. "
+            "Use to recall context beyond what you remember and what the "
+            "event already showed you; page further into the past with "
+            "before_message_id."
         ),
         "parameters": {
             "type": "object",
@@ -520,9 +526,11 @@ HISTORY_TOOLS: list[ToolParam] = [
         "type": "function",
         "name": "get_unread_messages_count",
         "description": (
-            "Count stored messages added since you last fetched recent "
-            "messages from a chat or forum topic. Call this before "
-            "get_recent_messages to choose the smallest useful limit."
+            "Count the stored messages of a chat or forum topic that "
+            "nobody has shown you yet — neither an event nor a history "
+            "read. Usually zero for a chat you have just heard from, "
+            "since an event carries its own context; a large count means "
+            "a conversation ran on without you."
         ),
         "parameters": {
             "type": "object",
@@ -549,8 +557,10 @@ HISTORY_TOOLS: list[ToolParam] = [
         "description": (
             "Fetch the reply thread a message belongs to: what it "
             "replies to, replies to those, and every branch off any of "
-            "them, oldest first. Use to follow one conversation strand "
-            "in a busy group without paging through unrelated messages."
+            "them, oldest first, as a transcript. Use to follow a long "
+            "conversation strand in a busy group without paging through "
+            "unrelated messages — an event already quotes the one "
+            "message its own is replying to."
         ),
         "parameters": {
             "type": "object",
@@ -581,8 +591,9 @@ HISTORY_TOOLS: list[ToolParam] = [
         "name": "search_messages",
         "description": (
             "Search one chat's whole history for messages containing a "
-            "text fragment (case-insensitive), newest first. Use to find "
-            "what was said long ago without paging through everything."
+            "text fragment (case-insensitive), newest first, as a "
+            "transcript. Use to find what was said long ago without "
+            "paging through everything."
         ),
         "parameters": {
             "type": "object",
@@ -643,9 +654,10 @@ MEMORY_TOOLS: list[ToolParam] = [
         "type": "function",
         "name": "recall",
         "description": (
-            "Ask your long-term memory a question. Use before answering "
-            "anything that depends on the past beyond what you currently "
-            "see: names, preferences, promises, earlier plans."
+            "Ask your long-term memory a question: names, preferences, "
+            "promises, earlier plans, what you have concluded. It reads "
+            "your saved notes and has never seen a chat — for what was "
+            "actually said, use get_recent_messages or search_messages."
         ),
         "parameters": {
             "type": "object",
@@ -1066,6 +1078,11 @@ class Toolbox:
         self.outward_calls = 0
         #: Set by ``wake_up`` to the summary that ends the dream.
         self.wake_summary: str | None = None
+        #: Which turn or dream the calls being dispatched belong to; the
+        #: loop sets them each round so a handler's own API calls land on
+        #: the same ledger row as the round that asked for them.
+        self.turn_id: int | None = None
+        self.dream_id: int | None = None
         self._handlers = {
             # messaging
             "send_message": self._send_message,
@@ -1474,21 +1491,24 @@ class Toolbox:
         return json.dumps(rows, ensure_ascii=False)
 
     async def _get_recent_messages(self, args: dict[str, Any]) -> str:
-        """Return a page of a chat's messages as JSON, oldest first."""
+        """Return a page of a chat's messages as a transcript, oldest first."""
         limit = max(1, min(args.get("limit") or 20, 50))
+        thread_id = args.get("message_thread_id")
         rows = await self.db.recent_messages(
             args["chat_id"],
             limit,
             args.get("before_message_id"),
-            args.get("message_thread_id"),
+            thread_id,
         )
-        if args.get("before_message_id") is None and rows:
+        if not rows:
+            return "no messages stored for this chat"
+        if args.get("before_message_id") is None:
             await self.db.mark_messages_read(
                 args["chat_id"],
                 max(row["message_id"] for row in rows),
-                args.get("message_thread_id"),
+                thread_id,
             )
-        return json.dumps(rows, ensure_ascii=False)
+        return render_transcript(rows, self.tz, show_topic=thread_id is None)
 
     async def _get_unread_messages_count(self, args: dict[str, Any]) -> str:
         """Return unread stored-message count for a chat or topic."""
@@ -1498,15 +1518,15 @@ class Toolbox:
         return str(count)
 
     async def _get_message_thread(self, args: dict[str, Any]) -> str:
-        """Return the reply thread around a message as JSON, oldest first."""
+        """Return the reply thread around a message as a transcript."""
         limit = max(1, min(args.get("limit") or 20, 50))
         rows = await self.db.message_thread(args["chat_id"], args["message_id"], limit)
         if not rows:
             return "no such message stored"
-        return json.dumps(rows, ensure_ascii=False)
+        return render_transcript(rows, self.tz, show_topic=True)
 
     async def _search_messages(self, args: dict[str, Any]) -> str:
-        """Return a chat's messages matching a substring as JSON.
+        """Return a chat's messages matching a substring as a transcript.
 
         An empty needle is refused rather than passed down: SQLite's
         ``instr`` reports it as a match in every row, so the search would
@@ -1516,15 +1536,11 @@ class Toolbox:
         if not query:
             return "error: query must not be empty"
         limit = max(1, min(args.get("limit") or 20, 50))
-        rows = await self.db.search_messages(
-            args["chat_id"],
-            query,
-            limit,
-            args.get("message_thread_id"),
-        )
+        thread_id = args.get("message_thread_id")
+        rows = await self.db.search_messages(args["chat_id"], query, limit, thread_id)
         if not rows:
             return "no matches"
-        return json.dumps(rows, ensure_ascii=False)
+        return render_transcript(rows, self.tz, show_topic=thread_id is None)
 
     # ==========================================================
     #                          Memory
@@ -1553,7 +1569,26 @@ class Toolbox:
             reasoning=reasoning,
             store=False,
         )
+        await self._record_memory_usage(response)
         return response.output_text or "recall came back empty"
+
+    async def _record_memory_usage(self, response: Any) -> None:
+        """Bill one memory-extraction call to the turn or dream that made it.
+
+        These calls bypass the round engine, so without this the ledger
+        would miss them entirely — and a recall can happen on every turn.
+        They answer from their own input rather than from the context
+        window, which is what ``input_context_id = 0`` records.
+        """
+        usage = response_usage(response, self.recall_model)
+        if usage is None or (self.turn_id is None and self.dream_id is None):
+            return
+        await self.db.append_api_usage(
+            turn_id=self.turn_id,
+            dream_id=self.dream_id,
+            input_context_id=0,
+            **usage,
+        )
 
     async def _recall(self, args: dict[str, Any]) -> str:
         """Answer a query from memory + inbox via a one-shot extraction call."""

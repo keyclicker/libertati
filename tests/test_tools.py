@@ -47,6 +47,23 @@ SUMMARY_PROMPT = "test summary prompt"
 OPEN_REGISTRY = ChatRegistry(Path("unused-chats.toml"), enabled=False)
 
 
+def message_row(**overrides: Any) -> dict:
+    """Build a stored-message row in the shape history queries return."""
+    return {
+        "message_id": 10,
+        "date": "2026-08-04T05:46:31+00:00",
+        "outgoing": 0,
+        "username": "nick",
+        "first_name": "Nick",
+        "text": "hi",
+        "caption": None,
+        "content_type": "text",
+        "message_thread_id": None,
+        "reply_to_message_id": None,
+        **overrides,
+    }
+
+
 class FakeDB:
     """Records calls made by tool handlers."""
 
@@ -57,7 +74,9 @@ class FakeDB:
         self.read_marks: list[tuple[int, int, int | None]] = []
         self.recent_rows: list[dict] = []
         self.search_calls: list[tuple[int, str, int, int | None]] = []
+        self.search_rows: list[dict] = []
         self.thread_calls: list[tuple[int, int, int]] = []
+        self.thread_rows: list[dict] = []
         self.wakeups: list[tuple[str, str]] = []
         self.pending: list[dict] = []
         self.chats: list[dict] = []
@@ -69,6 +88,7 @@ class FakeDB:
         self.outgoing_rows: set[tuple[int, int]] = set()
         self.topics: list[dict] = []
         self.observed_topics: set[tuple[int, int]] = set()
+        self.usage: list[dict] = []
 
     async def recent_messages(
         self,
@@ -77,7 +97,7 @@ class FakeDB:
         before_message_id: int | None = None,
         message_thread_id: int | None = None,
     ) -> list[dict]:
-        """Record the query and return no rows."""
+        """Record the query and return the canned page."""
         self.recent_calls.append((chat_id, limit, before_message_id, message_thread_id))
         return self.recent_rows
 
@@ -103,9 +123,9 @@ class FakeDB:
         limit: int,
         message_thread_id: int | None = None,
     ) -> list[dict]:
-        """Record the query and return no rows."""
+        """Record the query and return the canned matches."""
         self.search_calls.append((chat_id, needle, limit, message_thread_id))
-        return []
+        return self.search_rows
 
     async def list_topics(self, chat_id: int) -> list[dict]:
         """Return the canned topic list."""
@@ -118,9 +138,9 @@ class FakeDB:
     async def message_thread(
         self, chat_id: int, message_id: int, limit: int
     ) -> list[dict]:
-        """Record the query and return no rows."""
+        """Record the query and return the canned thread."""
         self.thread_calls.append((chat_id, message_id, limit))
-        return []
+        return self.thread_rows
 
     async def list_chats(self) -> list[dict]:
         """Return the canned chat list."""
@@ -154,6 +174,10 @@ class FakeDB:
     async def message_is_outgoing(self, chat_id: int, message_id: int) -> bool:
         """Report ownership from the canned outgoing set."""
         return (chat_id, message_id) in self.outgoing_rows
+
+    async def append_api_usage(self, **usage: Any) -> None:
+        """Collect one usage record."""
+        self.usage.append(usage)
 
     async def add_wakeup(self, due_at: str, note: str) -> int:
         """Record the wakeup and return a fixed id."""
@@ -287,13 +311,18 @@ class RecordingBot:
 class FakeClient:
     """Records recall extraction calls and returns a canned answer."""
 
-    def __init__(self) -> None:
+    def __init__(self, usage: Any = None) -> None:
         """Expose a responses.create stub that logs its kwargs."""
         self.calls: list[dict[str, Any]] = []
 
         async def create(**kwargs: Any) -> Any:
             self.calls.append(kwargs)
-            return SimpleNamespace(output_text="the cat is named Bober")
+            return SimpleNamespace(
+                id="resp",
+                model=None,
+                output_text="the cat is named Bober",
+                usage=usage,
+            )
 
         self.responses = SimpleNamespace(create=create)
 
@@ -961,7 +990,7 @@ async def test_unread_count_and_recent_read_cursor() -> None:
     """Unread count is exposed and newest-history reads advance its cursor."""
     db = FakeDB()
     db.read_count = 3
-    db.recent_rows = [{"message_id": 9}]
+    db.recent_rows = [message_row(message_id=9)]
     toolbox = make_toolbox(db=db)
     count_args = {"chat_id": 1, "message_thread_id": 12}
     assert await toolbox.run("get_unread_messages_count", json.dumps(count_args)) == "3"
@@ -973,6 +1002,71 @@ async def test_unread_count_and_recent_read_cursor() -> None:
     }
     await toolbox.run("get_recent_messages", json.dumps(recent_args))
     assert db.read_marks == [(1, 9, 12)]
+
+
+async def test_get_recent_messages_renders_a_transcript() -> None:
+    """History comes back as transcript lines, not as JSON rows."""
+    db = FakeDB()
+    db.recent_rows = [
+        message_row(message_id=9, text="what's up"),
+        message_row(message_id=10, outgoing=1, text="nothing", reply_to_message_id=9),
+    ]
+    args = {
+        "chat_id": 1,
+        "limit": None,
+        "before_message_id": None,
+        "message_thread_id": 72,
+    }
+    result = await make_toolbox(db=db).run("get_recent_messages", json.dumps(args))
+    assert result == (
+        "— Tue 2026-08-04 —\n9 05:46 Nick @nick: what's up\n10 05:46 you: nothing ↩9"
+    )
+
+
+async def test_get_recent_messages_shows_topics_when_not_scoped() -> None:
+    """A chat-wide read tags each line with the topic it came from."""
+    db = FakeDB()
+    db.recent_rows = [message_row(message_thread_id=72)]
+    args = {
+        "chat_id": 1,
+        "limit": None,
+        "before_message_id": None,
+        "message_thread_id": None,
+    }
+    result = await make_toolbox(db=db).run("get_recent_messages", json.dumps(args))
+    assert result.endswith("#72")
+
+
+async def test_get_recent_messages_reports_an_empty_chat() -> None:
+    """Nothing stored says so instead of returning an empty transcript."""
+    db = FakeDB()
+    args = {
+        "chat_id": 1,
+        "limit": None,
+        "before_message_id": None,
+        "message_thread_id": None,
+    }
+    result = await make_toolbox(db=db).run("get_recent_messages", json.dumps(args))
+    assert result == "no messages stored for this chat"
+    assert db.read_marks == []
+
+
+async def test_get_message_thread_renders_a_transcript() -> None:
+    """A reply chain renders with its topics, which may differ per branch."""
+    db = FakeDB()
+    db.thread_rows = [message_row(message_id=9, message_thread_id=72)]
+    args = {"chat_id": 1, "message_id": 9, "limit": None}
+    result = await make_toolbox(db=db).run("get_message_thread", json.dumps(args))
+    assert result.endswith("9 05:46 Nick @nick: hi #72")
+
+
+async def test_search_messages_renders_a_transcript() -> None:
+    """Matches render as transcript lines in the order the query returned."""
+    db = FakeDB()
+    db.search_rows = [message_row(message_id=9, text="cat")]
+    args = {"chat_id": 1, "query": "cat", "limit": None, "message_thread_id": 72}
+    result = await make_toolbox(db=db).run("search_messages", json.dumps(args))
+    assert result == "— Tue 2026-08-04 —\n9 05:46 Nick @nick: cat"
 
 
 async def test_get_message_thread_clamps_limit_and_reports_missing() -> None:
@@ -1203,6 +1297,48 @@ async def test_recall_extracts_from_notes(tmp_path: Path) -> None:
     assert "cat named Bober" in call["input"]
     assert "cat name?" in call["input"]
     assert call["store"] is False
+
+
+async def test_recall_bills_its_own_tokens_to_the_turn(tmp_path: Path) -> None:
+    """A memory read bypasses the round engine, so it books itself."""
+    mind = make_mind(tmp_path)
+    mind.append_inbox("cat named Bober", "Sun 2026-08-02 12:00")
+    client = FakeClient(
+        usage=SimpleNamespace(
+            input_tokens=900,
+            output_tokens=40,
+            total_tokens=940,
+            input_tokens_details=SimpleNamespace(cached_tokens=800),
+            output_tokens_details=None,
+        )
+    )
+    db = FakeDB()
+    toolbox = make_toolbox(db=db, client=client, mind=mind)
+    toolbox.turn_id = 5
+
+    await toolbox.run("recall", json.dumps({"query": "cat name?"}))
+
+    (usage,) = db.usage
+    assert usage["turn_id"] == 5
+    assert usage["model"] == "recall-model"
+    assert usage["input_tokens"] == 900
+    assert usage["cached_tokens"] == 800
+    assert usage["reasoning_tokens"] == 0
+    # The notes are the whole input; no context row backs this call.
+    assert usage["input_context_id"] == 0
+
+
+async def test_recall_outside_a_turn_records_nothing(tmp_path: Path) -> None:
+    """With no turn or dream to bill, there is no row to write."""
+    mind = make_mind(tmp_path)
+    mind.append_inbox("cat named Bober", "Sun 2026-08-02 12:00")
+    db = FakeDB()
+    client = FakeClient(usage=SimpleNamespace(input_tokens=1, output_tokens=1))
+    toolbox = make_toolbox(db=db, client=client, mind=mind)
+
+    await toolbox.run("recall", json.dumps({"query": "cat name?"}))
+
+    assert db.usage == []
 
 
 async def test_recall_omits_reasoning_by_default(tmp_path: Path) -> None:

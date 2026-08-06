@@ -9,10 +9,19 @@ which table each of them records what it said, so only the round itself
 lives here.
 """
 
+import asyncio
 import logging
-from typing import TYPE_CHECKING, Any, cast
+import random
+from typing import TYPE_CHECKING, Any, TypedDict, cast
 
-from openai import AsyncOpenAI, BadRequestError, Omit
+from openai import (
+    APIConnectionError,
+    AsyncOpenAI,
+    BadRequestError,
+    InternalServerError,
+    Omit,
+    RateLimitError,
+)
 from openai.types.responses import ResponseInputParam, ToolParam
 from openai.types.shared_params import Reasoning
 
@@ -36,6 +45,55 @@ STALE_CONTEXT_ERRORS = (
 #: retrying with the locally executed function tools alone.
 SERVER_TOOL_ERROR = "Server tool request failed"
 
+#: Failures that say nothing about the request itself — the endpoint was
+#: unreachable, overloaded or rate limiting. Waiting is the whole fix; a
+#: turn that gives up on one drops the event that triggered it, since
+#: nothing re-queues an event whose turn already ran.
+TRANSIENT_ERRORS = (APIConnectionError, RateLimitError, InternalServerError)
+
+#: Delay before the first retry of a transient failure; each further one
+#: doubles it, with jitter so a burst of turns does not resynchronize on
+#: the provider.
+RETRY_BACKOFF_SECONDS = 4.0
+
+
+class Usage(TypedDict):
+    """What one API call reported, in ``append_api_usage`` keyword shape."""
+
+    response_id: str | None
+    model: str
+    input_tokens: int
+    cached_tokens: int
+    cache_write_tokens: int
+    output_tokens: int
+    reasoning_tokens: int
+    total_tokens: int
+
+
+def response_usage(response: Any, default_model: str) -> Usage | None:
+    """Pull the token counts out of a Responses-API result.
+
+    ``None`` when the endpoint reported none at all. Compatible
+    endpoints also omit individual sections of the usage object, so each
+    nested field is read defensively; ``default_model`` names the model
+    for one that does not echo the name back.
+    """
+    usage = getattr(response, "usage", None)
+    if usage is None:
+        return None
+    input_details = getattr(usage, "input_tokens_details", None)
+    output_details = getattr(usage, "output_tokens_details", None)
+    return Usage(
+        response_id=getattr(response, "id", None),
+        model=getattr(response, "model", None) or default_model,
+        input_tokens=usage.input_tokens,
+        cached_tokens=getattr(input_details, "cached_tokens", 0) or 0,
+        cache_write_tokens=getattr(input_details, "cache_write_tokens", 0) or 0,
+        output_tokens=usage.output_tokens,
+        reasoning_tokens=getattr(output_details, "reasoning_tokens", 0) or 0,
+        total_tokens=usage.total_tokens,
+    )
+
 
 class ModelLoop:
     """One model call plus its tool calls, and the usage bookkeeping.
@@ -58,6 +116,7 @@ class ModelLoop:
         tools: "Toolbox",
         api_tools: list[ToolParam],
         reasoning: Reasoning | Omit,
+        api_retries: int = 0,
     ) -> None:
         """Keep the API handles and start with an empty context window."""
         self.client = client
@@ -65,6 +124,7 @@ class ModelLoop:
         self.db = db
         self.tools = tools
         self.reasoning = reasoning
+        self.api_retries = api_retries
         self._api_tools = api_tools
         self._context: list[dict[str, Any]] = []
         self._last_output_text = ""
@@ -99,19 +159,40 @@ class ModelLoop:
         """
         input_context_id = await self._anchor_id()
         request_context = self._context
+        # One retry budget for the whole round, not one per call: the
+        # BadRequestError fallbacks below re-enter create(), and a
+        # per-call counter would let a flapping endpoint hold the turn
+        # lock for the sum of every fallback's backoff.
+        attempt = 0
 
         async def create(tools: list[ToolParam], context: list[dict[str, Any]]) -> Any:
-            return await self.client.responses.create(
-                model=self.model,
-                instructions=instructions,
-                input=cast(ResponseInputParam, context),
-                tools=tools,
-                # Nothing is stored server-side; encrypted reasoning must
-                # ride along in the context for multi-round tool turns.
-                store=False,
-                include=["reasoning.encrypted_content"],
-                reasoning=self.reasoning,
-            )
+            nonlocal attempt
+            while True:
+                try:
+                    return await self.client.responses.create(
+                        model=self.model,
+                        instructions=instructions,
+                        input=cast(ResponseInputParam, context),
+                        tools=tools,
+                        # Nothing is stored server-side; encrypted reasoning
+                        # must ride along for multi-round tool turns.
+                        store=False,
+                        include=["reasoning.encrypted_content"],
+                        reasoning=self.reasoning,
+                    )
+                except TRANSIENT_ERRORS as exc:
+                    if attempt >= self.api_retries:
+                        raise
+                    delay = (
+                        RETRY_BACKOFF_SECONDS * 2**attempt * random.uniform(0.8, 1.2)
+                    )
+                    log.warning(
+                        "transient API failure (%s); retrying in %.1fs",
+                        type(exc).__name__,
+                        delay,
+                    )
+                    await asyncio.sleep(delay)
+                    attempt += 1
 
         request_tools = self._api_tools
         # Each fallback is worth exactly one attempt: a second rejection
@@ -168,6 +249,10 @@ class ModelLoop:
                     len(response.output_text),
                 )
             return False
+        # A handler may call the API itself (memory extraction does), and
+        # what it spends belongs to the same turn or dream as this round.
+        self.tools.turn_id = turn_id
+        self.tools.dream_id = self.dream_id
         for call in calls:
             result = await self.tools.run(call.name, call.arguments)
             await self._remember(
@@ -186,35 +271,23 @@ class ModelLoop:
         input_context_id: int,
     ) -> None:
         """Log authoritative usage; persist it against its turn or dream."""
-        usage = getattr(response, "usage", None)
+        usage = response_usage(response, self.model)
         if usage is None:
             return
-        input_details = getattr(usage, "input_tokens_details", None)
-        output_details = getattr(usage, "output_tokens_details", None)
-        cached_tokens = getattr(input_details, "cached_tokens", 0) or 0
-        cache_write_tokens = getattr(input_details, "cache_write_tokens", 0) or 0
-        reasoning_tokens = getattr(output_details, "reasoning_tokens", 0) or 0
         if turn_id is not None or self.dream_id is not None:
             await self.db.append_api_usage(
-                response_id=getattr(response, "id", None),
                 turn_id=turn_id,
                 dream_id=self.dream_id,
                 input_context_id=input_context_id,
-                model=getattr(response, "model", None) or self.model,
-                input_tokens=usage.input_tokens,
-                cached_tokens=cached_tokens,
-                cache_write_tokens=cache_write_tokens,
-                output_tokens=usage.output_tokens,
-                reasoning_tokens=reasoning_tokens,
-                total_tokens=usage.total_tokens,
+                **usage,
             )
         log.info(
             "api usage: input=%d cached=%d cache_write=%d "
             "output=%d reasoning=%d total=%d",
-            usage.input_tokens,
-            cached_tokens,
-            cache_write_tokens,
-            usage.output_tokens,
-            reasoning_tokens,
-            usage.total_tokens,
+            usage["input_tokens"],
+            usage["cached_tokens"],
+            usage["cache_write_tokens"],
+            usage["output_tokens"],
+            usage["reasoning_tokens"],
+            usage["total_tokens"],
         )
