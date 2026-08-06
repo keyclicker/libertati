@@ -1,5 +1,6 @@
 """Tests for event formatting and routing of incoming Telegram messages."""
 
+import asyncio
 from collections.abc import Sequence
 from pathlib import Path
 from typing import Any, cast
@@ -13,6 +14,7 @@ from libertati.bot import (
     EVENT_CONTEXT_TEXT_LIMIT,
     EVENT_TEXT_LIMIT,
     HEARTBEAT_DIGEST_LIMIT,
+    ChatOrder,
     deliver_wakeups,
     event_context,
     format_event,
@@ -503,23 +505,27 @@ PHOTO = [{"file_id": "f", "file_unique_id": "u", "width": 320, "height": 240}]
 
 
 class FakeLens:
-    """Records which messages were waited for and which were not."""
+    """Records which messages were described and which were waited for."""
 
-    def __init__(self, note: str | None = "a cat glaring at a mug") -> None:
-        """Answer every wait with ``note``."""
+    def __init__(
+        self, note: str | None = "a cat glaring at a mug", delay: float = 0.0
+    ) -> None:
+        """Answer every wait with ``note``, after ``delay``."""
         self.note = note
+        self.delay = delay
         self.started: list[tuple[int, int]] = []
         self.waited: list[tuple[int, int]] = []
 
-    def start(self, chat_id: int, message_id: int, payload: dict) -> None:
-        """Record a background description."""
+    def start(self, chat_id: int, message_id: int, payload: dict) -> tuple[int, int]:
+        """Record a started description, standing in for its task."""
         self.started.append((chat_id, message_id))
+        return (chat_id, message_id)
 
-    async def look_briefly(
-        self, chat_id: int, message_id: int, payload: dict
-    ) -> str | None:
-        """Record a description the event waited for."""
-        self.waited.append((chat_id, message_id))
+    async def wait_briefly(self, job: tuple[int, int]) -> str | None:
+        """Record what an event waited for, taking its time about it."""
+        self.waited.append(job)
+        if self.delay:
+            await asyncio.sleep(self.delay)
         return self.note
 
 
@@ -552,6 +558,43 @@ async def test_addressed_media_is_described_before_the_event() -> None:
     )
     assert lens.waited == [(100, 42)]
     assert "<photo: a cat glaring at a mug> look" in agent.events[0]
+
+
+async def test_a_slow_look_does_not_let_the_next_message_overtake() -> None:
+    """The picture must reach the agent before the question about it."""
+    agent = FakeAgent()
+    lens = FakeLens(delay=0.05)
+    order = ChatOrder()
+    photo = make_message(text=None, photo=PHOTO, caption="look @libertati_bot")
+    question = make_message(message_id=43, text="what is it? @libertati_bot")
+    first = asyncio.create_task(
+        on_message(
+            photo,
+            agent,
+            UTC_TZ,
+            ME,
+            OPEN_REGISTRY,
+            FakeTopicDB(),  # type: ignore[arg-type]
+            cast(Any, lens),
+            order,
+        )
+    )
+    # Long enough for the photo's handler to be waiting on its note.
+    await asyncio.sleep(0.01)
+    await on_message(
+        question,
+        agent,
+        UTC_TZ,
+        ME,
+        OPEN_REGISTRY,
+        FakeTopicDB(),  # type: ignore[arg-type]
+        cast(Any, lens),
+        order,
+    )
+    await first
+
+    assert "<photo: a cat glaring at a mug> look" in agent.events[0]
+    assert "what is it?" in agent.events[1]
 
 
 async def test_group_media_nobody_addressed_is_still_described() -> None:

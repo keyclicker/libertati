@@ -472,36 +472,36 @@ class MediaLens:
             log.exception("describing %s in chat %s failed", ref.kind, chat_id)
             return None
 
-    def start(self, chat_id: int, message_id: int, payload: dict[str, Any]) -> None:
+    def start(
+        self, chat_id: int, message_id: int, payload: dict[str, Any]
+    ) -> "asyncio.Task[str | None] | None":
         """Describe one message's media in the background, if it has any.
 
-        What arrives in a group unaddressed is described now so that the
-        note is already there when the message later rides along with an
-        event as context.
-        """
-        if media_ref(payload) is None:
-            return
-        task = asyncio.create_task(self.look(chat_id, message_id, payload))
-        self._tasks.add(task)
-        task.add_done_callback(self._tasks.discard)
-
-    async def look_briefly(
-        self, chat_id: int, message_id: int, payload: dict[str, Any]
-    ) -> str | None:
-        """Describe media, giving up on waiting after ``wait_seconds``.
-
-        Used on the path an event takes: a note that arrives in time is
-        worth waiting a moment for, but a slow model must not hold up the
-        agent's reply. The work carries on in the background either way,
-        so the note is there for every later transcript.
+        Returns the running job so a caller that wants the note can wait
+        for it with :meth:`wait_briefly`; the work is started either way,
+        the moment the message lands, so a burst of pictures is looked at
+        all at once and the note is there when any of them later rides
+        along with an event as context.
         """
         if media_ref(payload) is None:
             return None
         task = asyncio.create_task(self.look(chat_id, message_id, payload))
         self._tasks.add(task)
         task.add_done_callback(self._tasks.discard)
-        done, _ = await asyncio.wait({task}, timeout=self.wait_seconds)
-        return task.result() if done else None
+        return task
+
+    async def wait_briefly(self, job: "asyncio.Task[str | None] | None") -> str | None:
+        """Give a started description ``wait_seconds`` to land.
+
+        Used on the path an event takes: a note that arrives in time is
+        worth waiting a moment for, but a slow model must not hold up the
+        agent's reply. The job carries on in the background either way,
+        so the note is there for every later transcript.
+        """
+        if job is None:
+            return None
+        done, _ = await asyncio.wait({job}, timeout=self.wait_seconds)
+        return job.result() if done else None
 
     # ------------------------- work --------------------------
 

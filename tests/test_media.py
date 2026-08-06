@@ -374,11 +374,22 @@ async def test_a_slow_description_does_not_hold_up_the_event(
     lens = make_lens(db, tmp_path, client, wait_seconds=0.0)
     (lens.media_dir / artifact_name("sticker-uid", ".webp")).write_bytes(b"webp")
 
-    assert await lens.look_briefly(10, 1, {"sticker": STICKER}) is None
+    job = lens.start(10, 1, {"sticker": STICKER})
+    assert await lens.wait_briefly(job) is None
 
     await client.responses.started.wait()
     await asyncio.gather(*lens._tasks)
     assert await db.media_note("sticker-uid") == "a cat"
+
+
+async def test_nothing_is_started_for_a_message_without_media(
+    db: Database, tmp_path: Path
+) -> None:
+    """There is no job to wait for, and none was queued."""
+    lens = make_lens(db, tmp_path)
+    assert lens.start(10, 1, {"text": "hi"}) is None
+    assert await lens.wait_briefly(None) is None
+    assert lens._tasks == set()
 
 
 async def test_media_without_eyes_is_never_looked_at(

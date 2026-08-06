@@ -89,6 +89,12 @@ One package, `src/libertati/`, no sub-packages:
   transcript through `messages.media_uid`, which is written only after a
   description exists. Originals are deleted straight after ffmpeg runs;
   only the compressed artifact under `media_dir` stays.
+- **Events arrive in the order they were sent.** aiogram runs every
+  update in its own task and `on_message` waits up to
+  `media_wait_seconds` for a description, so the push happens under
+  `ChatOrder`'s per-chat lock. Anything else that makes the handler wait
+  belongs inside that lock too, or a later message overtakes an earlier
+  one on the way to the agent.
 - **Timestamps**: UTC in the DB (`clock.utc_stamp`, matches SQLite's
   `datetime('now')`), the configured timezone for anything the model
   sees (`clock.format_local`).
