@@ -70,10 +70,10 @@ class FakeTranscriptions:
         self.text = text
         self.calls: list[dict[str, Any]] = []
 
-    async def create(self, **kwargs: Any) -> str:
-        """Return a plain-text transcript, as ``response_format`` asks."""
+    async def create(self, **kwargs: Any) -> Any:
+        """Answer the way a ``json`` response format is handed back."""
         self.calls.append(kwargs)
-        return self.text
+        return SimpleNamespace(text=self.text)
 
 
 class FakeClient:
@@ -365,6 +365,9 @@ async def test_voice_is_transcribed_when_a_model_is_configured(
 
     assert note == "see you at six"
     assert client.responses.calls == []
+    # Not "text": OpenRouter rejects that format outright, and json is
+    # the one every transcription endpoint offers.
+    assert client.audio.transcriptions.calls[0]["response_format"] == "json"
 
 
 async def test_a_slow_description_does_not_hold_up_the_event(

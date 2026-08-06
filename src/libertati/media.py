@@ -660,11 +660,17 @@ class MediaLens:
         return self._clean(response.output_text)
 
     async def _transcribe(self, artifact: Path) -> str | None:
-        """Send one voice/audio artifact to the speech-to-text endpoint."""
+        """Send one voice/audio artifact to the speech-to-text endpoint.
+
+        ``json`` rather than ``text``: it is the one response format
+        every transcription endpoint offers (OpenRouter rejects ``text``
+        outright), and the answer is read the same either way — some
+        compatible endpoints hand back the bare string regardless.
+        """
         response = await self.client.audio.transcriptions.create(
             model=self.transcribe_model or "",
             file=(artifact.name, artifact.read_bytes(), "audio/ogg"),
-            response_format="text",
+            response_format="json",
         )
         text = response if isinstance(response, str) else getattr(response, "text", "")
         return self._clean(text)
