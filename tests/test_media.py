@@ -262,7 +262,7 @@ def test_frames_command_falls_back_to_one_still() -> None:
 
 def test_audio_command_produces_small_mono_opus() -> None:
     """Voice is kept re-transcribable, not hi-fi."""
-    command = audio_command(Path("in.oga"), Path("out.opus"))
+    command = audio_command(Path("in.oga"), Path("out.ogg"))
     assert "libopus" in command
     assert command[command.index("-ac") + 1] == "1"
 
@@ -356,7 +356,7 @@ async def test_voice_is_transcribed_when_a_model_is_configured(
     """The transcript is the note, stored like any other."""
     client = FakeClient(audio="see you at six")
     lens = make_lens(db, tmp_path, client, transcribe_model="ears")
-    (lens.media_dir / artifact_name("v-uid", ".opus")).write_bytes(b"opus")
+    (lens.media_dir / artifact_name("v-uid", ".ogg")).write_bytes(b"opus")
 
     note = await lens.look(
         10, 1, {"voice": {"file_id": "v", "file_unique_id": "v-uid", "duration": 3}}

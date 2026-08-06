@@ -543,7 +543,10 @@ class MediaLens:
                 "skipping %s: %d bytes is past Telegram's limit", ref.kind, ref.size
             )
             return None
-        suffix = ".opus" if ref.source == "audio" else ".webp"
+        # Named by container, not codec: a transcription endpoint reads
+        # the format off the filename it is handed, and ".ogg" is on
+        # every provider's list where ".opus" is on few.
+        suffix = ".ogg" if ref.source == "audio" else ".webp"
         artifact = self.media_dir / artifact_name(ref.file_unique_id, suffix)
         async with self._jobs:
             # An artifact that survived from an earlier look is described
