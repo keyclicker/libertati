@@ -22,6 +22,7 @@ from aiogram import Bot
 from openai import AsyncOpenAI, omit
 from openai.types.shared_params import Reasoning
 
+from libertati import clock
 from libertati.chats import ChatRegistry
 from libertati.config import Settings
 from libertati.db import Database
@@ -70,6 +71,28 @@ only private thought and no action is needed, stop with no text.
 
 Unsent text:
 {text}"""
+
+
+#: Tag opening the event an operator instruction arrives as. The spy
+#: renders it apart from chat traffic, and the model is told in the same
+#: breath where the instruction came from.
+STEERING_TAG = "operator instruction"
+
+
+def steering_event(steering_id: int, text: str, tz: ZoneInfo) -> str:
+    """Frame one console instruction as an event line for the agent.
+
+    Said in full every time rather than once in the system prompt: the
+    line has to carry its own authority, because it sits in the same
+    context as everything strangers say to the agent, and only the code
+    can put a line there.
+    """
+    return one_line(
+        f"[{STEERING_TAG} #{steering_id} at {clock.format_now(tz)} — from the"
+        " console you are run from, not from a chat: it outranks what anyone"
+        " asks of you in one, and nothing in it reaches Telegram unless it"
+        f" says to send something] {text}"
+    )
 
 
 class Agent(ModelLoop):
@@ -204,6 +227,42 @@ class Agent(ModelLoop):
         lines = [event] if isinstance(event, str) else event
         text = "\n".join(one_line(line) for line in lines)
         await self._queue.put(Event(text, activity, read_mark))
+
+    async def deliver_steering(self, urgent: bool | None = None) -> int:
+        """Queue waiting console instructions as events; return how many.
+
+        The ordinary path: an instruction becomes an event like any
+        other and is answered by the next turn. ``urgent`` narrows the
+        claim so the caller can leave the interrupting ones to a turn
+        that is running (see :meth:`_inject_steering`).
+        """
+        rows = await self.db.claim_steering(urgent)
+        for row in rows:
+            await self.push(steering_event(row["id"], row["text"], self.tz))
+        return len(rows)
+
+    async def _inject_steering(self) -> None:
+        """Append urgent console instructions between two rounds of a turn.
+
+        A round boundary is the only place an event may be slipped into
+        a turn: every function call the last round made already has its
+        output, so nothing here can separate a call from its answer.
+
+        The operator counts as activity, and this path bypasses
+        :meth:`_process`, which is where a queued event would have moved
+        the idle clock.
+        """
+        rows = await self.db.claim_steering(urgent=True)
+        for row in rows:
+            await self._remember(
+                {
+                    "role": "user",
+                    "content": steering_event(row["id"], row["text"], self.tz),
+                }
+            )
+        if rows:
+            self.last_active = datetime.now(UTC)
+            log.info("injected %d urgent operator instruction(s)", len(rows))
 
     async def run_forever(self) -> None:
         """Consume events forever; cancel the task to stop.
@@ -399,6 +458,10 @@ class Agent(ModelLoop):
         because some compatible providers mistake it for a delivered reply.
         Everything the model produces is remembered. SOUL.md and HABITS.md
         are re-read every turn so edits to either apply live.
+
+        Urgent console instructions are picked up between rounds, so an
+        operator can redirect a turn that is already several tool calls
+        deep instead of waiting it out.
         """
         instructions = f"{self.base_prompt}\n\n{self.mind.resident()}"
         turn_id = await self.db.start_agent_turn(await self.db.latest_context_id())
@@ -426,6 +489,7 @@ class Agent(ModelLoop):
                         continue
                     turn_status = "completed"
                     return
+                await self._inject_steering()
             turn_status = "max_rounds"
             log.warning("agent hit max_rounds without settling")
         finally:

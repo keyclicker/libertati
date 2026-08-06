@@ -1,5 +1,6 @@
 """Tests for event formatting and routing of incoming Telegram messages."""
 
+import asyncio
 from collections.abc import Sequence
 from pathlib import Path
 from typing import Any, cast
@@ -8,11 +9,13 @@ from zoneinfo import ZoneInfo
 from aiogram import Dispatcher
 from aiogram.types import Message, MessageReactionUpdated, User
 
+from libertati.agent import Agent
 from libertati.bot import (
     EVENT_CONTEXT_LIMIT,
     EVENT_CONTEXT_TEXT_LIMIT,
     EVENT_TEXT_LIMIT,
     HEARTBEAT_DIGEST_LIMIT,
+    deliver_steering,
     deliver_wakeups,
     event_context,
     format_event,
@@ -486,6 +489,41 @@ async def test_event_context_truncates_long_bodies(db: Database) -> None:
     await db.save_message(trigger)
     lines = await event_context(db, trigger, UTC_TZ)
     assert any("[…50 chars]" in line for line in lines)
+
+
+def make_steered_agent(db: Database) -> Agent:
+    """Build a bare agent with only what console delivery touches."""
+    agent = Agent.__new__(Agent)
+    agent.db = db
+    agent.tz = UTC_TZ
+    agent._queue = asyncio.Queue()
+    agent.turn_lock = asyncio.Lock()
+    return agent
+
+
+async def test_deliver_steering_holds_urgent_back_during_a_turn(db: Database) -> None:
+    """The running turn keeps its claim on what was meant to interrupt it."""
+    agent = make_steered_agent(db)
+    await db.add_steering("whenever you can", urgent=False)
+    await db.add_steering("stop that now", urgent=True)
+
+    async with agent.turn_lock:
+        await deliver_steering(agent)
+
+    assert agent._queue.qsize() == 1
+    assert "whenever you can" in agent._queue.get_nowait().text
+    assert [row["text"] for row in await db.claim_steering()] == ["stop that now"]
+
+
+async def test_deliver_steering_takes_everything_between_turns(db: Database) -> None:
+    """With no turn to interrupt, an urgent instruction is just an event."""
+    agent = make_steered_agent(db)
+    await db.add_steering("stop that now", urgent=True)
+
+    await deliver_steering(agent)
+
+    assert "stop that now" in agent._queue.get_nowait().text
+    assert await db.claim_steering() == []
 
 
 async def test_deliver_wakeups_pushes_due_and_completes(db: Database) -> None:

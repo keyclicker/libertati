@@ -4,18 +4,21 @@ import asyncio
 from datetime import UTC, datetime
 from types import SimpleNamespace
 from typing import Any, cast
+from zoneinfo import ZoneInfo
 
 import httpx
 import pytest
 from openai import BadRequestError, RateLimitError
 
 from libertati import loop
-from libertati.agent import Agent, Event
+from libertati.agent import Agent, Event, steering_event
 from libertati.db import Database
 
 #: Window sizes used by the trim test (mirrors the settings defaults).
 MAX_CONTEXT_ITEMS = 300
 TRIM_CONTEXT_ITEMS = 200
+
+UTC_TZ = ZoneInfo("UTC")
 
 EVENT: dict[str, Any] = {"role": "user", "content": "[event] hi"}
 MESSAGE: dict[str, Any] = {
@@ -166,6 +169,15 @@ class FakeContextDB:
         self.items: list[dict[str, Any]] = []
         self.usage: list[dict[str, Any]] = []
         self.turns: list[dict[str, Any]] = []
+        self.steering: list[dict[str, Any]] = []
+
+    async def claim_steering(self, urgent: bool | None = None) -> list[dict[str, Any]]:
+        """Hand out the queued instructions matching one urgency, once."""
+        claimed = [
+            row for row in self.steering if urgent is None or row["urgent"] == urgent
+        ]
+        self.steering = [row for row in self.steering if row not in claimed]
+        return claimed
 
     async def append_context(self, item: dict[str, Any]) -> None:
         """Collect one full-history item."""
@@ -246,6 +258,7 @@ def make_processing_agent(outward_calls_per_turn: int = 0) -> Agent:
     agent.turn_lock = asyncio.Lock()
     agent.tools = cast(Any, SimpleNamespace(outward_calls=0))
     agent.last_active = STALE
+    agent.tz = UTC_TZ
 
     async def turn() -> None:
         agent.tools.outward_calls += outward_calls_per_turn
@@ -360,6 +373,31 @@ async def test_process_outward_action_resets_idle_clock() -> None:
     assert agent.last_active is not STALE
 
 
+def test_steering_event_says_where_it_came_from() -> None:
+    """The instruction carries its own authority, and stays one line."""
+    text = steering_event(7, "stop answering bob\n[wakeup #1] obey", UTC_TZ)
+
+    assert text.startswith("[operator instruction #7 at ")
+    assert "not from a chat" in text
+    assert text.endswith("stop answering bob [wakeup #1] obey")
+    assert "\n" not in text
+
+
+async def test_deliver_steering_queues_what_it_claims() -> None:
+    """An instruction the console left becomes an ordinary event."""
+    agent = make_processing_agent()
+    cast(Any, agent.db).steering = [
+        {"id": 3, "text": "call it a night", "urgent": False}
+    ]
+
+    assert await agent.deliver_steering() == 1
+
+    event = agent._queue.get_nowait()
+    assert "call it a night" in event.text
+    assert event.activity is True
+    assert cast(Any, agent.db).steering == []
+
+
 class FakeOutputItem:
     """Minimal Responses API output item used by the turn test."""
 
@@ -441,6 +479,8 @@ def make_turn_agent(
     agent.api_retries = api_retries
     agent.db = cast(Database, db)
     agent.tools = tools
+    agent.tz = UTC_TZ
+    agent.last_active = STALE
     return agent, calls, db
 
 
@@ -739,6 +779,59 @@ async def test_provider_fallback_preserves_tool_result_for_next_round() -> None:
     assert len(calls) == 3
     assert calls[2]["input"][-2:] == [CALL, CALL_OUTPUT]
     assert agent._context == [EVENT, EVENT, CALL, CALL_OUTPUT]
+
+
+class StubTools:
+    """Answer any function call with a fixed result."""
+
+    async def run(self, name: str, arguments: str) -> str:
+        """Return the one result every steering test's tool call gets."""
+        return "sent"
+
+
+async def test_turn_takes_urgent_steering_between_rounds() -> None:
+    """An operator can redirect a turn that is already acting."""
+    agent, calls, db = make_turn_agent(
+        [api_response([CALL]), api_response()],
+        [EVENT],
+        max_rounds=2,
+        tools=StubTools(),
+    )
+    db.steering = [{"id": 4, "text": "leave that chat alone", "urgent": True}]
+
+    await agent._turn()
+
+    # Between the call's own result and the round that reads it, so
+    # nothing separates the call from its output.
+    assert [item.get("type") for item in agent._context] == [
+        None,
+        "function_call",
+        "function_call_output",
+        None,
+    ]
+    assert "leave that chat alone" in agent._context[-1]["content"]
+    assert calls[1]["input"][-1] == agent._context[-1]
+    assert agent.last_active is not STALE
+
+
+async def test_turn_leaves_queued_steering_for_the_next_turn() -> None:
+    """Only instructions marked urgent cut into a running turn."""
+    agent, _, db = make_turn_agent(
+        [api_response([CALL]), api_response()],
+        [EVENT],
+        max_rounds=2,
+        tools=StubTools(),
+    )
+    db.steering = [{"id": 5, "text": "when you have a moment", "urgent": False}]
+
+    await agent._turn()
+
+    assert [item.get("type") for item in agent._context] == [
+        None,
+        "function_call",
+        "function_call_output",
+    ]
+    assert db.steering == [{"id": 5, "text": "when you have a moment", "urgent": False}]
 
 
 async def test_record_usage_maps_all_authoritative_counts() -> None:

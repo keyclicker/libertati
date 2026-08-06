@@ -3,9 +3,9 @@
 Handlers don't answer anything themselves — every incoming message is
 persisted, formatted as an event and pushed to the single agent loop,
 which replies (or not) through its ``send_message`` tool. Background
-loops feed the same queue with due wakeups and heartbeat status events,
-and hand the agent over to the dreaming loop when it has been idle long
-enough.
+loops feed the same queue with due wakeups, heartbeat status events and
+whatever the operator typed at the spy console, and hand the agent over
+to the dreaming loop when it has been idle long enough.
 """
 
 import asyncio
@@ -45,6 +45,11 @@ WAKEUP_POLL_SECONDS = 30
 
 #: How often the dream loop checks whether it should take over.
 DREAM_POLL_SECONDS = 60
+
+#: How often the console is checked for instructions waiting in the
+#: database. Far tighter than the other loops: an operator has just
+#: typed and is watching for the turn to start.
+STEERING_POLL_SECONDS = 2
 
 #: Max message body length quoted into an event (rest is elided).
 EVENT_TEXT_LIMIT = 1000
@@ -335,6 +340,32 @@ async def wakeup_loop(agent: Agent, db: Database, tz: ZoneInfo) -> None:
         await asyncio.sleep(WAKEUP_POLL_SECONDS)
 
 
+async def deliver_steering(agent: Agent) -> None:
+    """Queue the console's waiting instructions, one delivery pass.
+
+    Urgent ones are left where they are while a turn holds the lock:
+    that turn collects them itself between rounds, which is the whole
+    point of marking one urgent. Should the lock be taken right after it
+    was read as free, the instruction is queued instead and arrives one
+    turn later — later than asked for, but never twice and never lost.
+    """
+    await agent.deliver_steering(False if agent.turn_lock.locked() else None)
+
+
+async def steering_loop(agent: Agent) -> None:
+    """Deliver instructions typed at the operator console.
+
+    A transient failure must not take the loop down: the console would
+    then go quiet until a restart, with nothing there to say so.
+    """
+    while True:
+        try:
+            await deliver_steering(agent)
+        except Exception:
+            log.exception("steering delivery failed")
+        await asyncio.sleep(STEERING_POLL_SECONDS)
+
+
 def and_more(rendered: list[str], total: int, separator: str) -> str:
     """Join the entries that fit and count the ones left out."""
     hidden = total - len(rendered)
@@ -445,7 +476,7 @@ async def run() -> None:
     """Assemble the bot and run long polling until cancelled.
 
     Loads settings, connects the database, starts the agent worker plus
-    the wakeup, heartbeat and dream loops, and routes all incoming
+    the wakeup, heartbeat, dream and steering loops, and routes all incoming
     messages to the agent. Background tasks are cancelled and the
     database closed on the way out.
     """
@@ -471,6 +502,7 @@ async def run() -> None:
             heartbeat_loop(agent, db, tz, settings.heartbeat_minutes, registry)
         ),
         asyncio.create_task(dream_loop(dreamer)),
+        asyncio.create_task(steering_loop(agent)),
     ]
 
     dispatcher = Dispatcher(
