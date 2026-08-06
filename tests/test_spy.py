@@ -5,8 +5,9 @@ import sqlite3
 
 import pytest
 
+from libertati.render import TRUNCATE_AT
 from libertati.spy import (
-    TRUNCATE_AT,
+    Match,
     SpyApp,
     Usage,
     build_block,
@@ -161,7 +162,8 @@ def test_internal_input_message_renders_legacy_string_content() -> None:
 
     assert block is not None
     assert "INTERNAL INPUT" in block.plain
-    assert "[delivery correction] legacy" in block.plain
+    # The tag becomes the first line; the text it prefixed follows it.
+    assert block.plain.endswith("delivery correction\nlegacy")
 
 
 def test_estimate_scales_with_script_and_shape() -> None:
@@ -218,6 +220,15 @@ def test_status_shows_usage_and_prediction_together() -> None:
     assert "in 18.4k" in tokens
     assert "cached 12.8k 70%" in tokens
     assert "next ~19.1k" in tokens
+
+
+def test_status_counts_the_search_position() -> None:
+    """An active search says which of how many hits is under the cursor."""
+    counted = build_status(50, None, matches=(2, 7))
+    pending = build_status(50, None, matches=(0, 7))
+
+    assert "match 2/7" in counted.plain
+    assert "7 matches" in pending.plain
 
 
 def test_status_explains_missing_api_usage() -> None:
@@ -439,6 +450,7 @@ async def test_search_jumps_and_reports_misses() -> None:
         await pilot.pause()
         # Smartcase: an upper-case pattern is matched case-sensitively.
         assert app.note == "pattern not found"
+        assert app.matches == []
 
         await pilot.press("slash")
         await pilot.press(*"needle")
@@ -446,12 +458,105 @@ async def test_search_jumps_and_reports_misses() -> None:
         await pilot.pause()
 
         assert view.pattern is not None
-        assert app.note == ""
-        assert view.scroll_y == view.blocks[3].start
+        assert view.cursor == Match(4, 0)
+        # The only match is behind the tail, so the search wraps to it.
+        assert app.note == "search hit BOTTOM, continuing at TOP"
+        assert app.match_at == 0
+        assert app.matches == [Match(4, 0)]
+        assert view.scroll_y <= view.blocks[3].start
 
         await pilot.press("escape")
         await pilot.pause()
         assert view.pattern is None
+        assert view.cursor is None
+        assert app.matches == []
+
+    conn.close()
+
+
+@pytest.mark.asyncio
+async def test_search_reaches_matches_older_than_the_loaded_tail() -> None:
+    """A hit thousands of rows back is indexed from the database and shown."""
+    conn = make_context_db(0)
+    append_event(conn, "the needle, right at the start")
+    for index in range(300):
+        append_event(conn, f"filler {index}")
+    app = SpyApp(conn, last_id=tail_anchor(conn, 20), page_size=20)
+
+    async with app.run_test(size=(80, 10)) as pilot:
+        await pilot.pause()
+        view = app.view
+        assert view.oldest_id is not None and view.oldest_id > 1
+
+        await pilot.press("slash")
+        await pilot.press(*"needle")
+        await pilot.press("enter")
+        await pilot.pause()
+
+        assert app.matches == [Match(1, 0)]
+        # History paged in until the match was loadable, then landed on it.
+        assert view.oldest_id == 1
+        assert view.cursor == Match(1, 0)
+        assert "needle" in view.blocks[0].plain
+
+    conn.close()
+
+
+@pytest.mark.asyncio
+async def test_repeat_search_steps_through_every_occurrence() -> None:
+    """`n` and `N` walk occurrence by occurrence, not block by block."""
+    conn = make_context_db(0)
+    append_event(conn, "needle and needle again")
+    append_event(conn, "one more needle")
+    app = SpyApp(conn, last_id=0)
+
+    async with app.run_test(size=(80, 10)) as pilot:
+        await pilot.pause()
+        await pilot.press("slash")
+        await pilot.press(*"needle")
+        await pilot.press("enter")
+        await pilot.pause()
+
+        assert app.matches == [Match(1, 0), Match(1, 1), Match(2, 0)]
+        assert app.view.cursor == Match(1, 0)
+
+        await pilot.press("n")
+        await pilot.pause()
+        assert app.view.cursor == Match(1, 1)
+        assert app.match_at == 1
+
+        await pilot.press("N")
+        await pilot.pause()
+        assert app.view.cursor == Match(1, 0)
+
+        await pilot.press("N")
+        await pilot.pause()
+        assert app.view.cursor == Match(2, 0)
+        assert app.note == "search hit TOP, continuing at BOTTOM"
+
+    conn.close()
+
+
+@pytest.mark.asyncio
+async def test_rows_arriving_during_a_search_are_indexed() -> None:
+    """A match written while the pattern is active is reachable at once."""
+    conn = make_context_db(0)
+    append_event(conn, "needle one")
+    app = SpyApp(conn, last_id=0)
+
+    async with app.run_test(size=(80, 10)) as pilot:
+        await pilot.pause()
+        await pilot.press("slash")
+        await pilot.press(*"needle")
+        await pilot.press("enter")
+        await pilot.pause()
+        assert app.matches == [Match(1, 0)]
+
+        append_event(conn, "needle two")
+        app.poll()
+        await pilot.pause()
+
+        assert app.matches == [Match(1, 0), Match(2, 0)]
 
     conn.close()
 
