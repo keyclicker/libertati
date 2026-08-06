@@ -25,6 +25,8 @@ import hashlib
 import logging
 import re
 import shutil
+from collections.abc import AsyncIterator
+from contextlib import asynccontextmanager
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
@@ -403,7 +405,8 @@ class MediaLens:
         self.max_frames = max_frames
         self.note_chars = note_chars
         self.wait_seconds = wait_seconds
-        self._locks: dict[str, asyncio.Lock] = {}
+        #: Per-file lock and how many jobs are holding or awaiting it.
+        self._locks: dict[str, tuple[asyncio.Lock, int]] = {}
         self._jobs = asyncio.Semaphore(CONCURRENT_JOBS)
         # Background describe tasks are held here for their lifetime:
         # asyncio only keeps weak references, and a collected task is a
@@ -513,10 +516,30 @@ class MediaLens:
 
     # ------------------------- work --------------------------
 
+    @asynccontextmanager
+    async def _file_lock(self, file_unique_id: str) -> AsyncIterator[None]:
+        """Hold one file's lock, forgetting it once nobody wants it.
+
+        The lock is what keeps a sticker forwarded into three chats at
+        once from being described three times. Counting holders rather
+        than leaving the entry behind keeps the table the size of the
+        work in flight, not of every file the bot has ever seen.
+        """
+        lock, holders = self._locks.get(file_unique_id, (asyncio.Lock(), 0))
+        self._locks[file_unique_id] = (lock, holders + 1)
+        try:
+            async with lock:
+                yield
+        finally:
+            lock, holders = self._locks[file_unique_id]
+            if holders > 1:
+                self._locks[file_unique_id] = (lock, holders - 1)
+            else:
+                del self._locks[file_unique_id]
+
     async def _note(self, chat_id: int, message_id: int, ref: MediaRef) -> str | None:
         """Return a file's note, describing it once if nobody has yet."""
-        lock = self._locks.setdefault(ref.file_unique_id, asyncio.Lock())
-        async with lock:
+        async with self._file_lock(ref.file_unique_id):
             note = await self.db.media_note(ref.file_unique_id)
             if note is None:
                 note = await self._describe(ref)

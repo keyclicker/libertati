@@ -393,6 +393,21 @@ async def test_nothing_is_started_for_a_message_without_media(
     assert lens._tasks == set()
 
 
+async def test_a_files_lock_is_forgotten_once_nobody_holds_it(
+    db: Database, tmp_path: Path
+) -> None:
+    """The table tracks work in flight, not every file ever seen."""
+    lens = make_lens(db, tmp_path, FakeClient("a cat", delay=0.02))
+    (lens.media_dir / artifact_name("sticker-uid", ".webp")).write_bytes(b"webp")
+
+    await asyncio.gather(
+        lens.look(10, 1, {"sticker": STICKER}),
+        lens.look(10, 2, {"sticker": STICKER}),
+    )
+
+    assert lens._locks == {}
+
+
 async def test_media_without_eyes_is_never_looked_at(
     db: Database, tmp_path: Path
 ) -> None:
