@@ -36,6 +36,7 @@ dependencies; run via ``uv run libertati-spy``.
 """
 
 import argparse
+import asyncio
 import re
 import sqlite3
 from dataclasses import dataclass, field
@@ -1025,10 +1026,10 @@ class SpyApp(App[None]):
         prompt.display = True
         prompt.focus()
 
-    def on_input_submitted(self, event: Input.Submitted) -> None:
+    async def on_input_submitted(self, event: Input.Submitted) -> None:
         """Run whichever prompt was submitted."""
         if event.input.id == "steer":
-            self.submit_steering(event.value)
+            await self.submit_steering(event.value)
         else:
             self.submit_search(event.value)
 
@@ -1160,12 +1161,14 @@ class SpyApp(App[None]):
             else "instruct (ctrl+t: interrupt)"
         )
 
-    def submit_steering(self, text: str) -> None:
+    async def submit_steering(self, text: str) -> None:
         """Post the typed instruction for the bot process to deliver.
 
         Nothing here waits for the agent to read it: the event shows up
         in this very view once the bot picks it up, which is the honest
-        confirmation.
+        confirmation. The write itself goes to a thread — the bot writes
+        on every message it stores, and a busy database is worth waiting
+        out rather than freezing the viewer for the wait.
         """
         urgent = self.steer_urgent
         self.close_steering()
@@ -1177,7 +1180,9 @@ class SpyApp(App[None]):
             self.update_status()
             return
         try:
-            steering_id = post_steering(self.db_path, text, urgent)
+            steering_id = await asyncio.to_thread(
+                post_steering, self.db_path, text, urgent
+            )
         except sqlite3.Error as error:
             self.note = f"instruction failed: {error}"
         else:
