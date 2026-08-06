@@ -124,7 +124,9 @@ round, so a turn already three tool calls deep can be redirected instead
 of waited out. `ctrl+t` switches between the two while typing. The
 instruction goes into the `steering` table — the one thing the viewer
 writes — and the bot process picks it up from there within seconds; you
-see it land as an event in this same view.
+see it land as an event in this same view. A dream has no round to
+interrupt, so one posted while the agent sleeps waits for it to wake,
+and the status line says which dream it is waiting on.
 
 `d` switches to a dream's context and back. While you are at the bottom
 and have not pressed `d`, a starting dream is followed on its own and let

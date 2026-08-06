@@ -88,10 +88,16 @@ One package, `src/libertati/`, no sub-packages:
   deliverers race for a `steering` row — `bot.steering_loop` and the
   turn in flight — so `Database.claim_steering` only returns rows its
   own `UPDATE` flipped. Unlike wakeups this is at-most-once on purpose:
-  a repeated instruction is worse than one still visibly unread.
-  Urgent ones are injected only at a round boundary
-  (`Agent._inject_steering`), where every function call already has its
-  output; anywhere else would separate a call from its answer.
+  a repeated instruction is worse than one still visibly unread. Being
+  at-most-once is what makes the two rules below load-bearing: a claim
+  nobody reads is gone for good.
+- **Nothing claims an instruction it cannot deliver.** Urgent ones are
+  injected only at a round boundary (`Agent._inject_steering`), where
+  every function call already has its output; anywhere else would
+  separate a call from its answer. Never after the last round, which
+  has nothing left to read it, and never on behalf of a dream — the
+  dreaming loop takes the same turn lock but has no boundary to inject
+  at, so `bot.deliver_steering` queues them instead of parking them.
 - **An injected instruction is inside a turn, not the start of one.**
   It reads as an external event, so `Agent._active_turn_start` skips
   the ones `_injected_events` holds; counting one as a boundary would

@@ -479,14 +479,17 @@ class Agent(ModelLoop):
 
         Urgent console instructions are picked up between rounds, so an
         operator can redirect a turn that is already several tool calls
-        deep instead of waiting it out.
+        deep instead of waiting it out — but never after the last one,
+        which would claim an instruction this turn has no round left to
+        read and nothing re-delivers.
         """
         instructions = f"{self.base_prompt}\n\n{self.mind.resident()}"
         turn_id = await self.db.start_agent_turn(await self.db.latest_context_id())
         turn_status = "failed"
         corrected_private_output = False
+        self._injected_events = []
         try:
-            for _ in range(self.max_rounds):
+            for remaining in range(self.max_rounds, 0, -1):
                 if not await self._round(instructions, turn_id):
                     if self._last_output_text and not corrected_private_output:
                         corrected_private_output = True
@@ -507,7 +510,8 @@ class Agent(ModelLoop):
                         continue
                     turn_status = "completed"
                     return
-                await self._inject_steering()
+                if remaining > 1:
+                    await self._inject_steering()
             turn_status = "max_rounds"
             log.warning("agent hit max_rounds without settling")
         finally:

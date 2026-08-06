@@ -838,6 +838,23 @@ async def test_turn_leaves_queued_steering_for_the_next_turn() -> None:
     assert db.steering == [{"id": 5, "text": "when you have a moment", "urgent": False}]
 
 
+async def test_turn_leaves_urgent_steering_for_a_turn_with_a_round_left() -> None:
+    """The last round claims nothing: it has no round left to read it."""
+    agent, _, db = make_turn_agent(
+        [api_response([CALL])],
+        [EVENT],
+        max_rounds=1,
+        tools=StubTools(),
+    )
+    db.steering = [{"id": 6, "text": "stop that", "urgent": True}]
+
+    await agent._turn()
+
+    assert db.turns[-1]["status"] == "max_rounds"
+    assert db.steering == [{"id": 6, "text": "stop that", "urgent": True}]
+    assert not any("stop that" in str(item.get("content")) for item in agent._context)
+
+
 async def test_injected_steering_does_not_split_the_turn() -> None:
     """An instruction mid-turn is not the boundary the turn started at."""
     agent, _, db = make_turn_agent(

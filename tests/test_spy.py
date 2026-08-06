@@ -814,6 +814,30 @@ async def test_instruction_urgency_starts_from_the_key_and_toggles(
 
 
 @pytest.mark.asyncio
+async def test_instruction_during_a_dream_promises_no_interruption(
+    tmp_path: Path,
+) -> None:
+    """A dream has no round boundary to cut into, and the note says so."""
+    path = tmp_path / "context.db"
+    conn = make_context_db(0, path)
+    dream = start_dream(conn)
+    conn.commit()
+    app = SpyApp(conn, last_id=0, db_path=path)
+
+    async with app.run_test(size=(80, 10)) as pilot:
+        await pilot.pause()
+        await pilot.press("I")
+        await pilot.press(*"drop it")
+        await pilot.press("enter")
+        await pilot.pause()
+
+        assert conn.execute("SELECT urgent FROM steering").fetchall() == [(1,)]
+        assert app.note == f"instruction #1 queued (dream #{dream} first)"
+
+    conn.close()
+
+
+@pytest.mark.asyncio
 async def test_empty_instruction_writes_nothing(tmp_path: Path) -> None:
     """Opening the prompt and thinking better of it costs nothing."""
     path = tmp_path / "context.db"

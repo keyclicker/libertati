@@ -3,6 +3,7 @@
 import asyncio
 from collections.abc import Sequence
 from pathlib import Path
+from types import SimpleNamespace
 from typing import Any, cast
 from zoneinfo import ZoneInfo
 
@@ -29,6 +30,7 @@ from libertati.bot import (
 )
 from libertati.chats import ChatRegistry
 from libertati.db import Database
+from libertati.dream import Dreamer
 
 UTC_TZ = ZoneInfo("UTC")
 
@@ -501,6 +503,11 @@ def make_steered_agent(db: Database) -> Agent:
     return agent
 
 
+def make_dreamer(dream_id: int | None) -> Dreamer:
+    """Stand in for the dreaming loop, awake or in a dream."""
+    return cast(Dreamer, SimpleNamespace(dream_id=dream_id))
+
+
 async def test_deliver_steering_holds_urgent_back_during_a_turn(db: Database) -> None:
     """The running turn keeps its claim on what was meant to interrupt it."""
     agent = make_steered_agent(db)
@@ -508,7 +515,7 @@ async def test_deliver_steering_holds_urgent_back_during_a_turn(db: Database) ->
     await db.add_steering("stop that now", urgent=True)
 
     async with agent.turn_lock:
-        await deliver_steering(agent)
+        await deliver_steering(agent, make_dreamer(None))
 
     assert agent._queue.qsize() == 1
     assert "whenever you can" in agent._queue.get_nowait().text
@@ -520,7 +527,19 @@ async def test_deliver_steering_takes_everything_between_turns(db: Database) -> 
     agent = make_steered_agent(db)
     await db.add_steering("stop that now", urgent=True)
 
-    await deliver_steering(agent)
+    await deliver_steering(agent, make_dreamer(None))
+
+    assert "stop that now" in agent._queue.get_nowait().text
+    assert await db.claim_steering() == []
+
+
+async def test_deliver_steering_does_not_wait_out_a_dream(db: Database) -> None:
+    """A dream holds the lock but collects nothing, so nothing is left for it."""
+    agent = make_steered_agent(db)
+    await db.add_steering("stop that now", urgent=True)
+
+    async with agent.turn_lock:
+        await deliver_steering(agent, make_dreamer(7))
 
     assert "stop that now" in agent._queue.get_nowait().text
     assert await db.claim_steering() == []

@@ -16,9 +16,10 @@ the rest, and the status line counts them.
 ``i`` and ``I`` post an instruction to the agent: not a chat message but
 steering, delivered as an event that says it came from this console.
 ``i`` waits for the turn in flight to end, ``I`` interrupts it between
-rounds; ``ctrl+t`` switches between the two while typing. The instruction
-is written to the ``steering`` table — the only thing this viewer writes
-— and a loop in the bot process picks it up from there.
+rounds — except during a dream, which has no round boundary to cut into.
+``ctrl+t`` switches between the two while typing. The instruction is
+written to the ``steering`` table — the only thing this viewer writes —
+and a loop in the bot process picks it up from there.
 
 ``d`` switches to a dream's context (``dream_context``) and back; while
 nothing is pinned and the view is following, a starting dream is picked
@@ -880,6 +881,10 @@ class SpyApp(App[None]):
         # Whether the instruction being typed interrupts the turn in
         # flight; the prompt says which, and ctrl+t flips it.
         self.steer_urgent = False
+        # The dream in flight, as of the last poll: what an instruction
+        # posted now would have to wait out. Set before the first key
+        # can reach the prompt, but named here so nothing reads it unset.
+        self.running_dream: int | None = None
         # Every occurrence of the active pattern in the stored history,
         # and where in that list the cursor sits.
         self.matches: list[Match] = []
@@ -1170,9 +1175,20 @@ class SpyApp(App[None]):
         except sqlite3.Error as error:
             self.note = f"instruction failed: {error}"
         else:
-            when = "interrupting" if urgent else "queued"
-            self.note = f"instruction #{steering_id} {when}"
+            self.note = f"instruction #{steering_id} {self._steering_fate(urgent)}"
         self.update_status()
+
+    def _steering_fate(self, urgent: bool) -> str:
+        """Say what the instruction just posted is actually waiting for.
+
+        A dream holds the turn lock with no round boundary to interrupt,
+        so an urgent instruction posted during one waits it out like any
+        other. Promising an interruption that cannot happen for another
+        half hour is worse than saying nothing.
+        """
+        if self.running_dream is not None:
+            return f"queued (dream #{self.running_dream} first)"
+        return "interrupting" if urgent else "queued"
 
     def close_steering(self) -> None:
         """Hide the instruction prompt and focus the context again."""

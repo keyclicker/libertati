@@ -340,19 +340,25 @@ async def wakeup_loop(agent: Agent, db: Database, tz: ZoneInfo) -> None:
         await asyncio.sleep(WAKEUP_POLL_SECONDS)
 
 
-async def deliver_steering(agent: Agent) -> None:
+async def deliver_steering(agent: Agent, dreamer: Dreamer) -> None:
     """Queue the console's waiting instructions, one delivery pass.
 
-    Urgent ones are left where they are while a turn holds the lock:
-    that turn collects them itself between rounds, which is the whole
-    point of marking one urgent. Should the lock be taken right after it
-    was read as free, the instruction is queued instead and arrives one
-    turn later — later than asked for, but never twice and never lost.
+    Urgent ones are left where they are while a waking turn holds the
+    lock: that turn collects them itself between rounds, which is the
+    whole point of marking one urgent. Should the lock be taken right
+    after it was read as free, the instruction is queued instead and
+    arrives one turn later — later than asked for, but never twice and
+    never lost.
+
+    A dream holds the same lock and has no round boundary to collect
+    anything at, so during one there is nobody to leave them for: they
+    are queued like the rest and land in the first batch after waking.
     """
-    await agent.deliver_steering(False if agent.turn_lock.locked() else None)
+    collected = agent.turn_lock.locked() and dreamer.dream_id is None
+    await agent.deliver_steering(False if collected else None)
 
 
-async def steering_loop(agent: Agent) -> None:
+async def steering_loop(agent: Agent, dreamer: Dreamer) -> None:
     """Deliver instructions typed at the operator console.
 
     A transient failure must not take the loop down: the console would
@@ -360,7 +366,7 @@ async def steering_loop(agent: Agent) -> None:
     """
     while True:
         try:
-            await deliver_steering(agent)
+            await deliver_steering(agent, dreamer)
         except Exception:
             log.exception("steering delivery failed")
         await asyncio.sleep(STEERING_POLL_SECONDS)
@@ -502,7 +508,7 @@ async def run() -> None:
             heartbeat_loop(agent, db, tz, settings.heartbeat_minutes, registry)
         ),
         asyncio.create_task(dream_loop(dreamer)),
-        asyncio.create_task(steering_loop(agent)),
+        asyncio.create_task(steering_loop(agent, dreamer)),
     ]
 
     dispatcher = Dispatcher(
