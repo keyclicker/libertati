@@ -76,7 +76,10 @@ _TAG = re.compile(r"^\[(?P<tag>[^\]]*)\]\s*(?P<rest>.*)$", re.DOTALL)
 _STAMP_TAG = re.compile(r"^[A-Za-z]{3} \d{4}-\d{2}-\d{2} \d{2}:\d{2}$")
 _CHAT_HEAD = re.compile(r"^chat (?P<chat_id>-?\d+) \(")
 _SPEAKER_LINE = re.compile(
-    r"^(?P<who>.*?)(?: \(msg (?P<msg>\d+)\))?: (?P<text>.*)$", re.DOTALL
+    r"^(?P<who>.*?)"
+    r"(?: \((?P<ref>msg \d+(?:, replying to msg \d+)?)\))?"
+    r": (?P<text>.*)$",
+    re.DOTALL,
 )
 _HANDLE = re.compile(r"@\w+")
 _WAKEUP_TAG = re.compile(r"^wakeup #(?P<id>\d+) (?P<detail>.*)$", re.DOTALL)
@@ -279,8 +282,8 @@ def _event_body(item: dict[str, Any]) -> Text | None:
         body.append(rest[title[1] + 3 :])
         return body
     body.append_text(_handles(said.group("who")))
-    if said.group("msg"):
-        body.append(f"  msg {said.group('msg')}", style=META)
+    if said.group("ref"):
+        body.append(f"  {said.group('ref')}", style=META)
     body.append("\n")
     body.append(said.group("text"))
     return body

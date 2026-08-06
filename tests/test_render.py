@@ -66,6 +66,39 @@ def test_chat_event_splits_chat_speaker_and_text() -> None:
     assert text == "не пиши в інші вітки"
 
 
+def test_reply_event_keeps_its_whole_reference_out_of_the_name() -> None:
+    """A reply's `msg N, replying to msg M` is reference, not a name."""
+    item = event(
+        "[Thu 2026-08-06 12:34] chat 319 (private) | Nick @nick"
+        " (msg 512, replying to msg 508): and this too"
+    )
+
+    block = build_block(row(item))
+
+    assert block is not None
+    _, speaker, text = block.plain.splitlines()
+    assert speaker == "Nick @nick  msg 512, replying to msg 508"
+    assert text == "and this too"
+
+
+def test_event_context_lines_ride_along_under_the_message() -> None:
+    """The history an event carries stays readable below what it answers."""
+    item = event(
+        "[Thu 2026-08-06 12:34] chat 319 (private) | Nick @nick (msg 512): look\n"
+        "[earlier here, not shown to you yet]\n"
+        "— Thu 2026-08-06 —\n"
+        "511 12:33 Nick @nick: some chatter"
+    )
+
+    block = build_block(row(item))
+
+    assert block is not None
+    assert block.plain.endswith(
+        "look\n[earlier here, not shown to you yet]\n"
+        "— Thu 2026-08-06 —\n511 12:33 Nick @nick: some chatter"
+    )
+
+
 def test_wakeup_event_names_its_alarm() -> None:
     """A wakeup carries its number in the header and its task in the body."""
     item = event(
