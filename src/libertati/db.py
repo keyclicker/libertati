@@ -581,7 +581,11 @@ class Database:
             )
             if updated.rowcount > 0:
                 claimed.append(row)
-        await self.conn.commit()
+        # Only when an ``UPDATE`` actually ran. This is polled every few
+        # seconds on the connection everything else shares, and a commit
+        # on an empty poll would end a transaction someone else opened.
+        if pending:
+            await self.conn.commit()
         return claimed
 
     #: Forum housekeeping messages, which nobody is waiting on an answer
