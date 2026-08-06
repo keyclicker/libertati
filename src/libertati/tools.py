@@ -1344,11 +1344,9 @@ class Toolbox:
 
     async def _approved_chats(self) -> list[dict]:
         """Return stored chat rows allowed by the live registry."""
-        return [
-            chat
-            for chat in await self.db.list_chats()
-            if self.registry.check(chat["chat_id"])
-        ]
+        chats = await self.db.list_chats()
+        allowed = self.registry.approved(chat["chat_id"] for chat in chats)
+        return [chat for chat in chats if chat["chat_id"] in allowed]
 
     async def _approved_chat_ids(self) -> list[int]:
         """Return ids of stored chats allowed by the live registry."""

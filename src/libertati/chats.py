@@ -11,6 +11,7 @@ Two modes, chosen by the ``chat_approval`` setting:
 
 import logging
 import tomllib
+from collections.abc import Iterable
 from pathlib import Path
 
 log = logging.getLogger(__name__)
@@ -54,6 +55,20 @@ class ChatRegistry:
         if approvals is None:
             return False
         return approvals.get(str(chat_id)) is True
+
+    def approved(self, chat_ids: Iterable[int]) -> set[int]:
+        """Return which of the given chats are approved, in one read.
+
+        The file is deliberately re-read per :meth:`check` so edits apply
+        live; filtering a whole list that way costs one parse per entry,
+        and every caller here wants a single point-in-time answer anyway.
+        """
+        if not self.enabled:
+            return set(chat_ids)
+        approvals = self._load()
+        if approvals is None:
+            return set()
+        return {chat_id for chat_id in chat_ids if approvals.get(str(chat_id)) is True}
 
     def register(self, chat_id: int, label: str) -> bool:
         """Check approval, appending unknown chats as unapproved."""

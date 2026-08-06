@@ -55,6 +55,24 @@ def test_check_is_read_only(tmp_path: Path) -> None:
     assert not registry.path.exists()
 
 
+def test_approved_filters_a_batch_like_check(tmp_path: Path) -> None:
+    """The batch filter agrees with per-chat checks, in every mode."""
+    registry = make_registry(tmp_path)
+    for chat_id in (100, 200, 300):
+        registry.register(chat_id, "someone (private)")
+    text = registry.path.read_text(encoding="utf-8")
+    registry.path.write_text(
+        text.replace("200 = false", "200 = true"), encoding="utf-8"
+    )
+
+    assert registry.approved([100, 200, 300, 400]) == {200}
+
+    registry.path.write_text("nonsense???\n", encoding="utf-8")
+    assert registry.approved([100, 200]) == set()
+
+    assert make_registry(tmp_path, enabled=False).approved([1, 2]) == {1, 2}
+
+
 def test_broken_file_denies_and_preserves(tmp_path: Path) -> None:
     """A file that fails to parse denies all chats and is not written to."""
     registry = make_registry(tmp_path)

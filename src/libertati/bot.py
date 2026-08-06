@@ -291,9 +291,9 @@ async def heartbeat_digest(db: Database, tz: ZoneInfo, registry: ChatRegistry) -
     names are never looked up, only cost a count.
     """
     parts = []
-    unanswered = [
-        row for row in await db.unanswered_chats() if registry.check(row["chat_id"])
-    ]
+    rows = await db.unanswered_chats()
+    allowed = registry.approved(row["chat_id"] for row in rows)
+    unanswered = [row for row in rows if row["chat_id"] in allowed]
     if unanswered:
         chats = []
         for row in unanswered[:HEARTBEAT_DIGEST_LIMIT]:
