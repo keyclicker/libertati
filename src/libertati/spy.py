@@ -13,6 +13,14 @@ database, ``n``/``N`` step through those occurrences in order (paging
 history in as they go), the one under the cursor is marked apart from
 the rest, and the status line counts them.
 
+``i`` and ``I`` post an instruction to the agent: not a chat message but
+steering, delivered as an event that says it came from this console.
+``i`` waits for the turn in flight to end, ``I`` interrupts it between
+rounds — except during a dream, which has no round boundary to cut into.
+``ctrl+t`` switches between the two while typing. The instruction is
+written to the ``steering`` table — the only thing this viewer writes —
+and a loop in the bot process picks it up from there.
+
 ``d`` switches to a dream's context (``dream_context``) and back; while
 nothing is pinned and the view is following, a starting dream is picked
 up on its own and dropped again on waking. ``--dream ID`` opens a past
@@ -28,6 +36,7 @@ dependencies; run via ``uv run libertati-spy``.
 """
 
 import argparse
+import asyncio
 import re
 import sqlite3
 from dataclasses import dataclass, field
@@ -66,6 +75,17 @@ SEARCH_PAGES = 500
 
 #: Rows read at a time while indexing a pattern.
 SCAN_CHUNK = 500
+
+#: Seconds an instruction waits for the bot's writer before giving up.
+#: The bot writes on every message it stores, so a busy database is
+#: normal and worth waiting out rather than reporting as a failure.
+STEERING_TIMEOUT = 5.0
+
+#: Longest instruction the prompt accepts. Mirrors ``STEERING_TEXT_LIMIT``
+#: on the bot side, which is what actually bounds the event; stopping the
+#: keystrokes here just means a long paste is visibly refused instead of
+#: silently elided later.
+STEERING_MAX_CHARS = 1000
 
 
 @dataclass(frozen=True)
@@ -247,6 +267,25 @@ def fetch_usage(
         except sqlite3.OperationalError:
             return None
     return Usage(*row) if row else None
+
+
+def post_steering(db_path: Path, text: str, urgent: bool) -> int:
+    """Queue one operator instruction for the bot; return its row id.
+
+    The one thing this viewer writes, and it opens its own connection to
+    do it: the guarantee that watching the agent cannot disturb it is
+    worth keeping for the connection everything else goes through.
+    """
+    conn = sqlite3.connect(db_path, timeout=STEERING_TIMEOUT)
+    try:
+        cursor = conn.execute(
+            "INSERT INTO steering (text, urgent) VALUES (?, ?)",
+            (text, int(urgent)),
+        )
+        conn.commit()
+        return int(cursor.lastrowid or 0)
+    finally:
+        conn.close()
 
 
 def newest_id(conn: sqlite3.Connection, dream_id: int | None = None) -> int:
@@ -747,6 +786,24 @@ class SearchInput(Input):
         cast(SpyApp, self.app).close_search()
 
 
+class SteerInput(Input):
+    """One-line prompt for an instruction to post to the agent."""
+
+    BINDINGS: ClassVar[list[Binding]] = [
+        Binding("escape", "close", "Cancel", show=False),
+        Binding("ctrl+t", "toggle_urgent", "Urgent", show=False),
+    ]
+
+    def action_close(self) -> None:
+        """Abandon the instruction and hand focus back to the context."""
+        cast(SpyApp, self.app).close_steering()
+
+    def action_toggle_urgent(self) -> None:
+        """Switch between interrupting the running turn and awaiting it."""
+        app = cast(SpyApp, self.app)
+        app.set_steer_urgent(not app.steer_urgent)
+
+
 class SpyApp(App[None]):
     """Full-screen live view of the agent's context."""
 
@@ -765,7 +822,7 @@ class SpyApp(App[None]):
         height: 1fr;
     }
 
-    #search {
+    #search, #steer {
         dock: bottom;
         display: none;
         height: 1;
@@ -786,6 +843,8 @@ class SpyApp(App[None]):
         Binding("q", "quit", "Quit", show=False),
         Binding("f", "toggle_full", "Full bodies", show=False),
         Binding("d", "toggle_dream", "Dream context", show=False),
+        Binding("i", "steer(False)", "Instruct", show=False),
+        Binding("I", "steer(True)", "Instruct now", show=False),
         Binding("slash", "search('forward')", "Search", show=False),
         Binding("question_mark", "search('backward')", "Search back", show=False),
         Binding("n", "repeat_search(False)", "Next match", show=False),
@@ -800,10 +859,16 @@ class SpyApp(App[None]):
         page_size: int = 50,
         max_items: int = 300,
         dream_id: int | None = None,
+        db_path: Path | None = None,
     ) -> None:
-        """Create a viewer over an open read-only database connection."""
+        """Create a viewer over an open read-only database connection.
+
+        ``db_path`` is what instructions are posted through; without one
+        the viewer is read-only in every sense.
+        """
         super().__init__()
         self.conn = conn
+        self.db_path = db_path
         self.page_size = page_size
         self.max_items = max_items
         self.dream_id = dream_id
@@ -820,6 +885,13 @@ class SpyApp(App[None]):
         self.note = ""
         self.hint = ""
         self.search_backward = False
+        # Whether the instruction being typed interrupts the turn in
+        # flight; the prompt says which, and ctrl+t flips it.
+        self.steer_urgent = False
+        # The dream in flight, as of the last poll: what an instruction
+        # posted now would have to wait out. Set before the first key
+        # can reach the prompt, but named here so nothing reads it unset.
+        self.running_dream: int | None = None
         # Every occurrence of the active pattern in the stored history,
         # and where in that list the cursor sits.
         self.matches: list[Match] = []
@@ -832,9 +904,10 @@ class SpyApp(App[None]):
         return self.query_one(ContextView)
 
     def compose(self) -> ComposeResult:
-        """Create the context view, the search prompt and the status."""
+        """Create the context view, both prompts and the status."""
         yield ContextView(self.conn, self.page_size, self.dream_id, id="context")
         yield SearchInput(id="search")
+        yield SteerInput(id="steer", max_length=STEERING_MAX_CHARS)
         yield Static(id="status")
 
     def on_mount(self) -> None:
@@ -953,9 +1026,15 @@ class SpyApp(App[None]):
         prompt.display = True
         prompt.focus()
 
-    def on_input_submitted(self, event: Input.Submitted) -> None:
+    async def on_input_submitted(self, event: Input.Submitted) -> None:
+        """Run whichever prompt was submitted."""
+        if event.input.id == "steer":
+            await self.submit_steering(event.value)
+        else:
+            self.submit_search(event.value)
+
+    def submit_search(self, pattern: str) -> None:
         """Index the typed search, close the prompt and jump to a hit."""
-        pattern = event.value
         self.close_search()
         if not pattern:
             return
@@ -1059,6 +1138,75 @@ class SpyApp(App[None]):
         prompt.display = False
         self.view.focus()
 
+    # ----- Steering -----
+
+    def action_steer(self, urgent: bool) -> None:
+        """Open the prompt for an instruction to the agent."""
+        prompt = self.query_one("#steer", SteerInput)
+        prompt.value = ""
+        prompt.display = True
+        self.set_steer_urgent(urgent)
+        prompt.focus()
+
+    def set_steer_urgent(self, urgent: bool) -> None:
+        """Choose when the instruction lands, and say so in the prompt.
+
+        The two differ enough to be worth naming: one waits for whatever
+        the agent is doing, the other cuts into it at the next round.
+        """
+        self.steer_urgent = urgent
+        self.query_one("#steer", SteerInput).placeholder = (
+            "instruct now (ctrl+t: after this turn)"
+            if urgent
+            else "instruct (ctrl+t: interrupt)"
+        )
+
+    async def submit_steering(self, text: str) -> None:
+        """Post the typed instruction for the bot process to deliver.
+
+        Nothing here waits for the agent to read it: the event shows up
+        in this very view once the bot picks it up, which is the honest
+        confirmation. The write itself goes to a thread — the bot writes
+        on every message it stores, and a busy database is worth waiting
+        out rather than freezing the viewer for the wait.
+        """
+        urgent = self.steer_urgent
+        self.close_steering()
+        text = text.strip()
+        if not text:
+            return
+        if self.db_path is None:
+            self.note = "no database path: instructions unavailable"
+            self.update_status()
+            return
+        try:
+            steering_id = await asyncio.to_thread(
+                post_steering, self.db_path, text, urgent
+            )
+        except sqlite3.Error as error:
+            self.note = f"instruction failed: {error}"
+        else:
+            self.note = f"instruction #{steering_id} {self._steering_fate(urgent)}"
+        self.update_status()
+
+    def _steering_fate(self, urgent: bool) -> str:
+        """Say what the instruction just posted is actually waiting for.
+
+        A dream holds the turn lock with no round boundary to interrupt,
+        so an urgent instruction posted during one waits it out like any
+        other. Promising an interruption that cannot happen for another
+        half hour is worse than saying nothing.
+        """
+        if self.running_dream is not None:
+            return f"queued (dream #{self.running_dream} first)"
+        return "interrupting" if urgent else "queued"
+
+    def close_steering(self) -> None:
+        """Hide the instruction prompt and focus the context again."""
+        prompt = self.query_one("#steer", SteerInput)
+        prompt.display = False
+        self.view.focus()
+
 
 def load_settings() -> Settings | None:
     """Load settings, tolerating a machine without secrets configured."""
@@ -1076,7 +1224,7 @@ def main() -> None:
         epilog=(
             "keys: j/k ctrl+e/ctrl+y line, ctrl+d/ctrl+u half page, "
             "ctrl+f/ctrl+b page, g/G ends, / ? n N search, f full bodies, "
-            "d dream context, q quit"
+            "d dream context, i/I instruct the agent, q quit"
         ),
     )
     parser.add_argument(
@@ -1124,7 +1272,7 @@ def main() -> None:
         parser.error(f"no dream #{args.dream} in {db_path}")
     anchor = tail_anchor(conn, args.tail, args.dream)
     try:
-        SpyApp(conn, anchor, args.tail, max_items, args.dream).run()
+        SpyApp(conn, anchor, args.tail, max_items, args.dream, db_path).run()
     except KeyboardInterrupt:
         pass
     finally:
