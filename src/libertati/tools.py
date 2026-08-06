@@ -68,12 +68,14 @@ def strip_citation_artifacts(text: str) -> str:
 def typing_delay(text: str, chars_per_second: float) -> float:
     """How long to pretend to type a message, with human jitter.
 
-    A non-positive speed disables the emulation (returns 0).
+    A non-positive speed disables the emulation (returns 0). The cap is
+    applied after the jitter, so it really is a cap: multiplying a capped
+    value by up to 1.2 let a long message stall the turn for 9.6s.
     """
     if chars_per_second <= 0:
         return 0.0
     seconds = TYPING_MIN_SECONDS + len(text) / chars_per_second
-    return min(seconds, TYPING_MAX_SECONDS) * random.uniform(0.8, 1.2)
+    return min(seconds * random.uniform(0.8, 1.2), TYPING_MAX_SECONDS)
 
 
 # ==========================================================

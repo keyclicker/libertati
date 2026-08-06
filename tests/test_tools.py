@@ -863,10 +863,14 @@ async def test_list_chat_speakers() -> None:
 
 
 def test_typing_delay_bounds() -> None:
-    """Typing time grows with length within the min/max bounds."""
+    """Typing time grows with length, and the cap really caps it.
+
+    Jittering a capped value would let a long message stall the turn for
+    a fifth longer than the documented maximum.
+    """
     assert typing_delay("hi", 15) >= TYPING_MIN_SECONDS * 0.8
     assert typing_delay("hi", 15) <= (TYPING_MIN_SECONDS + 1) * 1.2
-    assert typing_delay("x" * 10_000, 15) <= TYPING_MAX_SECONDS * 1.2
+    assert all(typing_delay("x" * 10_000, 15) <= TYPING_MAX_SECONDS for _ in range(100))
 
 
 def test_typing_delay_disabled() -> None:
