@@ -9,10 +9,19 @@ which table each of them records what it said, so only the round itself
 lives here.
 """
 
+import asyncio
 import logging
+import random
 from typing import TYPE_CHECKING, Any, cast
 
-from openai import AsyncOpenAI, BadRequestError, Omit
+from openai import (
+    APIConnectionError,
+    AsyncOpenAI,
+    BadRequestError,
+    InternalServerError,
+    Omit,
+    RateLimitError,
+)
 from openai.types.responses import ResponseInputParam, ToolParam
 from openai.types.shared_params import Reasoning
 
@@ -36,6 +45,17 @@ STALE_CONTEXT_ERRORS = (
 #: retrying with the locally executed function tools alone.
 SERVER_TOOL_ERROR = "Server tool request failed"
 
+#: Failures that say nothing about the request itself — the endpoint was
+#: unreachable, overloaded or rate limiting. Waiting is the whole fix; a
+#: turn that gives up on one drops the event that triggered it, since
+#: nothing re-queues an event whose turn already ran.
+TRANSIENT_ERRORS = (APIConnectionError, RateLimitError, InternalServerError)
+
+#: Delay before the first retry of a transient failure; each further one
+#: doubles it, with jitter so a burst of turns does not resynchronize on
+#: the provider.
+RETRY_BACKOFF_SECONDS = 4.0
+
 
 class ModelLoop:
     """One model call plus its tool calls, and the usage bookkeeping.
@@ -58,6 +78,7 @@ class ModelLoop:
         tools: "Toolbox",
         api_tools: list[ToolParam],
         reasoning: Reasoning | Omit,
+        api_retries: int = 0,
     ) -> None:
         """Keep the API handles and start with an empty context window."""
         self.client = client
@@ -65,6 +86,7 @@ class ModelLoop:
         self.db = db
         self.tools = tools
         self.reasoning = reasoning
+        self.api_retries = api_retries
         self._api_tools = api_tools
         self._context: list[dict[str, Any]] = []
         self._last_output_text = ""
@@ -101,17 +123,33 @@ class ModelLoop:
         request_context = self._context
 
         async def create(tools: list[ToolParam], context: list[dict[str, Any]]) -> Any:
-            return await self.client.responses.create(
-                model=self.model,
-                instructions=instructions,
-                input=cast(ResponseInputParam, context),
-                tools=tools,
-                # Nothing is stored server-side; encrypted reasoning must
-                # ride along in the context for multi-round tool turns.
-                store=False,
-                include=["reasoning.encrypted_content"],
-                reasoning=self.reasoning,
-            )
+            attempt = 0
+            while True:
+                try:
+                    return await self.client.responses.create(
+                        model=self.model,
+                        instructions=instructions,
+                        input=cast(ResponseInputParam, context),
+                        tools=tools,
+                        # Nothing is stored server-side; encrypted reasoning
+                        # must ride along for multi-round tool turns.
+                        store=False,
+                        include=["reasoning.encrypted_content"],
+                        reasoning=self.reasoning,
+                    )
+                except TRANSIENT_ERRORS as exc:
+                    if attempt >= self.api_retries:
+                        raise
+                    delay = (
+                        RETRY_BACKOFF_SECONDS * 2**attempt * random.uniform(0.8, 1.2)
+                    )
+                    log.warning(
+                        "transient API failure (%s); retrying in %.1fs",
+                        type(exc).__name__,
+                        delay,
+                    )
+                    await asyncio.sleep(delay)
+                    attempt += 1
 
         request_tools = self._api_tools
         # Each fallback is worth exactly one attempt: a second rejection

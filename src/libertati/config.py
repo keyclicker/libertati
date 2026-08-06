@@ -84,6 +84,10 @@ class Settings(BaseSettings):
     recall_reasoning_effort: str | None = None
     # Model used while dreaming; None = main model.
     dream_model: str | None = None
+    # Extra attempts for a model call that failed for a transient reason
+    # (unreachable, overloaded, rate limited). The event that triggered
+    # the turn is not re-queued, so giving up early loses it.
+    api_retries: int = 3
 
     # ==========================================================
     #                      Context window

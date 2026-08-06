@@ -113,6 +113,7 @@ class Agent(ModelLoop):
             ),
             api_tools=build_tools(settings.web_search, dreaming=dreaming),
             reasoning=cast(Reasoning, reasoning) if reasoning else omit,
+            api_retries=settings.api_retries,
         )
         # Max model/tool rounds per turn (one turn per batch of events).
         self.max_rounds = settings.max_rounds

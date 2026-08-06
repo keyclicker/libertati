@@ -7,8 +7,9 @@ from typing import Any, cast
 
 import httpx
 import pytest
-from openai import BadRequestError
+from openai import BadRequestError, RateLimitError
 
+from libertati import loop
 from libertati.agent import Agent
 from libertati.db import Database
 
@@ -364,6 +365,7 @@ def make_turn_agent(
     prune: bool = False,
     reasoning: dict[str, Any] | None = None,
     tools: Any = None,
+    api_retries: int = 0,
 ) -> tuple[Agent, list[dict[str, Any]], FakeContextDB]:
     """Build a bare agent whose API client replays a scripted sequence.
 
@@ -395,6 +397,7 @@ def make_turn_agent(
     agent._api_tools = api_tools or []
     agent.reasoning = cast(Any, reasoning or {})
     agent.prune_completed_reasoning = prune
+    agent.api_retries = api_retries
     agent.db = cast(Database, db)
     agent.tools = tools
     return agent, calls, db
@@ -491,6 +494,75 @@ async def test_turn_retries_encrypted_reasoning_with_provider_neutral_context() 
     assert len(calls) == 2
     assert calls[1]["input"] == [EVENT, EVENT]
     assert agent._context == [EVENT, EVENT]
+
+
+def rate_limited() -> RateLimitError:
+    """Build the 429 a provider returns when it is overloaded."""
+    request = httpx.Request("POST", "https://api.openai.com/v1/responses")
+    return RateLimitError(
+        "slow down",
+        response=httpx.Response(429, request=request),
+        body=None,
+    )
+
+
+async def test_round_waits_out_a_transient_failure(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A provider hiccup is waited out; the event would be lost otherwise."""
+    slept: list[float] = []
+
+    async def record_sleep(delay: float) -> None:
+        """Note the wait instead of taking it."""
+        slept.append(delay)
+
+    monkeypatch.setattr(loop, "RETRY_BACKOFF_SECONDS", 4.0)
+    monkeypatch.setattr(loop.asyncio, "sleep", record_sleep)
+    agent, calls, _ = make_turn_agent(
+        [rate_limited(), rate_limited(), api_response()],
+        [EVENT],
+        api_retries=3,
+    )
+
+    await agent._turn()
+
+    assert len(calls) == 3
+    assert [round(delay / 4.0) for delay in slept] == [1, 2]
+
+
+async def test_round_gives_up_after_the_configured_retries(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Retrying forever would block every later event behind a dead endpoint."""
+
+    async def no_sleep(delay: float) -> None:
+        """Skip the backoff entirely."""
+
+    monkeypatch.setattr(loop.asyncio, "sleep", no_sleep)
+    agent, calls, _ = make_turn_agent(
+        [rate_limited(), rate_limited()],
+        [EVENT],
+        api_retries=1,
+    )
+
+    with pytest.raises(RateLimitError):
+        await agent._round("instructions", turn_id=None)
+
+    assert len(calls) == 2
+
+
+async def test_round_does_not_retry_a_rejected_request() -> None:
+    """A 400 is about the request itself; sending it again changes nothing."""
+    agent, calls, _ = make_turn_agent(
+        [bad_request("Unsupported parameter"), api_response()],
+        [EVENT],
+        api_retries=3,
+    )
+
+    with pytest.raises(BadRequestError, match="Unsupported parameter"):
+        await agent._round("instructions", turn_id=None)
+
+    assert len(calls) == 1
 
 
 async def test_turn_chains_server_tool_and_duplicate_id_fallbacks() -> None:
