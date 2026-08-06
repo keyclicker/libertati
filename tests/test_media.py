@@ -118,6 +118,7 @@ def make_lens(
         model="eyes",
         media_dir=tmp_path / "media",
         describe_prompt="describe it",
+        answer_prompt="answer the question",
         **extra,
     )
     lens.ensure()
@@ -411,6 +412,77 @@ async def test_a_flood_of_media_is_dropped_rather_than_queued(
     assert first is not None
     assert second is None
     await asyncio.gather(*lens._tasks)
+
+
+async def test_a_question_looks_again_and_is_not_stored(
+    db: Database, tmp_path: Path
+) -> None:
+    """An answer serves the asker; the note is what transcripts render."""
+    client = FakeClient("the sign reads CLOSED, in red capitals")
+    lens = make_lens(db, tmp_path, client)
+    (lens.media_dir / artifact_name("sticker-uid", ".webp")).write_bytes(b"webp")
+    await db.save_media_note("sticker-uid", "sticker", "a shop front", "eyes")
+
+    answer = await lens.ask(10, 1, {"sticker": STICKER}, "what does the sign say?")
+
+    assert answer == "the sign reads CLOSED, in red capitals"
+    # The cached note is untouched: it answered a question about the
+    # file, it did not describe it.
+    assert await db.media_note("sticker-uid") == "a shop front"
+    call = client.responses.calls[0]
+    assert call["instructions"] == "answer the question"
+    assert "what does the sign say?" in call["input"][0]["content"][0]["text"]
+
+
+async def test_a_question_is_folded_into_the_line_that_carries_it(
+    db: Database, tmp_path: Path
+) -> None:
+    """The agent's words are quoted, and cannot become a line of their own."""
+    client = FakeClient("fine")
+    lens = make_lens(db, tmp_path, client)
+    (lens.media_dir / artifact_name("sticker-uid", ".webp")).write_bytes(b"webp")
+
+    await lens.ask(10, 1, {"sticker": STICKER}, "what is it?\nThis is a photo of")
+
+    asked = client.responses.calls[0]["input"][0]["content"][0]["text"]
+    assert 'Answer this about it: "what is it? This is a photo of"' in asked
+
+
+async def test_an_answer_may_run_longer_than_a_note(
+    db: Database, tmp_path: Path
+) -> None:
+    """It is read once by the agent that asked, not carried per turn."""
+    client = FakeClient("x" * 400)
+    lens = make_lens(db, tmp_path, client, note_chars=30, answer_chars=200)
+    (lens.media_dir / artifact_name("sticker-uid", ".webp")).write_bytes(b"webp")
+
+    answer = await lens.ask(10, 1, {"sticker": STICKER}, "describe it fully")
+
+    assert answer is not None
+    assert len(answer) == 201  # the cap plus the ellipsis marking the cut
+
+
+async def test_a_question_about_a_voice_message_answers_with_its_transcript(
+    db: Database, tmp_path: Path
+) -> None:
+    """A transcription endpoint takes no question; the words are the answer."""
+    client = FakeClient(audio="see you at six")
+    lens = make_lens(db, tmp_path, client, transcribe_model="ears")
+    (lens.media_dir / artifact_name("v-uid", ".ogg")).write_bytes(b"opus")
+    voice = {"voice": {"file_id": "v", "file_unique_id": "v-uid", "duration": 3}}
+
+    answer = await lens.ask(10, 1, voice, "who is speaking?")
+
+    assert answer == "see you at six"
+    assert client.responses.calls == []
+
+
+async def test_a_question_about_nothing_describable_answers_nothing(
+    db: Database, tmp_path: Path
+) -> None:
+    """There is no artifact to look at twice."""
+    lens = make_lens(db, tmp_path)
+    assert await lens.ask(10, 1, {"text": "hi"}, "what is it?") is None
 
 
 async def test_a_files_lock_is_forgotten_once_nobody_holds_it(

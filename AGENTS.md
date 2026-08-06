@@ -199,6 +199,11 @@ it in `READ_ONLY_MESSAGING_TOOLS`.
 - `look_at_media` is not a dream tool and is hidden (schema and handler
   both) when no `media_model` is configured — `build_tools(media=…)`
   and the `MEDIA_TOOL_NAMES` subtraction in `Toolbox.__init__`.
+- `look_at_media` with a `question` takes a different path: `MediaLens.
+  ask` reuses the artifact, answers with the looser `[media].answer`
+  prompt under `media_answer_chars`, and stores nothing. Only the
+  describing path writes `media_notes`, because only it describes the
+  file rather than answering about it.
 - ffmpeg is a hard dependency of the media path only; tests never invoke
   it (they pre-create the artifact), so CI needs no ffmpeg.
 - The voice artifact is named `.ogg`, not `.opus`, and transcription

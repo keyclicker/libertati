@@ -1125,11 +1125,19 @@ class FakeLens:
         """Answer every look with ``note`` and record what was asked."""
         self.note = note
         self.calls: list[tuple[int, int]] = []
+        self.questions: list[str] = []
 
     async def look(self, chat_id: int, message_id: int, payload: dict) -> str | None:
         """Record the request and return the canned note."""
         self.calls.append((chat_id, message_id))
         return self.note
+
+    async def ask(
+        self, chat_id: int, message_id: int, payload: dict, question: str
+    ) -> str | None:
+        """Record the question and answer it in the canned way."""
+        self.questions.append(question)
+        return None if self.note is None else f"{self.note} — asked {question!r}"
 
 
 PHOTO_PAYLOAD = {
@@ -1145,11 +1153,33 @@ async def test_look_at_media_describes_a_stored_message() -> None:
     box = make_toolbox(db=fake_db, lens=cast(Any, lens))
 
     result = await box.run(
-        "look_at_media", json.dumps({"chat_id": 100, "message_id": 7})
+        "look_at_media",
+        json.dumps({"chat_id": 100, "message_id": 7, "question": None}),
     )
 
     assert result == "a cat glaring at a mug"
     assert lens.calls == [(100, 7)]
+    assert lens.questions == []
+
+
+async def test_look_at_media_takes_a_question_without_touching_the_note() -> None:
+    """A second look answers the asker; the stored line is unchanged."""
+    fake_db = FakeDB()
+    fake_db.payloads[(100, 7)] = PHOTO_PAYLOAD
+    lens = FakeLens()
+    box = make_toolbox(db=fake_db, lens=cast(Any, lens))
+
+    result = await box.run(
+        "look_at_media",
+        json.dumps(
+            {"chat_id": 100, "message_id": 7, "question": "what does the sign say?"}
+        ),
+    )
+
+    assert "asked 'what does the sign say?'" in result
+    # The describing path is what writes a note, and it never ran.
+    assert lens.calls == []
+    assert lens.questions == ["what does the sign say?"]
 
 
 async def test_look_at_media_needs_the_message_and_some_media() -> None:
@@ -1159,10 +1189,12 @@ async def test_look_at_media_needs_the_message_and_some_media() -> None:
     box = make_toolbox(db=fake_db, lens=cast(Any, FakeLens()))
 
     missing = await box.run(
-        "look_at_media", json.dumps({"chat_id": 100, "message_id": 7})
+        "look_at_media",
+        json.dumps({"chat_id": 100, "message_id": 7, "question": None}),
     )
     textual = await box.run(
-        "look_at_media", json.dumps({"chat_id": 100, "message_id": 8})
+        "look_at_media",
+        json.dumps({"chat_id": 100, "message_id": 8, "question": None}),
     )
 
     assert "was not observed" in missing
@@ -1176,7 +1208,8 @@ async def test_look_at_media_reports_a_file_it_could_not_read() -> None:
     box = make_toolbox(db=fake_db, lens=cast(Any, FakeLens(note=None)))
 
     result = await box.run(
-        "look_at_media", json.dumps({"chat_id": 100, "message_id": 7})
+        "look_at_media",
+        json.dumps({"chat_id": 100, "message_id": 7, "question": None}),
     )
 
     assert result.startswith("error:")
@@ -1186,7 +1219,8 @@ async def test_look_at_media_reports_a_file_it_could_not_read() -> None:
 async def test_look_at_media_does_not_exist_without_eyes() -> None:
     """No media model configured means the tool is not there at all."""
     result = await make_toolbox().run(
-        "look_at_media", json.dumps({"chat_id": 100, "message_id": 7})
+        "look_at_media",
+        json.dumps({"chat_id": 100, "message_id": 7, "question": None}),
     )
     assert result == "error: unknown tool 'look_at_media'"
 

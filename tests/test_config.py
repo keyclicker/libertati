@@ -72,6 +72,9 @@ def test_media_models_are_named_and_share_the_one_endpoint() -> None:
     assert settings.media_model
     assert settings.transcribe_model
     assert settings.media_dir == Path("data/media")
+    # An answer is asked for, read once and thrown away, so it may run
+    # longer than the note every transcript carries.
+    assert settings.media_answer_chars > settings.media_note_chars
     # There is no second route or key to get them wrong: whatever is
     # named here has to be a model the configured provider serves.
     assert not hasattr(settings, "media_base_url")
@@ -92,6 +95,8 @@ def test_media_frames_and_note_length_must_be_positive() -> None:
         Settings(bot_token="t", api_key="k", model="m", media_note_chars=0)
     with pytest.raises(ValidationError):
         Settings(bot_token="t", api_key="k", model="m", media_wait_seconds=-1)
+    with pytest.raises(ValidationError):
+        Settings(bot_token="t", api_key="k", model="m", media_answer_chars=0)
 
 
 def test_dream_defaults_valid() -> None:

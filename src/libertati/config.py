@@ -109,6 +109,9 @@ class Settings(BaseSettings):
     # Cap on one stored description. Notes ride along in transcripts and
     # events, so a rambling one would be paid for on every later turn.
     media_note_chars: int = 220
+    # Cap on one answer to a look_at_media question. Longer than a note:
+    # it is read once, by the agent that asked, and never stored.
+    media_answer_chars: int = 700
     # How long an event waits for the description of the media that
     # triggered it before going out without one (the work continues).
     media_wait_seconds: float = 6.0
@@ -191,6 +194,8 @@ class Settings(BaseSettings):
             raise ValueError("media_max_frames must be positive")
         if self.media_note_chars < 1:
             raise ValueError("media_note_chars must be positive")
+        if self.media_answer_chars < 1:
+            raise ValueError("media_answer_chars must be positive")
         if self.media_wait_seconds < 0:
             raise ValueError("media_wait_seconds must not be negative")
         return self

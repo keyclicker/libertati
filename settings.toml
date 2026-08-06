@@ -104,6 +104,10 @@ media_max_frames = 3
 # events, so a rambling one is paid for on every later turn.
 media_note_chars = 220
 
+# Cap on one answer to a look_at_media question. Longer than a note
+# because the agent asked for it, reads it once and it is never stored.
+media_answer_chars = 700
+
 # How long an incoming message waits for its own description before the
 # event goes out without one (the work continues in the background, so
 # later transcripts still have it).

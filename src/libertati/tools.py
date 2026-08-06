@@ -641,7 +641,11 @@ MEDIA_TOOLS: list[ToolParam] = [
             "description in words. Most media is described for you "
             "automatically and shows in transcripts as "
             "`<sticker: …>`; use this for the ones still showing as a "
-            "bare `<photo>`, `<video>` or `<voice>`."
+            "bare `<photo>`, `<video>` or `<voice>`. Pass a question to "
+            "look again for something the one-line description does not "
+            "cover — what a sign says, what breed the dog is, which "
+            "frame someone drops the cup in. Reading text off a picture "
+            "is unreliable, so treat a quoted word as approximate."
         ),
         "parameters": {
             "type": "object",
@@ -654,8 +658,16 @@ MEDIA_TOOLS: list[ToolParam] = [
                     "type": "integer",
                     "description": "Id of the message carrying the media.",
                 },
+                "question": {
+                    "type": ["string", "null"],
+                    "description": (
+                        "What to look for. Null gives the usual one-line "
+                        "description. A voice message answers with its "
+                        "transcript either way."
+                    ),
+                },
             },
-            "required": ["chat_id", "message_id"],
+            "required": ["chat_id", "message_id", "question"],
             "additionalProperties": False,
         },
         "strict": True,
@@ -1609,12 +1621,17 @@ class Toolbox:
     # ==========================================================
 
     async def _look_at_media(self, args: dict[str, Any]) -> str:
-        """Describe one stored message's media, and cache the description.
+        """Describe one stored message's media, or answer about it.
 
-        The note is stored against the file, so the same picture read
-        back later — here or in any transcript — costs nothing more.
+        Without a question the note is stored against the file, so the
+        same picture read back later — here or in any transcript — costs
+        nothing more. With one, the artifact is looked at again and the
+        answer goes only to the caller: it answers what was asked rather
+        than describing the file, and the stored note stays the line
+        every transcript renders.
         """
         chat_id, message_id = args["chat_id"], args["message_id"]
+        question = args.get("question")
         if self.lens is None:
             return "error: you have no eyes configured"
         payload = await self.db.message_payload(chat_id, message_id)
@@ -1623,10 +1640,13 @@ class Toolbox:
         ref = media_ref(payload)
         if ref is None:
             return f"error: message {message_id} in chat {chat_id} carries no media"
-        note = await self.lens.look(chat_id, message_id, payload)
-        if note is None:
+        if question:
+            answer = await self.lens.ask(chat_id, message_id, payload, question)
+        else:
+            answer = await self.lens.look(chat_id, message_id, payload)
+        if answer is None:
             return f"error: this {ref.kind} could not be described"
-        return note
+        return answer
 
     # ==========================================================
     #                          Memory

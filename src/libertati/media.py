@@ -396,9 +396,11 @@ class MediaLens:
         model: str,
         media_dir: Path,
         describe_prompt: str,
+        answer_prompt: str = "",
         transcribe_model: str | None = None,
         max_frames: int = 3,
         note_chars: int = 220,
+        answer_chars: int = 700,
         wait_seconds: float = 6.0,
     ) -> None:
         """Keep the handles and the (empty) per-file lock table."""
@@ -408,9 +410,11 @@ class MediaLens:
         self.model = model
         self.media_dir = media_dir
         self.describe_prompt = describe_prompt
+        self.answer_prompt = answer_prompt
         self.transcribe_model = transcribe_model
         self.max_frames = max_frames
         self.note_chars = note_chars
+        self.answer_chars = answer_chars
         self.wait_seconds = wait_seconds
         #: Per-file lock and how many jobs are holding or awaiting it.
         self._locks: dict[str, tuple[asyncio.Lock, int]] = {}
@@ -446,9 +450,11 @@ class MediaLens:
             model=settings.media_model,
             media_dir=settings.media_dir,
             describe_prompt=prompts.media_describe,
+            answer_prompt=prompts.media_answer,
             transcribe_model=settings.transcribe_model or None,
             max_frames=settings.media_max_frames,
             note_chars=settings.media_note_chars,
+            answer_chars=settings.media_answer_chars,
             wait_seconds=settings.media_wait_seconds,
         )
 
@@ -487,6 +493,36 @@ class MediaLens:
             return await self._note(chat_id, message_id, ref)
         except Exception:
             log.exception("describing %s in chat %s failed", ref.kind, chat_id)
+            return None
+
+    async def ask(
+        self, chat_id: int, message_id: int, payload: dict[str, Any], question: str
+    ) -> str | None:
+        """Answer one question about a message's media, uncached.
+
+        The stored note is one line an agent never chose the shape of;
+        this is the second look it can ask for — what the sign says, what
+        breed the dog is, which frame the cup falls in. The answer is not
+        written to ``media_notes``: it answers a question rather than
+        describing the file, and every later transcript would carry it.
+
+        Audio has no such second look — a transcription endpoint takes no
+        question — so a voice message answers with its transcript, which
+        is everything there is to know about it.
+        """
+        ref = media_ref(payload)
+        if ref is None:
+            return None
+        try:
+            if ref.source == "audio":
+                return await self._note(chat_id, message_id, ref)
+            async with self._file_lock(ref.file_unique_id), self._jobs:
+                artifact = await self._artifact(ref)
+                if artifact is None:
+                    return None
+                return await self._describe_image(ref, artifact, question=question)
+        except Exception:
+            log.exception("answering about %s in chat %s failed", ref.kind, chat_id)
             return None
 
     def start(
@@ -574,10 +610,13 @@ class MediaLens:
             return self.transcribe_model or ""
         return self.model
 
-    async def _describe(self, ref: MediaRef) -> str | None:
-        """Build the artifact if needed, then ask a model what it is."""
-        if ref.source == "audio" and not self.transcribe_model:
-            return None
+    async def _artifact(self, ref: MediaRef) -> Path | None:
+        """Return a file's compressed artifact, building it if needed.
+
+        One that survived an earlier look is reused as it stands, so a
+        second question about the same picture touches neither Telegram
+        nor ffmpeg.
+        """
         if ref.size > MAX_DOWNLOAD_BYTES:
             log.info(
                 "skipping %s: %d bytes is past Telegram's limit", ref.kind, ref.size
@@ -588,10 +627,17 @@ class MediaLens:
         # every provider's list where ".opus" is on few.
         suffix = ".ogg" if ref.source == "audio" else ".webp"
         artifact = self.media_dir / artifact_name(ref.file_unique_id, suffix)
+        if artifact.exists():
+            return artifact
+        return artifact if await self._build(ref, artifact) else None
+
+    async def _describe(self, ref: MediaRef) -> str | None:
+        """Build the artifact if needed, then ask a model what it is."""
+        if ref.source == "audio" and not self.transcribe_model:
+            return None
         async with self._jobs:
-            # An artifact that survived from an earlier look is described
-            # again without touching Telegram or ffmpeg.
-            if not artifact.exists() and not await self._build(ref, artifact):
+            artifact = await self._artifact(ref)
+            if artifact is None:
                 return None
             if ref.source == "audio":
                 return await self._transcribe(artifact)
@@ -627,8 +673,15 @@ class MediaLens:
             staged.unlink(missing_ok=True)
         return artifact.exists()
 
-    async def _describe_image(self, ref: MediaRef, artifact: Path) -> str | None:
-        """Ask the vision model to put one small image into words."""
+    async def _describe_image(
+        self, ref: MediaRef, artifact: Path, question: str | None = None
+    ) -> str | None:
+        """Ask the vision model to put one small image into words.
+
+        With a ``question`` the looser answering prompt is used and the
+        answer may run longer: it is read once, by the agent that asked,
+        rather than stored and carried by every later transcript.
+        """
         data = base64.b64encode(artifact.read_bytes()).decode("ascii")
         hint = ref.hint
         if ref.source == "video":
@@ -636,14 +689,22 @@ class MediaLens:
                 f" — the image is up to {self.max_frames} frames of it,"
                 " tiled left to right in time order"
             )
+        prompt = f"This is {hint}."
+        if question is not None:
+            # The question is the agent's own words, not a stranger's,
+            # but it is still quoted rather than joined to the
+            # instructions: the model is answering about the picture,
+            # not taking orders from the turn that asked.
+            asked = " ".join(question.split())
+            prompt += f'\nAnswer this about it: "{asked}"'
         response = await self.client.responses.create(
             model=self.model,
-            instructions=self.describe_prompt,
+            instructions=self.answer_prompt if question else self.describe_prompt,
             input=[
                 {
                     "role": "user",
                     "content": [
-                        {"type": "input_text", "text": f"This is {hint}."},
+                        {"type": "input_text", "text": prompt},
                         {
                             "type": "input_image",
                             "image_url": f"data:image/webp;base64,{data}",
@@ -656,7 +717,8 @@ class MediaLens:
             ],
             store=False,
         )
-        return self._clean(response.output_text)
+        cap = self.answer_chars if question else self.note_chars
+        return self._clean(response.output_text, cap)
 
     async def _transcribe(self, artifact: Path) -> str | None:
         """Send one voice/audio artifact to the speech-to-text endpoint.
@@ -674,16 +736,19 @@ class MediaLens:
         text = response if isinstance(response, str) else getattr(response, "text", "")
         return self._clean(text)
 
-    def _clean(self, text: str | None) -> str | None:
+    def _clean(self, text: str | None, cap: int | None = None) -> str | None:
         """Fold and cap a model's answer into a storable note.
 
         Notes are read back into a line-oriented transcript, so folding is
         not cosmetic: a note is stored as one line because the format has
-        no way to say where a second one would end.
+        no way to say where a second one would end. An answer to a
+        question is folded on the same rule though it is never stored —
+        one line is what the tool result should be either way.
         """
         note = " ".join((text or "").split())
         if not note:
             return None
-        if len(note) > self.note_chars:
-            note = note[: self.note_chars].rstrip() + "…"
+        limit = self.note_chars if cap is None else cap
+        if len(note) > limit:
+            note = note[:limit].rstrip() + "…"
         return note

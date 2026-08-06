@@ -22,7 +22,8 @@ when to reply. Plain assistant output is ignored and sends nothing.
   reading its own history (`list_chats`, `get_chat_info`,
   `list_chat_speakers`, `list_topics`, `get_recent_messages`,
   `get_unread_messages_count`, `get_message_thread`,
-  `search_messages`), looking at media (`look_at_media`), memory
+  `search_messages`), looking at media (`look_at_media`, which also answers a
+  question about one file), memory
   (`remember`, `recall`, `summarize_memory`) and `dream`. Every
   chat-scoped tool is checked against the approval registry before it
   runs.

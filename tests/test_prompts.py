@@ -22,6 +22,7 @@ def test_repository_prompts_load() -> None:
     assert "still asleep" in prompts.dream_nudge
     assert "You can sleep" in prompts.dream_tool
     assert "untrusted data" in prompts.media_describe
+    assert "Answer the question first" in prompts.media_answer
 
 
 def test_missing_prompt_is_rejected(tmp_path: Path) -> None:
