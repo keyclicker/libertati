@@ -56,9 +56,10 @@ when to reply. Plain assistant output is ignored and sends nothing.
   starts knowing the conversation instead of looking it up. Background
   loops deliver due wakeups, periodic heartbeat status digests, and
   hand the agent over to a dream.
-- **Storage** (`db.py`): SQLite (WAL) with full raw Telegram payloads,
-  append-only model context (waking and dreaming kept apart), and exact
-  API token/cache usage per turn or dream.
+- **Storage** (`db.py`): SQLite (WAL) through SQLAlchemy, with full raw
+  Telegram payloads, append-only model context (waking and dreaming
+  kept apart), and exact API token/cache usage per turn or dream. The
+  schema is managed by Alembic and upgraded automatically at startup.
 - **Mind** (`memory.py`): five markdown files under `data/memory/`,
   editable by hand at any time. `SOUL.md` is the personality and
   `HABITS.md` the behaviour learned from experience; both are re-read
