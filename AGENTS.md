@@ -23,8 +23,8 @@ One package, `src/libertati/`, no sub-packages:
 
 - `bot.py` — aiogram wiring, entry point `run()`: handlers persist every
   message and push events to the agent (with the chat context it has
-  not been shown); background loops for wakeups, heartbeats and dream
-  handover.
+  not been shown); background loops for wakeups, heartbeats, operator
+  instructions and dream handover.
 - `agent.py` — `Agent(ModelLoop)`: the single waking loop; event queue,
   turn lock, context-window trimming/restore invariants.
 - `loop.py` — `ModelLoop`: one Responses-API round (model call + tool
@@ -33,7 +33,7 @@ One package, `src/libertati/`, no sub-packages:
   reflection session; budget, cooldown and idle triggers.
 - `tools.py` — every function-tool schema and its handler (`Toolbox`).
 - `db.py` — aiosqlite persistence: messages/chats/users, append-only
-  agent context, turns, usage, dreams, wakeups.
+  agent context, turns, usage, dreams, wakeups, console instructions.
 - `memory.py` — `Mind`: the five markdown mind files under
   `data/memory/`.
 - `config.py` — pydantic-settings `Settings` (env > .env >
@@ -44,8 +44,10 @@ One package, `src/libertati/`, no sub-packages:
 - `clock.py` — the only place timestamp formats live.
 - `transcript.py` — the only place stored messages are rendered for the
   model (history tools and the context events carry).
-- `spy.py` — standalone read-only TUI; must not import aiogram/openai
-  at module level (keeps `libertati-spy` startup fast).
+- `spy.py` — standalone TUI over the live database; must not import
+  aiogram/openai at module level (keeps `libertati-spy` startup fast).
+  Reads through a `mode=ro` connection and writes exactly one thing —
+  an operator instruction, through a connection of its own.
 - `render.py` — how the spy lays out one context item: a layout per
   kind, each falling back to the generic body, plus `searchable()`,
   the text a spy search matches against. Pure functions over decoded
@@ -82,6 +84,25 @@ One package, `src/libertati/`, no sub-packages:
 - **Timestamps**: UTC in the DB (`clock.utc_stamp`, matches SQLite's
   `datetime('now')`), the configured timezone for anything the model
   sees (`clock.format_local`).
+- **Console instructions are claimed, not just marked done.** Two
+  deliverers race for a `steering` row — `bot.steering_loop` and the
+  turn in flight — so `Database.claim_steering` only returns rows its
+  own `UPDATE` flipped. Unlike wakeups this is at-most-once on purpose:
+  a repeated instruction is worse than one still visibly unread. Being
+  at-most-once is what makes the two rules below load-bearing: a claim
+  nobody reads is gone for good.
+- **Nothing claims an instruction it cannot deliver.** Urgent ones are
+  injected only at a round boundary (`Agent._inject_steering`), where
+  every function call already has its output; anywhere else would
+  separate a call from its answer. Never after the last round, which
+  has nothing left to read it, and never on behalf of a dream — the
+  dreaming loop takes the same turn lock but has no boundary to inject
+  at, so `bot.deliver_steering` queues them instead of parking them.
+- **An injected instruction is inside a turn, not the start of one.**
+  It reads as an external event, so `Agent._active_turn_start` skips
+  the ones `_injected_events` holds; counting one as a boundary would
+  halve the turn, leaving its earlier rounds unpruned by `_finish_turn`
+  and outside what `_provider_fallback_context` keeps whole.
 - **Idle clock**: `Agent.last_active` moves only on activity events or
   outward tool calls — heartbeat-only turns must not reset it, or idle
   dreams become unreachable.
@@ -141,9 +162,17 @@ it in `READ_ONLY_MESSAGING_TOOLS`.
   `Database.connect`.
 - Same-second message bursts are real: any query ordering by `date`
   needs `message_id` as a tiebreaker.
-- The three background loops in `bot.py` must survive transient
+- The four background loops in `bot.py` must survive transient
   errors — log and continue, never let the loop die.
 - Spy search matches `render.searchable()` — the headline plus the
   rendered body — so a layout that moves text between the two changes
   what is findable. Highlight numbering follows the same order
   (headline first), and `spy.Match.index` is an index into it.
+- `render.py` reads the transcript format `transcript.py` writes, to
+  mark up history results line by line; it adds styles only, never
+  characters, so search keeps matching what the model was shown.
+  Changing the transcript line shape means changing both.
+- Not every `api_usage` row measures the context window: a memory
+  extraction (`recall`, `summarize_memory`) books itself against the
+  turn with `input_context_id = 0`, and lands after the round it served.
+  Anything reading "the latest usage" must skip those.

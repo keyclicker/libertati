@@ -2,13 +2,16 @@
 
 import json
 import sqlite3
+from pathlib import Path
 
 import pytest
 
 from libertati.render import TRUNCATE_AT
 from libertati.spy import (
+    STEERING_MAX_CHARS,
     Match,
     SpyApp,
+    SteerInput,
     Usage,
     build_block,
     build_status,
@@ -23,9 +26,13 @@ from libertati.spy import (
 )
 
 
-def make_context_db(rows: int = 30) -> sqlite3.Connection:
-    """Create an in-memory context database with enough rows to scroll."""
-    conn = sqlite3.connect(":memory:")
+def make_context_db(rows: int = 30, path: Path | None = None) -> sqlite3.Connection:
+    """Create a context database with enough rows to scroll.
+
+    In memory unless ``path`` is given; a file is what the tests that
+    post instructions need, since those open a connection of their own.
+    """
+    conn = sqlite3.connect(path or ":memory:")
     conn.execute(
         """CREATE TABLE context (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -60,10 +67,21 @@ def make_context_db(rows: int = 30) -> sqlite3.Connection:
             item TEXT NOT NULL
         )"""
     )
+    conn.execute(
+        """CREATE TABLE steering (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            text TEXT NOT NULL,
+            urgent INTEGER NOT NULL DEFAULT 0,
+            done INTEGER NOT NULL DEFAULT 0
+        )"""
+    )
     conn.executemany(
         "INSERT INTO context (item) VALUES (?)",
         [(json.dumps({"role": "user", "content": f"event {i}"}),) for i in range(rows)],
     )
+    # A file database keeps a write lock until this lands, and the
+    # instruction prompt writes through a second connection.
+    conn.commit()
     return conn
 
 
@@ -275,6 +293,23 @@ def test_waking_usage_ignores_dreaming_rows() -> None:
     assert fetch_usage(conn) == Usage(18400, 9200, 100, 1200, 900, 1)
     assert fetch_usage(conn, 1) == Usage(90000, 45000, 100, 1200, 900, 4)
     assert fetch_usage(conn, 2) is None
+    conn.close()
+
+
+def test_usage_ignores_calls_that_never_read_the_context() -> None:
+    """A memory extraction booked after a round does not hide the round.
+
+    `recall` bills its own call to the same turn with no context id, and
+    it lands last — so the newest row is not the one that measured the
+    window the viewer is showing.
+    """
+    conn = make_context_db(0)
+    append_usage(conn, 18400, context_id=1)
+    append_usage(conn, 900, context_id=0)
+
+    usage = fetch_usage(conn)
+
+    assert usage == Usage(18400, 9200, 100, 1200, 900, 1)
     conn.close()
 
 
@@ -726,5 +761,157 @@ async def test_opening_a_dream_directly_pins_the_view() -> None:
         await pilot.pause()
         # A dream running right now must not steal a pinned view.
         assert app.dream_id == dream
+
+    conn.close()
+
+
+@pytest.mark.asyncio
+async def test_instruction_prompt_posts_to_the_database(tmp_path: Path) -> None:
+    """`i` writes what was typed where the bot process picks it up."""
+    path = tmp_path / "context.db"
+    conn = make_context_db(0, path)
+    app = SpyApp(conn, last_id=0, db_path=path)
+
+    async with app.run_test(size=(80, 10)) as pilot:
+        await pilot.pause()
+        await pilot.press("i")
+        await pilot.press(*"stop replying to bob")
+        await pilot.press("enter")
+        await pilot.pause()
+
+        assert conn.execute("SELECT text, urgent, done FROM steering").fetchall() == [
+            ("stop replying to bob", 0, 0)
+        ]
+        assert app.note == "instruction #1 queued"
+
+    conn.close()
+
+
+@pytest.mark.asyncio
+async def test_instruction_urgency_starts_from_the_key_and_toggles(
+    tmp_path: Path,
+) -> None:
+    """`I` interrupts the running turn; ctrl+t changes its mind."""
+    path = tmp_path / "context.db"
+    conn = make_context_db(0, path)
+    app = SpyApp(conn, last_id=0, db_path=path)
+
+    async with app.run_test(size=(80, 10)) as pilot:
+        await pilot.pause()
+        await pilot.press("I")
+        assert app.steer_urgent is True
+        await pilot.press("ctrl+t")
+        assert app.steer_urgent is False
+        await pilot.press("ctrl+t")
+        await pilot.press(*"drop it")
+        await pilot.press("enter")
+        await pilot.pause()
+
+        assert conn.execute("SELECT text, urgent FROM steering").fetchall() == [
+            ("drop it", 1)
+        ]
+        assert app.note == "instruction #1 interrupting"
+
+    conn.close()
+
+
+@pytest.mark.asyncio
+async def test_instruction_during_a_dream_promises_no_interruption(
+    tmp_path: Path,
+) -> None:
+    """A dream has no round boundary to cut into, and the note says so."""
+    path = tmp_path / "context.db"
+    conn = make_context_db(0, path)
+    dream = start_dream(conn)
+    conn.commit()
+    app = SpyApp(conn, last_id=0, db_path=path)
+
+    async with app.run_test(size=(80, 10)) as pilot:
+        await pilot.pause()
+        await pilot.press("I")
+        await pilot.press(*"drop it")
+        await pilot.press("enter")
+        await pilot.pause()
+
+        assert conn.execute("SELECT urgent FROM steering").fetchall() == [(1,)]
+        assert app.note == f"instruction #1 queued (dream #{dream} first)"
+
+    conn.close()
+
+
+@pytest.mark.asyncio
+async def test_instruction_prompt_caps_what_can_be_typed(tmp_path: Path) -> None:
+    """Keystrokes past the cap are refused rather than elided later."""
+    path = tmp_path / "context.db"
+    conn = make_context_db(0, path)
+    app = SpyApp(conn, last_id=0, db_path=path)
+
+    async with app.run_test(size=(80, 10)) as pilot:
+        await pilot.pause()
+        await pilot.press("i")
+        assert app.query_one("#steer", SteerInput).max_length == STEERING_MAX_CHARS
+
+    conn.close()
+
+
+@pytest.mark.asyncio
+async def test_empty_instruction_writes_nothing(tmp_path: Path) -> None:
+    """Opening the prompt and thinking better of it costs nothing."""
+    path = tmp_path / "context.db"
+    conn = make_context_db(0, path)
+    app = SpyApp(conn, last_id=0, db_path=path)
+
+    async with app.run_test(size=(80, 10)) as pilot:
+        await pilot.pause()
+        await pilot.press("i")
+        await pilot.press("space", "enter")
+        await pilot.press("i")
+        await pilot.press("escape")
+        await pilot.pause()
+
+        assert conn.execute("SELECT COUNT(*) FROM steering").fetchone() == (0,)
+        assert app.note == ""
+
+    conn.close()
+
+
+@pytest.mark.asyncio
+async def test_instruction_without_a_database_path_says_so() -> None:
+    """A viewer opened on a connection alone cannot post; it admits it."""
+    conn = make_context_db(0)
+    app = SpyApp(conn, last_id=0)
+
+    async with app.run_test(size=(80, 10)) as pilot:
+        await pilot.pause()
+        await pilot.press("i")
+        await pilot.press(*"hello")
+        await pilot.press("enter")
+        await pilot.pause()
+
+        assert app.note == "no database path: instructions unavailable"
+
+    conn.close()
+
+
+@pytest.mark.asyncio
+async def test_instruction_reports_a_database_that_refuses_it(
+    tmp_path: Path,
+) -> None:
+    """A database without the table (an old bot) fails visibly, not silently."""
+    path = tmp_path / "context.db"
+    conn = make_context_db(0, path)
+    conn.execute("DROP TABLE steering")
+    conn.commit()
+    app = SpyApp(conn, last_id=0, db_path=path)
+
+    async with app.run_test(size=(80, 10)) as pilot:
+        await pilot.pause()
+        await pilot.press("i")
+        await pilot.press(*"hello")
+        await pilot.press("enter")
+        await pilot.pause()
+
+        assert app.note.startswith("instruction failed:")
+        assert app.is_running
 
     conn.close()

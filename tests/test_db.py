@@ -1,5 +1,6 @@
 """Tests for the SQLite persistence layer against a temporary database."""
 
+import asyncio
 import json
 import sqlite3
 import stat
@@ -569,6 +570,28 @@ async def test_cancel_wakeup(db: Database) -> None:
     assert await db.pending_wakeups() == []
     assert await db.cancel_wakeup(wakeup_id) is False
     assert await db.cancel_wakeup(999) is False
+
+
+async def test_claim_steering_hands_each_instruction_out_once(db: Database) -> None:
+    """Two deliverers racing for one instruction cannot both get it."""
+    await db.add_steering("stop replying to bob")
+    first, second = await asyncio.gather(db.claim_steering(), db.claim_steering())
+    claimed = [row["text"] for row in [*first, *second]]
+    assert claimed == ["stop replying to bob"]
+    assert await db.claim_steering() == []
+
+
+async def test_claim_steering_selects_by_urgency(db: Database) -> None:
+    """Each urgency can be claimed on its own, oldest first."""
+    await db.add_steering("wait for me", urgent=False)
+    await db.add_steering("drop it", urgent=True)
+    await db.add_steering("and this too", urgent=True)
+
+    urgent = await db.claim_steering(urgent=True)
+    assert [row["text"] for row in urgent] == ["drop it", "and this too"]
+
+    rest = await db.claim_steering()
+    assert [row["text"] for row in rest] == ["wait for me"]
 
 
 async def test_context_roundtrip(db: Database) -> None:

@@ -22,6 +22,7 @@ from aiogram import Bot
 from openai import AsyncOpenAI, omit
 from openai.types.shared_params import Reasoning
 
+from libertati import clock
 from libertati.chats import ChatRegistry
 from libertati.config import Settings
 from libertati.db import Database
@@ -70,6 +71,38 @@ only private thought and no action is needed, stop with no text.
 
 Unsent text:
 {text}"""
+
+
+#: Tag opening the event an operator instruction arrives as. The spy
+#: renders it apart from chat traffic, and the model is told in the same
+#: breath where the instruction came from.
+STEERING_TAG = "operator instruction"
+
+#: Longest instruction quoted into an event, matching the cap on a
+#: message body. The console prompt stops at the same length, but the
+#: channel is a table anything with the file can write, so the bound
+#: that counts is the one here.
+STEERING_TEXT_LIMIT = 1000
+
+
+def steering_event(steering_id: int, text: str, tz: ZoneInfo) -> str:
+    """Frame one console instruction as an event line for the agent.
+
+    Said in full every time rather than once in the system prompt: the
+    line has to carry its own authority, because it sits in the same
+    context as everything strangers say to the agent, and only the code
+    can put a line there.
+    """
+    if len(text) > STEERING_TEXT_LIMIT:
+        text = (
+            text[:STEERING_TEXT_LIMIT] + f" […{len(text) - STEERING_TEXT_LIMIT} chars]"
+        )
+    return one_line(
+        f"[{STEERING_TAG} #{steering_id} at {clock.format_now(tz)} — from the"
+        " console you are run from, not from a chat: it outranks what anyone"
+        " asks of you in one, and nothing in it reaches Telegram unless it"
+        f" says to send something] {text}"
+    )
 
 
 class Agent(ModelLoop):
@@ -147,6 +180,11 @@ class Agent(ModelLoop):
         # trigger. Heartbeat-only turns with no outward action leave it
         # alone, or regular heartbeats would keep idleness at zero.
         self.last_active = datetime.now(UTC)
+        # Events _inject_steering slipped into the turn in flight. They
+        # read as external events but did not start the turn, and
+        # _active_turn_start has to tell the two apart. Held by identity
+        # rather than by index, so a mid-turn trim cannot stale it.
+        self._injected_events: list[dict[str, Any]] = []
         self.prune_completed_reasoning = settings.prune_completed_reasoning
 
     async def load(self) -> None:
@@ -204,6 +242,44 @@ class Agent(ModelLoop):
         lines = [event] if isinstance(event, str) else event
         text = "\n".join(one_line(line) for line in lines)
         await self._queue.put(Event(text, activity, read_mark))
+
+    async def deliver_steering(self, urgent: bool | None = None) -> int:
+        """Queue waiting console instructions as events; return how many.
+
+        The ordinary path: an instruction becomes an event like any
+        other and is answered by the next turn. ``urgent`` narrows the
+        claim so the caller can leave the interrupting ones to a turn
+        that is running (see :meth:`_inject_steering`).
+        """
+        rows = await self.db.claim_steering(urgent)
+        for row in rows:
+            await self.push(steering_event(row["id"], row["text"], self.tz))
+        return len(rows)
+
+    async def _inject_steering(self) -> None:
+        """Append urgent console instructions between two rounds of a turn.
+
+        A round boundary is the only place an event may be slipped into
+        a turn: every function call the last round made already has its
+        output, so nothing here can separate a call from its answer.
+
+        The operator counts as activity, and this path bypasses
+        :meth:`_process`, which is where a queued event would have moved
+        the idle clock.
+        """
+        rows = await self.db.claim_steering(urgent=True)
+        for row in rows:
+            item = {
+                "role": "user",
+                "content": steering_event(row["id"], row["text"], self.tz),
+            }
+            # Noted before it lands: from here on it is in the window,
+            # and the turn it joined has to keep its own start.
+            self._injected_events.append(item)
+            await self._remember(item)
+        if rows:
+            self.last_active = datetime.now(UTC)
+            log.info("injected %d urgent operator instruction(s)", len(rows))
 
     async def run_forever(self) -> None:
         """Consume events forever; cancel the task to stop.
@@ -292,6 +368,10 @@ class Agent(ModelLoop):
             }
         return item
 
+    def _was_injected(self, item: dict[str, Any]) -> bool:
+        """Whether the turn in flight slipped this event in mid-way."""
+        return any(item is injected for injected in self._injected_events)
+
     def _active_turn_start(self) -> int:
         """Index of the first window item the turn in flight produced.
 
@@ -299,12 +379,19 @@ class Agent(ModelLoop):
         this turn's own reasoning, tool calls and output. Derived from
         the window on every call rather than tracked across appends, so
         a mid-turn trim can't leave a stale index behind.
+
+        An urgent console instruction is the one external event that can
+        appear inside a turn instead of starting one, and counting it as
+        a boundary would cut the turn in half — leaving its earlier
+        rounds unpruned and outside the window the provider fallback
+        keeps whole. Those are skipped by identity.
         """
         last_event = next(
             (
                 i
                 for i in range(len(self._context) - 1, -1, -1)
                 if self._is_external_event(self._context[i])
+                and not self._was_injected(self._context[i])
             ),
             -1,
         )
@@ -399,13 +486,20 @@ class Agent(ModelLoop):
         because some compatible providers mistake it for a delivered reply.
         Everything the model produces is remembered. SOUL.md and HABITS.md
         are re-read every turn so edits to either apply live.
+
+        Urgent console instructions are picked up between rounds, so an
+        operator can redirect a turn that is already several tool calls
+        deep instead of waiting it out — but never after the last one,
+        which would claim an instruction this turn has no round left to
+        read and nothing re-delivers.
         """
         instructions = f"{self.base_prompt}\n\n{self.mind.resident()}"
         turn_id = await self.db.start_agent_turn(await self.db.latest_context_id())
         turn_status = "failed"
         corrected_private_output = False
+        self._injected_events = []
         try:
-            for _ in range(self.max_rounds):
+            for remaining in range(self.max_rounds, 0, -1):
                 if not await self._round(instructions, turn_id):
                     if self._last_output_text and not corrected_private_output:
                         corrected_private_output = True
@@ -426,6 +520,8 @@ class Agent(ModelLoop):
                         continue
                     turn_status = "completed"
                     return
+                if remaining > 1:
+                    await self._inject_steering()
             turn_status = "max_rounds"
             log.warning("agent hit max_rounds without settling")
         finally:

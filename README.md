@@ -103,7 +103,8 @@ does not fit its shape falls back to the plain body. Navigation is
 vim-like: `j`/`k` and `ctrl+e`/`ctrl+y` by line, `ctrl+d`/`ctrl+u` by
 half a screen, `ctrl+f`/`ctrl+b` by screen, `g`/`G` for the ends,
 `/`, `?`, `n`, `N` to search (smartcase, highlighted), `f` to un-truncate
-long bodies, `q` to quit. Older history pages in as you scroll up.
+long bodies, `i`/`I` to instruct the agent, `q` to quit. Older history
+pages in as you scroll up.
 
 Search covers the whole stored context, not the part currently on
 screen: the pattern is indexed occurrence by occurrence out of the
@@ -113,6 +114,19 @@ underlined apart from the other highlights, and the status line counts
 your position (`match 4/109`). A body long enough to be truncated is
 shown in full when the pattern matched inside it, and a wrap around the
 ends says so the way vim does.
+
+`i` posts an instruction to the agent — steering rather than a chat
+message: it arrives as an event that says it came from the console you
+run it from and outranks what anyone asks in a chat, and it is never
+answered on Telegram unless it says to send something. `i` waits for
+whatever the agent is doing to finish; `I` interrupts it at the next
+round, so a turn already three tool calls deep can be redirected instead
+of waited out. `ctrl+t` switches between the two while typing. The
+instruction goes into the `steering` table — the one thing the viewer
+writes — and the bot process picks it up from there within seconds; you
+see it land as an event in this same view. A dream has no round to
+interrupt, so one posted while the agent sleeps waits for it to wake,
+and the status line says which dream it is waiting on.
 
 `d` switches to a dream's context and back. While you are at the bottom
 and have not pressed `d`, a starting dream is followed on its own and let
