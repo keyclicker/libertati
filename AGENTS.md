@@ -108,8 +108,9 @@ from `DREAM_API_TOOLS`, and execution is gated by `DREAM_TOOL_NAMES`.
 ## Gotchas
 
 - `Agent.__new__(Agent)` in tests skips `__init__`; when `_process`,
-  `_turn` or `_remember` grow new attribute reads, update the test
-  fixtures that hand-build agents (`test_agent.py`, `test_dream.py`).
+  `_turn` or `_remember` grow new attribute reads, update the fixtures
+  that hand-build agents — `make_turn_agent` / `make_processing_agent`
+  in `test_agent.py`, and `test_dream.py`.
 - Telegram messages are sent with legacy Markdown and fall back to
   plain text when parsing fails (`_markdown_send`); `@username`
   underscores are pre-escaped.
