@@ -124,7 +124,6 @@ def test_provider_fallback_keeps_active_turn_suffix() -> None:
     current_call = {**CALL, "call_id": "current"}
     current_output = {**CALL_OUTPUT, "call_id": "current"}
     agent._context = [EVENT, old_call, old_output, EVENT, current_call, current_output]
-    agent._active_turn_start = 3
 
     assert agent._provider_fallback_context() == [
         EVENT,
@@ -215,20 +214,20 @@ async def test_remember_trims_in_chunks() -> None:
     assert agent._context[0] is head
 
 
-async def test_remember_updates_active_turn_boundary_after_trim() -> None:
-    """Chunk trimming keeps active-turn boundary attached to its first event."""
+async def test_active_turn_boundary_survives_a_mid_turn_trim() -> None:
+    """The turn boundary is derived, so a trim cannot leave it stale."""
     agent = Agent.__new__(Agent)
     agent.db = cast(Database, FakeContextDB())
     agent.max_context_items = MAX_CONTEXT_ITEMS
     agent.trim_context_items = TRIM_CONTEXT_ITEMS
     agent._context = [dict(EVENT) for _ in range(MAX_CONTEXT_ITEMS)]
-    agent._active_turn_start = len(agent._context)
     active_event = {"role": "user", "content": "[event] current"}
 
     await agent._remember(active_event)
+    await agent._remember(dict(CALL))
 
-    assert agent._context[-1] is active_event
-    assert agent._active_turn_start == len(agent._context) - 1
+    assert agent._context[-2] is active_event
+    assert agent._active_turn_start() == len(agent._context) - 1
 
 
 STALE = datetime(2020, 1, 1, tzinfo=UTC)
