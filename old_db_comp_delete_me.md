@@ -33,6 +33,16 @@ anything older, delete the file and let the bot recreate it.
 4. **`idx_messages_chat_thread` created outside `SCHEMA`** (it named a
    column the old migration added, so `SCHEMA` could not carry it). It
    lives in the initial revision now.
-5. **Deleted tests** that pinned the above:
+5. **Spy fallback for pre-dream usage tables**: `fetch_usage` retried
+   without the `dream_id` column when the query failed with
+   `OperationalError` on a database written before dreams existed. The
+   spy now assumes the current schema.
+6. **Spy `OperationalError` guards** in `newest_id`, `latest_dream` and
+   `latest_recorded_dream`, which turned a missing `dreams` /
+   `dream_context` table into an empty view instead of a crash. Same
+   assumption now: the schema is current or the viewer fails loudly.
+7. **Deleted tests** that pinned the above:
    `test_usage_schema_migrates_existing_table`,
-   `test_messages_schema_migrates_and_backfills`.
+   `test_messages_schema_migrates_and_backfills`,
+   `test_usage_survives_a_database_without_the_dream_column`,
+   `test_dream_lookups_tolerate_a_database_without_dreams`.
