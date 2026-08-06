@@ -39,9 +39,6 @@ class Settings(BaseSettings):
 
     bot_token: str
     api_key: str
-    # Key for the media endpoint when it is a different provider;
-    # None reuses api_key.
-    media_api_key: str | None = None
 
     # ==========================================================
     #                         Runtime
@@ -101,10 +98,9 @@ class Settings(BaseSettings):
     # ==========================================================
 
     # Vision model describing pictures, stickers and video frames in a
-    # sentence or two; None leaves media undescribed (``<photo>``).
+    # sentence or two, on the same endpoint as everything else; None
+    # leaves media undescribed (``<photo>``).
     media_model: str | None = None
-    # Endpoint for the media models; None reuses base_url.
-    media_base_url: str | None = None
     # Speech-to-text model for voice messages; None leaves them
     # undescribed. Needs a provider with a transcription endpoint.
     transcribe_model: str | None = None

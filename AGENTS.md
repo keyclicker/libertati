@@ -37,7 +37,9 @@ One package, `src/libertati/`, no sub-packages:
 - `media.py` — `MediaLens`: turns a message's picture/sticker/gif/video
   into one cached text note (frames tiled into a single image), voice
   into a transcript; `media_ref` resolves what a raw payload carries.
-  Off unless `media_model` is set; needs ffmpeg on PATH.
+  Off unless `media_model` is set; runs on `base_url` with the one
+  `api_key`, so a model named there must be one that provider serves.
+  Needs ffmpeg on PATH.
 - `memory.py` — `Mind`: the five markdown mind files under
   `data/memory/`.
 - `config.py` — pydantic-settings `Settings` (env > .env >
@@ -199,9 +201,10 @@ it in `READ_ONLY_MESSAGING_TOOLS`.
   and the `MEDIA_TOOL_NAMES` subtraction in `Toolbox.__init__`.
 - ffmpeg is a hard dependency of the media path only; tests never invoke
   it (they pre-create the artifact), so CI needs no ffmpeg.
-- The voice artifact is named `.ogg`, not `.opus`: a transcription
-  endpoint reads the format off the filename, and `.opus` is on few
-  providers' lists.
+- The voice artifact is named `.ogg`, not `.opus`, and transcription
+  asks for `response_format="json"`, not `"text"`: an endpoint reads the
+  format off the filename, and OpenRouter rejects `text` outright. Both
+  were found by running real files through the lens, not by tests.
 - `Database.message_thread` spells its columns out instead of reusing
   `_MESSAGE_ROW` (a recursive CTE gets in the way), so a column added to
   one has to be added to the other — a transcript rendered from rows

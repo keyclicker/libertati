@@ -86,18 +86,15 @@ api_retries = 3
 # model in a sentence or two, once per file, and transcripts then read
 # "<sticker: a cat knocking a mug off a table>" instead of "<sticker>".
 # Empty leaves media undescribed. Videos and gifs are handled as a few
-# frames tiled into one image, so a plain vision model is enough.
-# Needs ffmpeg on PATH.
-media_model = ""
+# frames tiled into one image, so a plain vision model is enough. Runs
+# on base_url with the same key as everything else. Needs ffmpeg on
+# PATH.
+media_model = "openai/gpt-5.6-luna"
 
-# Endpoint for the media models; empty reuses base_url. A different
-# provider also needs LIBERTATI_MEDIA_API_KEY in .env.
-media_base_url = ""
-
-# Speech-to-text model transcribing voice messages (e.g. "whisper-1");
-# empty leaves them undescribed. Needs an endpoint with a transcription
-# API — not every OpenAI-compatible one has it.
-transcribe_model = ""
+# Speech-to-text model transcribing voice messages; empty leaves them
+# undescribed. Needs an endpoint with a transcription API — not every
+# OpenAI-compatible one has it.
+transcribe_model = "openai/gpt-transcribe"
 
 # Frames sampled from a gif or video and tiled into the one image the
 # vision model sees.

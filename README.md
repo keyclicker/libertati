@@ -34,12 +34,13 @@ when to reply. Plain assistant output is ignored and sends nothing.
   image, so a plain vision model is enough — no native video input.
   Voice messages go to a speech-to-text model instead. Descriptions are
   keyed by Telegram's `file_unique_id`, so the sticker a group spams all
-  day is paid for once; only compressed derivatives are kept on disk
+  day is paid for once; the describer runs on the same endpoint and key
+  as the agent itself; only compressed derivatives are kept on disk
   (one small webp per picture or frame strip, one low-bitrate opus per
   voice message). Media that arrives while nobody is addressing the bot
   is described in the background, so the note is ready by the time that
   message rides along with a later event. Off until `media_model` is
-  set.
+  set (`media_model` / `transcribe_model`).
 - **Dreaming** (`dream.py`): after a stretch of idleness — or when the
   agent calls `dream` itself — the waking loop pauses and a
   differently-prompted loop runs one long offline session. It wanders

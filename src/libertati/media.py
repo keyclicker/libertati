@@ -433,17 +433,16 @@ class MediaLens:
 
         Without a model there is nothing to fall back to — the feature is
         simply off, transcripts keep saying ``<photo>``, and every caller
-        skips the whole path on the ``None``.
+        skips the whole path on the ``None``. The describer talks to the
+        same endpoint with the same key as the agent itself: one route,
+        so a model named here is one the configured provider serves.
         """
         if not settings.media_model:
             return None
         return cls(
             db=db,
             bot=bot,
-            client=AsyncOpenAI(
-                api_key=settings.media_api_key or settings.api_key,
-                base_url=settings.media_base_url or settings.base_url,
-            ),
+            client=AsyncOpenAI(api_key=settings.api_key, base_url=settings.base_url),
             model=settings.media_model,
             media_dir=settings.media_dir,
             describe_prompt=prompts.media_describe,
