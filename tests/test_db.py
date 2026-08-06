@@ -614,7 +614,12 @@ async def test_usage_schema_migrates_existing_table(tmp_path: Path) -> None:
 
 
 async def test_messages_schema_migrates_and_backfills(tmp_path: Path) -> None:
-    """Connecting adds the topic column, backfills it and strips pseudo-replies."""
+    """Connecting adds the topic column, backfills it and strips pseudo-replies.
+
+    Also pins the ordering the topic index depends on: it names a column
+    the migration adds, so creating it from ``SCHEMA`` would fail to open
+    every database written before that column existed.
+    """
     path = tmp_path / "old.db"
     conn = sqlite3.connect(path)
     conn.executescript(
@@ -674,10 +679,15 @@ async def test_messages_schema_migrates_and_backfills(tmp_path: Path) -> None:
         "SELECT message_id, message_thread_id, reply_to_message_id FROM messages"
     ) as cursor:
         rows = {r[0]: (r[1], r[2]) for r in await cursor.fetchall()}
+    async with database.conn.execute(
+        "SELECT name FROM sqlite_master WHERE type = 'index'"
+    ) as cursor:
+        indexes = {r[0] for r in await cursor.fetchall()}
     await database.close()
 
     assert rows[43] == (12, None)
     assert rows[44] == (None, 43)
+    assert "idx_messages_chat_thread" in indexes
 
 
 async def test_dream_ledger_round_trip(db: Database) -> None:
