@@ -34,6 +34,7 @@ from libertati.chats import ChatRegistry
 from libertati.config import Settings
 from libertati.db import Database, effective_reply_to
 from libertati.dream import Dreamer, DreamGate
+from libertati.transcript import render_message, render_messages
 
 log = logging.getLogger(__name__)
 
@@ -47,6 +48,13 @@ DREAM_POLL_SECONDS = 60
 
 #: Max message body length quoted into an event (rest is elided).
 EVENT_TEXT_LIMIT = 1000
+
+#: Most messages an event carries along as the context the agent has not
+#: been shown yet, and how much of each body. Bounded because every event
+#: stays in the agent's context for good: enough to answer a group that
+#: moved on without it, not a second copy of the chat history.
+EVENT_CONTEXT_LIMIT = 8
+EVENT_CONTEXT_TEXT_LIMIT = 300
 
 #: Most chats/topics and pending wakeups one heartbeat spells out. Every
 #: heartbeat is appended to the agent's context for good, so an unbounded
@@ -120,6 +128,55 @@ def format_event(message: Message, tz: ZoneInfo, topic_name: str | None = None) 
         f"[{clock.format_local(message.date, tz)}] {where} | {one_line(sender)}"
         f" ({ref}): {body}"
     )
+
+
+def event_thread_id(message: Message) -> int | None:
+    """Forum topic a message belongs to, or ``None`` outside topics."""
+    if message.is_topic_message and message.message_thread_id:
+        return message.message_thread_id
+    return None
+
+
+async def event_context(db: Database, message: Message, tz: ZoneInfo) -> list[str]:
+    """Transcript lines for what the agent has not been shown yet.
+
+    An incoming message rarely stands alone: in a group only the ones
+    addressing the agent become events, so by the time it is pulled in
+    the conversation has usually moved several messages on, and the
+    message it answers may be one of them. Carrying that along means a
+    turn starts knowing what happened instead of spending two lookups
+    rediscovering it.
+
+    Older messages beyond the cap are announced rather than quoted; the
+    agent can page back to them with ``get_recent_messages``.
+    """
+    chat_id = message.chat.id
+    thread_id = event_thread_id(message)
+    rows = await db.messages_since_read(
+        chat_id, EVENT_CONTEXT_LIMIT + 1, message.message_id, thread_id
+    )
+    dropped = max(0, len(rows) - EVENT_CONTEXT_LIMIT)
+    rows = rows[dropped:]
+    lines = []
+    reply_to = effective_reply_to(message)
+    if reply_to is not None and all(row["message_id"] != reply_to for row in rows):
+        parent = await db.message_row(chat_id, reply_to)
+        if parent is not None:
+            quoted = render_message(parent, tz, text_limit=EVENT_CONTEXT_TEXT_LIMIT)
+            lines.append(f"[replies to] {quoted}")
+    if rows:
+        lines.append("[earlier here, not shown to you yet]")
+        if dropped:
+            lines.append("[older ones skipped — get_recent_messages has them]")
+        lines.extend(
+            render_messages(
+                rows,
+                tz,
+                show_topic=thread_id is None,
+                text_limit=EVENT_CONTEXT_TEXT_LIMIT,
+            )
+        )
+    return lines
 
 
 def is_addressed(message: Message, me: User) -> bool:
@@ -203,19 +260,25 @@ async def on_message(
     Messages from unapproved chats are persisted but never become
     events (in approval mode the chat lands in chats.toml for review).
     Group messages become events only when the bot is mentioned or
-    replied to — the agent catches up on the rest via history tools on
-    heartbeats. Forum topic messages resolve their topic name here
-    (PersistMiddleware has already saved the message, so even the first
-    message seen in a topic can name itself from its own payload).
+    replied to — the rest lands in history and rides along with the next
+    event as the context the agent has not seen. Forum topic messages
+    resolve their topic name here (PersistMiddleware has already saved
+    the message, so even the first message seen in a topic can name
+    itself from its own payload).
+
+    Everything the event carries counts as read, the skipped older
+    messages included: they were deliberately left out, and leaving them
+    unread would quote them into every later event instead.
     """
     if not registry.register(message.chat.id, chat_label(message)):
         return
     if message.chat.type != "private" and not is_addressed(message, me):
         return
-    topic_name = None
-    if message.is_topic_message and message.message_thread_id:
-        topic_name = await db.topic_name(message.chat.id, message.message_thread_id)
-    await agent.push(format_event(message, tz, topic_name=topic_name))
+    thread_id = event_thread_id(message)
+    topic_name = await db.topic_name(message.chat.id, thread_id) if thread_id else None
+    context = await event_context(db, message, tz)
+    await agent.push([format_event(message, tz, topic_name=topic_name), *context])
+    await db.mark_messages_read(message.chat.id, message.message_id, thread_id)
 
 
 @router.message_reaction()

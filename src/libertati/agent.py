@@ -13,6 +13,7 @@ pruned tail window is kept in memory and sent to the API.
 
 import asyncio
 import logging
+from collections.abc import Sequence
 from datetime import UTC, datetime
 from typing import Any, cast
 from zoneinfo import ZoneInfo
@@ -159,21 +160,24 @@ class Agent(ModelLoop):
         self._context = self._trim_dangling(self._trim_to_boundary(items))
         log.info("restored %d context items", len(self._context))
 
-    async def push(self, event: str, *, activity: bool = True) -> None:
-        """Queue an external event (formatted as text) for the agent.
+    async def push(self, event: str | Sequence[str], *, activity: bool = True) -> None:
+        """Queue an external event (one line, or a block of them) for the agent.
 
-        An event is always exactly one line. Every caller interpolates
-        text it does not control — a chat title, a sender's name, the
-        agent's own wakeup note, a dream summary — and a newline in any
-        of them would read as a second event: a message from a chat
-        nobody wrote in, a wakeup nobody scheduled. Collapsing here
-        rather than at each caller is what makes that structural.
+        Every line is collapsed to a single line first. Every caller
+        interpolates text it does not control — a chat title, a sender's
+        name, a quoted message body, the agent's own wakeup note — and a
+        newline in any of them would read as one more line: a message
+        from a chat nobody wrote in, a wakeup nobody scheduled. Callers
+        may therefore pass several lines, but only ones they built
+        themselves; folding here rather than at each caller is what makes
+        that structural.
 
         ``activity=False`` marks events (heartbeats) that should not by
         themselves reset the dream idle clock; the clock still moves
         when the turn they trigger reaches out to anyone.
         """
-        await self._queue.put((one_line(event), activity))
+        lines = [event] if isinstance(event, str) else event
+        await self._queue.put(("\n".join(one_line(line) for line in lines), activity))
 
     async def run_forever(self) -> None:
         """Consume events forever; cancel the task to stop.
