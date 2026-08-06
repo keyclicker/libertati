@@ -346,6 +346,17 @@ async def dream_loop(dreamer: Dreamer) -> None:
             log.exception("dream loop failed")
 
 
+def polled_updates(dispatcher: Dispatcher) -> list[str]:
+    """Update types to ask Telegram for, middleware-only ones included.
+
+    Telegram sends nothing outside ``allowed_updates``, and aiogram's own
+    resolution only counts observers carrying a *handler*. Edits are
+    persisted by an outer middleware and have no handler, so without
+    naming them here an edit would never reach the database at all.
+    """
+    return sorted({*dispatcher.resolve_used_update_types(), "edited_message"})
+
+
 async def run() -> None:
     """Assemble the bot and run long polling until cancelled.
 
@@ -388,7 +399,7 @@ async def run() -> None:
     dispatcher.edited_message.outer_middleware(persist_middleware)
     dispatcher.include_router(router)
     try:
-        await dispatcher.start_polling(bot)
+        await dispatcher.start_polling(bot, allowed_updates=polled_updates(dispatcher))
     finally:
         for task in tasks:
             task.cancel()

@@ -4,6 +4,7 @@ from pathlib import Path
 from typing import Any, cast
 from zoneinfo import ZoneInfo
 
+from aiogram import Dispatcher
 from aiogram.types import Message, MessageReactionUpdated, User
 
 from libertati.bot import (
@@ -15,6 +16,8 @@ from libertati.bot import (
     is_addressed,
     on_message,
     on_message_reaction,
+    polled_updates,
+    router,
 )
 from libertati.chats import ChatRegistry
 from libertati.db import Database
@@ -272,6 +275,17 @@ def make_reaction(**overrides: Any) -> MessageReactionUpdated:
     }
     data.update(overrides)
     return MessageReactionUpdated.model_validate(data)
+
+
+def test_polled_updates_covers_handlers_and_edit_middleware() -> None:
+    """Edits have no handler, so only an explicit request delivers them."""
+    dispatcher = Dispatcher()
+    dispatcher.include_router(router)
+    assert polled_updates(dispatcher) == [
+        "edited_message",
+        "message",
+        "message_reaction",
+    ]
 
 
 def test_format_reaction_event() -> None:
