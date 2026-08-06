@@ -874,9 +874,18 @@ TOOL_PARAMETER_SCHEMAS: dict[str, dict[str, Any]] = {
     for schema in [cast(dict[str, Any], tool)]
 }
 
+#: Messaging tools that only look something up. They sit in
+#: ``MESSAGING_TOOLS`` because that is where the model expects them, not
+#: because they reach anyone.
+READ_ONLY_MESSAGING_TOOLS: frozenset[str] = frozenset({"list_stickers"})
+
 #: Tools that visibly act on Telegram. Dispatching one counts as real
-#: activity for the dream idle clock, unlike read-only lookups.
-OUTWARD_TOOL_NAMES: frozenset[str] = function_names(MESSAGING_TOOLS)
+#: activity for the dream idle clock, unlike read-only lookups — a
+#: lookup that reset the clock would keep idleness at zero and put idle
+#: dreams out of reach.
+OUTWARD_TOOL_NAMES: frozenset[str] = (
+    function_names(MESSAGING_TOOLS) - READ_ONLY_MESSAGING_TOOLS
+)
 
 #: Chat-id arguments checked against the approval registry before a
 #: handler runs. The incoming-event gate in ``bot.py`` is not enough on
@@ -917,7 +926,12 @@ def valid_tool_arguments(name: str, args: object) -> bool:
     properties = schema["properties"]
     if not set(schema["required"]).issubset(args):
         return False
-    if schema.get("additionalProperties") is False and not set(args) <= set(properties):
+    # Every schema in the supported subset is closed, so an undeclared
+    # argument is invalid by definition. Rejecting it here rather than
+    # conditionally is also what keeps the per-property lookup below
+    # total: `Toolbox.run` calls this outside its own error handling and
+    # is documented never to raise.
+    if not set(args) <= set(properties):
         return False
     for key, value in args.items():
         parameter = properties[key]
@@ -973,10 +987,16 @@ class Toolbox:
     explicit ``chat_id`` argument from the model. Default dispatch is
     restricted to waking tools; the dreaming loop passes its narrower
     ``allowed`` set, sharing handlers but no messaging capability.
+
+    Every dependency is keyword-only: several are same-typed strings
+    (two prompts, two model names) that a positional call could swap
+    silently, and the waking and dreaming call sites differ only in the
+    last few arguments.
     """
 
     def __init__(
         self,
+        *,
         db: Database,
         bot: Bot,
         tz: ZoneInfo,
@@ -986,7 +1006,6 @@ class Toolbox:
         typing_chars_per_second: float,
         recall_prompt: str,
         summary_prompt: str,
-        *,
         registry: ChatRegistry,
         recall_effort: str | None = None,
         allowed: frozenset[str] | None = None,
@@ -1325,11 +1344,9 @@ class Toolbox:
 
     async def _approved_chats(self) -> list[dict]:
         """Return stored chat rows allowed by the live registry."""
-        return [
-            chat
-            for chat in await self.db.list_chats()
-            if self.registry.check(chat["chat_id"])
-        ]
+        chats = await self.db.list_chats()
+        allowed = self.registry.approved(chat["chat_id"] for chat in chats)
+        return [chat for chat in chats if chat["chat_id"] in allowed]
 
     async def _approved_chat_ids(self) -> list[int]:
         """Return ids of stored chats allowed by the live registry."""
@@ -1417,11 +1434,19 @@ class Toolbox:
         return json.dumps(rows, ensure_ascii=False)
 
     async def _search_messages(self, args: dict[str, Any]) -> str:
-        """Return a chat's messages matching a substring as JSON."""
+        """Return a chat's messages matching a substring as JSON.
+
+        An empty needle is refused rather than passed down: SQLite's
+        ``instr`` reports it as a match in every row, so the search would
+        quietly hand back the newest messages as if they were hits.
+        """
+        query = args["query"].strip()
+        if not query:
+            return "error: query must not be empty"
         limit = max(1, min(args.get("limit") or 20, 50))
         rows = await self.db.search_messages(
             args["chat_id"],
-            args["query"],
+            query,
             limit,
             args.get("message_thread_id"),
         )

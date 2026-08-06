@@ -6,6 +6,7 @@ from types import SimpleNamespace
 from typing import Any, cast
 
 import httpx
+import pytest
 from openai import BadRequestError
 
 from libertati.agent import Agent
@@ -124,7 +125,6 @@ def test_provider_fallback_keeps_active_turn_suffix() -> None:
     current_call = {**CALL, "call_id": "current"}
     current_output = {**CALL_OUTPUT, "call_id": "current"}
     agent._context = [EVENT, old_call, old_output, EVENT, current_call, current_output]
-    agent._active_turn_start = 3
 
     assert agent._provider_fallback_context() == [
         EVENT,
@@ -215,20 +215,20 @@ async def test_remember_trims_in_chunks() -> None:
     assert agent._context[0] is head
 
 
-async def test_remember_updates_active_turn_boundary_after_trim() -> None:
-    """Chunk trimming keeps active-turn boundary attached to its first event."""
+async def test_active_turn_boundary_survives_a_mid_turn_trim() -> None:
+    """The turn boundary is derived, so a trim cannot leave it stale."""
     agent = Agent.__new__(Agent)
     agent.db = cast(Database, FakeContextDB())
     agent.max_context_items = MAX_CONTEXT_ITEMS
     agent.trim_context_items = TRIM_CONTEXT_ITEMS
     agent._context = [dict(EVENT) for _ in range(MAX_CONTEXT_ITEMS)]
-    agent._active_turn_start = len(agent._context)
     active_event = {"role": "user", "content": "[event] current"}
 
     await agent._remember(active_event)
+    await agent._remember(dict(CALL))
 
-    assert agent._context[-1] is active_event
-    assert agent._active_turn_start == len(agent._context) - 1
+    assert agent._context[-2] is active_event
+    assert agent._active_turn_start() == len(agent._context) - 1
 
 
 STALE = datetime(2020, 1, 1, tzinfo=UTC)
@@ -291,35 +291,82 @@ class FakeOutputItem:
         return dict(self.item)
 
 
-async def test_turn_persists_then_prunes_ephemeral_outputs() -> None:
-    """Completed output remains in SQLite but leaves the live window."""
-    response = SimpleNamespace(
-        id="resp_1",
-        model="gpt-test",
-        output=[FakeOutputItem(REASONING), FakeOutputItem(MESSAGE)],
-        output_text="",
+def api_response(
+    output: list[dict[str, Any]] | None = None, output_text: str = ""
+) -> SimpleNamespace:
+    """Build one Responses-API result carrying no usage figures."""
+    return SimpleNamespace(
+        id="resp",
+        model="test-model",
+        output=[FakeOutputItem(item) for item in output or []],
+        output_text=output_text,
         usage=None,
     )
+
+
+def bad_request(message: str) -> BadRequestError:
+    """Build the 400 a provider returns for one compatibility complaint."""
+    request = httpx.Request("POST", "https://openrouter.ai/api/v1/responses")
+    return BadRequestError(
+        message,
+        response=httpx.Response(400, request=request),
+        body={"error": {"message": message}},
+    )
+
+
+def make_turn_agent(
+    script: list[Any],
+    context: list[dict[str, Any]],
+    *,
+    api_tools: list[Any] | None = None,
+    max_rounds: int = 1,
+    prune: bool = False,
+    reasoning: dict[str, Any] | None = None,
+    tools: Any = None,
+) -> tuple[Agent, list[dict[str, Any]], FakeContextDB]:
+    """Build a bare agent whose API client replays a scripted sequence.
+
+    Each ``script`` entry is either a response to return or an exception
+    to raise; the returned list collects the kwargs of every request the
+    turn made. Every hand-built agent for ``_turn`` goes through here, so
+    a new attribute read in the loop is one edit, not seven.
+    """
+    responses = iter(script)
     calls: list[dict[str, Any]] = []
 
     async def create(**kwargs: Any) -> Any:
         calls.append(kwargs)
-        return response
+        result = next(responses)
+        if isinstance(result, Exception):
+            raise result
+        return result
 
     db = FakeContextDB()
     agent = Agent.__new__(Agent)
     agent.client = cast(Any, SimpleNamespace(responses=SimpleNamespace(create=create)))
-    agent.model = "gpt-test"
+    agent.model = "test-model"
     agent.mind = cast(Any, SimpleNamespace(soul=lambda: "soul"))
     agent.base_prompt = "base"
-    agent.max_rounds = 1
+    agent.max_rounds = max_rounds
     agent.max_context_items = MAX_CONTEXT_ITEMS
     agent.trim_context_items = TRIM_CONTEXT_ITEMS
-    agent._context = [EVENT]
-    agent._api_tools = []
-    agent.reasoning = {"effort": "low", "context": "current_turn"}
-    agent.prune_completed_reasoning = True
+    agent._context = context
+    agent._api_tools = api_tools or []
+    agent.reasoning = cast(Any, reasoning or {})
+    agent.prune_completed_reasoning = prune
     agent.db = cast(Database, db)
+    agent.tools = tools
+    return agent, calls, db
+
+
+async def test_turn_persists_then_prunes_ephemeral_outputs() -> None:
+    """Completed output remains in SQLite but leaves the live window."""
+    agent, calls, db = make_turn_agent(
+        [api_response([REASONING, MESSAGE])],
+        [EVENT],
+        prune=True,
+        reasoning={"effort": "low", "context": "current_turn"},
+    )
 
     await agent._turn()
 
@@ -333,44 +380,14 @@ async def test_turn_persists_then_prunes_ephemeral_outputs() -> None:
 
 async def test_turn_retries_private_final_output_once() -> None:
     """A provider mistaking final output for a reply gets one correction."""
-    responses = iter(
+    agent, calls, db = make_turn_agent(
         [
-            SimpleNamespace(
-                id="resp_1",
-                model="gpt-test",
-                output=[FakeOutputItem(MESSAGE)],
-                output_text="This should have been sent",
-                usage=None,
-            ),
-            SimpleNamespace(
-                id="resp_2",
-                model="gpt-test",
-                output=[],
-                output_text="",
-                usage=None,
-            ),
-        ]
+            api_response([MESSAGE], output_text="This should have been sent"),
+            api_response(),
+        ],
+        [EVENT],
+        max_rounds=3,
     )
-    calls: list[dict[str, Any]] = []
-
-    async def create(**kwargs: Any) -> Any:
-        calls.append(kwargs)
-        return next(responses)
-
-    db = FakeContextDB()
-    agent = Agent.__new__(Agent)
-    agent.client = cast(Any, SimpleNamespace(responses=SimpleNamespace(create=create)))
-    agent.model = "gpt-test"
-    agent.mind = cast(Any, SimpleNamespace(soul=lambda: "soul"))
-    agent.base_prompt = "base"
-    agent.max_rounds = 3
-    agent.max_context_items = MAX_CONTEXT_ITEMS
-    agent.trim_context_items = TRIM_CONTEXT_ITEMS
-    agent._context = [EVENT]
-    agent._api_tools = []
-    agent.reasoning = {}
-    agent.prune_completed_reasoning = False
-    agent.db = cast(Database, db)
 
     await agent._turn()
 
@@ -388,40 +405,12 @@ async def test_turn_retries_private_final_output_once() -> None:
 
 async def test_turn_retries_without_failed_server_tool() -> None:
     """An unsupported built-in tool is removed while local tools remain."""
-    request = httpx.Request("POST", "https://openrouter.ai/api/v1/responses")
-    failure = BadRequestError(
-        "Server tool request failed",
-        response=httpx.Response(400, request=request),
-        body={"error": {"message": "Server tool request failed"}},
+    function_tool = {"type": "function", "name": "send_message"}
+    agent, calls, _ = make_turn_agent(
+        [bad_request("Server tool request failed"), api_response()],
+        [EVENT],
+        api_tools=[function_tool, {"type": "web_search"}],
     )
-    response = SimpleNamespace(
-        id="resp_1", model="gpt-test", output=[], output_text="", usage=None
-    )
-    responses = iter([failure, response])
-    calls: list[dict[str, Any]] = []
-
-    async def create(**kwargs: Any) -> Any:
-        calls.append(kwargs)
-        result = next(responses)
-        if isinstance(result, Exception):
-            raise result
-        return result
-
-    db = FakeContextDB()
-    agent = Agent.__new__(Agent)
-    agent.client = cast(Any, SimpleNamespace(responses=SimpleNamespace(create=create)))
-    agent.model = "gpt-test"
-    agent.mind = cast(Any, SimpleNamespace(soul=lambda: "soul"))
-    agent.base_prompt = "base"
-    agent.max_rounds = 1
-    agent.max_context_items = MAX_CONTEXT_ITEMS
-    agent.trim_context_items = TRIM_CONTEXT_ITEMS
-    agent._context = [EVENT]
-    function_tool = cast(Any, {"type": "function", "name": "send_message"})
-    agent._api_tools = [function_tool, cast(Any, {"type": "web_search"})]
-    agent.reasoning = {}
-    agent.prune_completed_reasoning = False
-    agent.db = cast(Database, db)
 
     await agent._turn()
 
@@ -433,39 +422,10 @@ async def test_turn_retries_without_failed_server_tool() -> None:
 
 async def test_turn_retries_duplicate_tool_ids_with_events_only() -> None:
     """Mistral duplicate-id errors fall back to external event context."""
-    request = httpx.Request("POST", "https://openrouter.ai/api/v1/responses")
-    failure = BadRequestError(
-        "Duplicate tool call id in assistant message",
-        response=httpx.Response(400, request=request),
-        body={"error": {"message": "Duplicate tool call id in assistant message"}},
+    agent, calls, _ = make_turn_agent(
+        [bad_request("Duplicate tool call id in assistant message"), api_response()],
+        [EVENT, CALL, CALL_OUTPUT, MESSAGE, EVENT],
     )
-    response = SimpleNamespace(
-        id="resp_1", model="mistral-test", output=[], output_text="", usage=None
-    )
-    responses = iter([failure, response])
-    calls: list[dict[str, Any]] = []
-
-    async def create(**kwargs: Any) -> Any:
-        calls.append(kwargs)
-        result = next(responses)
-        if isinstance(result, Exception):
-            raise result
-        return result
-
-    db = FakeContextDB()
-    agent = Agent.__new__(Agent)
-    agent.client = cast(Any, SimpleNamespace(responses=SimpleNamespace(create=create)))
-    agent.model = "mistral-test"
-    agent.mind = cast(Any, SimpleNamespace(soul=lambda: "soul"))
-    agent.base_prompt = "base"
-    agent.max_rounds = 1
-    agent.max_context_items = MAX_CONTEXT_ITEMS
-    agent.trim_context_items = TRIM_CONTEXT_ITEMS
-    agent._context = [EVENT, CALL, CALL_OUTPUT, MESSAGE, EVENT]
-    agent._api_tools = []
-    agent.reasoning = {}
-    agent.prune_completed_reasoning = False
-    agent.db = cast(Database, db)
 
     await agent._turn()
 
@@ -476,40 +436,14 @@ async def test_turn_retries_duplicate_tool_ids_with_events_only() -> None:
 
 async def test_turn_retries_encrypted_reasoning_with_provider_neutral_context() -> None:
     """Cross-provider encrypted reasoning errors compact historical context."""
-    request = httpx.Request("POST", "https://openrouter.ai/api/v1/responses")
-    failure = BadRequestError(
-        "Could not decrypt the provided encrypted_content",
-        response=httpx.Response(400, request=request),
-        body={"error": {"message": "Could not decrypt encrypted_content"}},
-    )
-    response = SimpleNamespace(
-        id="resp_1", model="xai-test", output=[], output_text="", usage=None
-    )
-    responses = iter([failure, response])
-    calls: list[dict[str, Any]] = []
-
-    async def create(**kwargs: Any) -> Any:
-        calls.append(kwargs)
-        result = next(responses)
-        if isinstance(result, Exception):
-            raise result
-        return result
-
-    db = FakeContextDB()
-    agent = Agent.__new__(Agent)
-    agent.client = cast(Any, SimpleNamespace(responses=SimpleNamespace(create=create)))
-    agent.model = "xai-test"
-    agent.mind = cast(Any, SimpleNamespace(soul=lambda: "soul"))
-    agent.base_prompt = "base"
-    agent.max_rounds = 1
-    agent.max_context_items = MAX_CONTEXT_ITEMS
-    agent.trim_context_items = TRIM_CONTEXT_ITEMS
     encrypted = {"type": "reasoning", "encrypted_content": "opaque"}
-    agent._context = [EVENT, encrypted, MESSAGE, EVENT]
-    agent._api_tools = []
-    agent.reasoning = {}
-    agent.prune_completed_reasoning = False
-    agent.db = cast(Database, db)
+    agent, calls, _ = make_turn_agent(
+        [
+            bad_request("Could not decrypt the provided encrypted_content"),
+            api_response(),
+        ],
+        [EVENT, encrypted, MESSAGE, EVENT],
+    )
 
     await agent._turn()
 
@@ -520,45 +454,16 @@ async def test_turn_retries_encrypted_reasoning_with_provider_neutral_context() 
 
 async def test_turn_chains_server_tool_and_duplicate_id_fallbacks() -> None:
     """Sequential compatibility failures both transform the next retry."""
-    request = httpx.Request("POST", "https://openrouter.ai/api/v1/responses")
-    server_failure = BadRequestError(
-        "Server tool request failed",
-        response=httpx.Response(400, request=request),
-        body={"error": {"message": "Server tool request failed"}},
+    function_tool = {"type": "function", "name": "send_message"}
+    agent, calls, _ = make_turn_agent(
+        [
+            bad_request("Server tool request failed"),
+            bad_request("Duplicate tool call id in assistant message"),
+            api_response(),
+        ],
+        [EVENT, CALL, CALL_OUTPUT, MESSAGE, EVENT],
+        api_tools=[function_tool, {"type": "web_search"}],
     )
-    duplicate_failure = BadRequestError(
-        "Duplicate tool call id in assistant message",
-        response=httpx.Response(400, request=request),
-        body={"error": {"message": "Duplicate tool call id in assistant message"}},
-    )
-    response = SimpleNamespace(
-        id="resp_1", model="mistral-test", output=[], output_text="", usage=None
-    )
-    responses = iter([server_failure, duplicate_failure, response])
-    calls: list[dict[str, Any]] = []
-
-    async def create(**kwargs: Any) -> Any:
-        calls.append(kwargs)
-        result = next(responses)
-        if isinstance(result, Exception):
-            raise result
-        return result
-
-    db = FakeContextDB()
-    agent = Agent.__new__(Agent)
-    agent.client = cast(Any, SimpleNamespace(responses=SimpleNamespace(create=create)))
-    agent.model = "mistral-test"
-    agent.mind = cast(Any, SimpleNamespace(soul=lambda: "soul"))
-    agent.base_prompt = "base"
-    agent.max_rounds = 1
-    agent.max_context_items = MAX_CONTEXT_ITEMS
-    agent.trim_context_items = TRIM_CONTEXT_ITEMS
-    agent._context = [EVENT, CALL, CALL_OUTPUT, MESSAGE, EVENT]
-    function_tool = cast(Any, {"type": "function", "name": "send_message"})
-    agent._api_tools = [function_tool, cast(Any, {"type": "web_search"})]
-    agent.reasoning = {}
-    agent.prune_completed_reasoning = False
-    agent.db = cast(Database, db)
 
     await agent._turn()
 
@@ -569,33 +474,33 @@ async def test_turn_chains_server_tool_and_duplicate_id_fallbacks() -> None:
     assert calls[2]["input"] == [EVENT, EVENT]
 
 
+async def test_turn_surfaces_the_provider_error_once_fallbacks_are_spent() -> None:
+    """A rejection no shed can answer reaches the caller as its own error.
+
+    Each fallback fires once; what follows must be the provider's own
+    message, not a synthetic "retries exhausted" that hides it.
+    """
+    agent, calls, _ = make_turn_agent(
+        [
+            bad_request("Duplicate tool call id in assistant message"),
+            bad_request("Server tool request failed"),
+            bad_request("Could not decrypt the provided encrypted_content"),
+        ],
+        [EVENT, CALL, CALL_OUTPUT, MESSAGE, EVENT],
+        api_tools=[
+            {"type": "function", "name": "send_message"},
+            {"type": "web_search"},
+        ],
+    )
+
+    with pytest.raises(BadRequestError, match="Could not decrypt"):
+        await agent._round("instructions", turn_id=None)
+
+    assert len(calls) == 3
+
+
 async def test_provider_fallback_preserves_tool_result_for_next_round() -> None:
     """Compacted context remains active through a multi-round tool turn."""
-    request = httpx.Request("POST", "https://openrouter.ai/api/v1/responses")
-    failure = BadRequestError(
-        "Duplicate tool call id in assistant message",
-        response=httpx.Response(400, request=request),
-        body={"error": {"message": "Duplicate tool call id in assistant message"}},
-    )
-    call_response = SimpleNamespace(
-        id="resp_1",
-        model="mistral-test",
-        output=[FakeOutputItem(CALL)],
-        output_text="",
-        usage=None,
-    )
-    final_response = SimpleNamespace(
-        id="resp_2", model="mistral-test", output=[], output_text="", usage=None
-    )
-    responses = iter([failure, call_response, final_response])
-    calls: list[dict[str, Any]] = []
-
-    async def create(**kwargs: Any) -> Any:
-        calls.append(kwargs)
-        result = next(responses)
-        if isinstance(result, Exception):
-            raise result
-        return result
 
     class FakeTools:
         """Return one stable result for the model's function call."""
@@ -606,21 +511,17 @@ async def test_provider_fallback_preserves_tool_result_for_next_round() -> None:
             assert arguments == "{}"
             return "sent"
 
-    db = FakeContextDB()
-    agent = Agent.__new__(Agent)
-    agent.client = cast(Any, SimpleNamespace(responses=SimpleNamespace(create=create)))
-    agent.model = "mistral-test"
-    agent.mind = cast(Any, SimpleNamespace(soul=lambda: "soul"))
-    agent.base_prompt = "base"
-    agent.max_rounds = 2
-    agent.max_context_items = MAX_CONTEXT_ITEMS
-    agent.trim_context_items = TRIM_CONTEXT_ITEMS
-    agent._context = [EVENT, {**CALL, "call_id": "old"}, EVENT]
-    agent._api_tools = []
-    agent.reasoning = {}
-    agent.prune_completed_reasoning = True
-    agent.db = cast(Database, db)
-    agent.tools = cast(Any, FakeTools())
+    agent, calls, _ = make_turn_agent(
+        [
+            bad_request("Duplicate tool call id in assistant message"),
+            api_response([CALL]),
+            api_response(),
+        ],
+        [EVENT, {**CALL, "call_id": "old"}, EVENT],
+        max_rounds=2,
+        prune=True,
+        tools=FakeTools(),
+    )
 
     await agent._turn()
 

@@ -21,6 +21,7 @@ from libertati.tools import (
     GATED_CHAT_ARGS,
     MESSAGING_TOOLS,
     SLEEP_TOOLS,
+    TOOL_PARAMETER_SCHEMAS,
     TOOLS,
     TYPING_MAX_SECONDS,
     TYPING_MIN_SECONDS,
@@ -301,15 +302,15 @@ def make_toolbox(
 ) -> Toolbox:
     """Build a Toolbox around fakes."""
     return Toolbox(
-        cast(Database, db or FakeDB()),
-        cast(Bot, bot or ExplodingBot()),
-        UTC_TZ,
-        cast(AsyncOpenAI, client or FakeClient()),
-        "recall-model",
-        cast(Mind, mind),
-        15.0,
-        RECALL_PROMPT,
-        SUMMARY_PROMPT,
+        db=cast(Database, db or FakeDB()),
+        bot=cast(Bot, bot or ExplodingBot()),
+        tz=UTC_TZ,
+        client=cast(AsyncOpenAI, client or FakeClient()),
+        recall_model="recall-model",
+        mind=cast(Mind, mind),
+        typing_chars_per_second=15.0,
+        recall_prompt=RECALL_PROMPT,
+        summary_prompt=SUMMARY_PROMPT,
         registry=registry or OPEN_REGISTRY,
         **dream,
     )
@@ -592,6 +593,16 @@ async def test_list_stickers() -> None:
     db.stickers = [{"file_id": "AAA", "emoji": "😀", "set_name": "pack"}]
     result = await toolbox.run("list_stickers", "{}")
     assert json.loads(result) == db.stickers
+
+
+async def test_listing_stickers_is_not_outward_activity() -> None:
+    """A lookup must not pass for reaching out, or idle dreams never fire."""
+    db = FakeDB()
+    db.chats = [{"chat_id": 1}]
+    toolbox = make_toolbox(db=db)
+    await toolbox.run("list_stickers", "{}")
+    assert toolbox.outward_calls == 0
+    assert toolbox.steps == 1
 
 
 async def test_forward_message() -> None:
@@ -974,6 +985,15 @@ async def test_search_messages_reports_no_matches() -> None:
     assert db.search_calls == [(1, "cat", 20, None)]
 
 
+async def test_search_messages_refuses_an_empty_query() -> None:
+    """A blank needle would match every row, not none."""
+    db = FakeDB()
+    args = {"chat_id": 1, "query": "  ", "limit": None, "message_thread_id": None}
+    result = await make_toolbox(db=db).run("search_messages", json.dumps(args))
+    assert result == "error: query must not be empty"
+    assert db.search_calls == []
+
+
 async def test_list_chats() -> None:
     """Chats come back as JSON; an empty list says so."""
     db = FakeDB()
@@ -1120,6 +1140,21 @@ def test_every_chat_targeting_tool_is_gated() -> None:
         )
         gated = GATED_CHAT_ARGS.get(schema["name"], ())
         assert set(gated) == set(expected), schema["name"]
+
+
+def test_every_tool_schema_stays_in_the_validated_subset() -> None:
+    """Local validation only holds while every schema is a closed object.
+
+    ``valid_tool_arguments`` rejects undeclared arguments outright and
+    then looks each remaining key up in ``properties`` — a lookup that is
+    total only because no schema allows extras. It also assumes optional
+    parameters are nullable rather than absent, so ``required`` covers
+    every property.
+    """
+    for name, schema in TOOL_PARAMETER_SCHEMAS.items():
+        assert schema["type"] == "object", name
+        assert schema["additionalProperties"] is False, name
+        assert set(schema["required"]) == set(schema["properties"]), name
 
 
 async def test_remember_appends_and_confirms(tmp_path: Path) -> None:

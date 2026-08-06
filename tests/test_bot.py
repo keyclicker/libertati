@@ -4,10 +4,12 @@ from pathlib import Path
 from typing import Any, cast
 from zoneinfo import ZoneInfo
 
+from aiogram import Dispatcher
 from aiogram.types import Message, MessageReactionUpdated, User
 
 from libertati.bot import (
     EVENT_TEXT_LIMIT,
+    HEARTBEAT_DIGEST_LIMIT,
     deliver_wakeups,
     format_event,
     format_reaction_event,
@@ -15,6 +17,8 @@ from libertati.bot import (
     is_addressed,
     on_message,
     on_message_reaction,
+    polled_updates,
+    router,
 )
 from libertati.chats import ChatRegistry
 from libertati.db import Database
@@ -274,6 +278,17 @@ def make_reaction(**overrides: Any) -> MessageReactionUpdated:
     return MessageReactionUpdated.model_validate(data)
 
 
+def test_polled_updates_covers_handlers_and_edit_middleware() -> None:
+    """Edits have no handler, so only an explicit request delivers them."""
+    dispatcher = Dispatcher()
+    dispatcher.include_router(router)
+    assert polled_updates(dispatcher) == [
+        "edited_message",
+        "message",
+        "message_reaction",
+    ]
+
+
 def test_format_reaction_event() -> None:
     """Reaction events identify actor, target message and change."""
     event = format_reaction_event(make_reaction(), UTC_TZ)
@@ -397,3 +412,22 @@ async def test_heartbeat_digest_names_unanswered_topics(db: Database) -> None:
     digest = await heartbeat_digest(db, UTC_TZ, OPEN_REGISTRY)
     assert "topic 12 “Ideas”" in digest
     assert "topic 13" not in digest
+
+
+async def test_heartbeat_digest_caps_both_lists(db: Database) -> None:
+    """A long backlog is summarized, not spelled out into the context."""
+    over = HEARTBEAT_DIGEST_LIMIT + 3
+    for index in range(over):
+        await db.save_message(
+            make_message(
+                message_id=index,
+                chat={"id": 1000 + index, "type": "private", "first_name": "Alice"},
+            )
+        )
+        await db.add_wakeup(f"2000-01-01 00:{index:02d}:00", f"note {index}")
+
+    digest = await heartbeat_digest(db, UTC_TZ, OPEN_REGISTRY)
+
+    assert digest.count("private, last ") == HEARTBEAT_DIGEST_LIMIT
+    assert digest.count("note ") == HEARTBEAT_DIGEST_LIMIT
+    assert digest.count("(+3 more)") == 2

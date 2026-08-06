@@ -108,15 +108,15 @@ class Dreamer(ModelLoop):
             model=settings.dream_model or settings.model,
             db=db,
             tools=Toolbox(
-                db,
-                bot,
-                agent.tz,
-                agent.client,
-                settings.recall_model or settings.model,
-                agent.mind,
-                settings.typing_chars_per_second,
-                agent.prompts.recall,
-                agent.prompts.summary,
+                db=db,
+                bot=bot,
+                tz=agent.tz,
+                client=agent.client,
+                recall_model=settings.recall_model or settings.model,
+                mind=agent.mind,
+                typing_chars_per_second=settings.typing_chars_per_second,
+                recall_prompt=agent.prompts.recall,
+                summary_prompt=agent.prompts.summary,
                 registry=agent.registry,
                 recall_effort=settings.recall_reasoning_effort,
                 allowed=DREAM_TOOL_NAMES,
@@ -183,6 +183,11 @@ class Dreamer(ModelLoop):
         started = datetime.now(UTC)
         dream_id = await self.db.start_dream(trigger)
         self.dream_id = dream_id
+        # Cleared here rather than inside the session: the finally below
+        # reports both as this dream's, so they must already belong to it
+        # by the time anything can fail on the way in.
+        self.tools.steps = 0
+        self.tools.wake_summary = None
         status = "failed"
         try:
             async with self.agent.turn_lock:
@@ -209,8 +214,6 @@ class Dreamer(ModelLoop):
         with ``store=False`` the encrypted reasoning has to ride the whole
         session, which is one unbroken chain of tool rounds.
         """
-        self.tools.steps = 0
-        self.tools.wake_summary = None
         self._context = []
         await self._remember({"role": "user", "content": self._opening(dream_id, note)})
         instructions = f"{self.prompt}\n\n## Soul\n{self.mind.soul()}"

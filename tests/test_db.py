@@ -91,6 +91,24 @@ async def test_unread_count_tracks_whole_chat_and_topic_reads(db: Database) -> N
     assert await db.unread_messages_count(-1001, 12) == 1
 
 
+async def test_unread_count_ignores_the_agents_own_messages(db: Database) -> None:
+    """Replies the agent sent itself are never reported back as unread."""
+    await db.save_message(make_message(1, "theirs"))
+    await db.save_message(make_message(2, "ours", date=STAMP + 60), outgoing=True)
+    assert await db.unread_messages_count(100) == 1
+
+
+async def test_whole_chat_read_clears_topic_unread_counts(db: Database) -> None:
+    """A chat-wide history read also exposed each topic's older messages."""
+    await db.save_message(make_topic_message(13, "one", date=STAMP + 1))
+    await db.save_message(make_topic_message(14, "two", thread_id=99, date=STAMP + 2))
+    await db.mark_messages_read(-1001, 14)
+    assert await db.unread_messages_count(-1001, 12) == 0
+    assert await db.unread_messages_count(-1001, 99) == 0
+    await db.save_message(make_topic_message(15, "three", date=STAMP + 3))
+    assert await db.unread_messages_count(-1001, 12) == 1
+
+
 async def test_search_messages(db: Database) -> None:
     """Substring search is case-insensitive, newest first, wildcards literal."""
     await db.save_message(make_message(1, "my Cat is grumpy", date=STAMP))
