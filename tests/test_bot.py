@@ -560,6 +560,22 @@ async def test_addressed_media_is_described_before_the_event() -> None:
     assert "<photo: a cat glaring at a mug> look" in agent.events[0]
 
 
+async def test_a_message_carrying_no_media_never_reaches_the_lens() -> None:
+    """Every message passes here; only some are worth serializing."""
+    lens = FakeLens()
+    await on_message(
+        make_message(text="hello"),
+        FakeAgent(),
+        UTC_TZ,
+        ME,
+        OPEN_REGISTRY,
+        FakeTopicDB(),  # type: ignore[arg-type]
+        cast(Any, lens),
+    )
+    assert lens.started == []
+    assert lens.waited == []
+
+
 async def test_a_slow_look_does_not_let_the_next_message_overtake() -> None:
     """The picture must reach the agent before the question about it."""
     agent = FakeAgent()

@@ -36,7 +36,7 @@ from libertati.chats import ChatRegistry
 from libertati.config import Settings
 from libertati.db import Database, effective_reply_to
 from libertati.dream import Dreamer, DreamGate
-from libertati.media import MediaLens
+from libertati.media import MEDIA_CONTENT_TYPES, MediaLens
 from libertati.prompts import load_prompts
 from libertati.transcript import media_body, render_message, render_messages
 
@@ -200,9 +200,10 @@ def start_media(
     Started before anything else the handler does, and for every message
     rather than only the ones the agent will hear about: media that just
     lands in history rides along with some later event as context, and
-    the note should be there by then.
+    the note should be there by then. Messages of a kind that carries no
+    media skip the payload dump entirely.
     """
-    if lens is None:
+    if lens is None or message.content_type not in MEDIA_CONTENT_TYPES:
         return None
     payload = message.model_dump(mode="json", exclude_none=True)
     return lens.start(message.chat.id, message.message_id, payload)

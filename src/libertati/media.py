@@ -66,6 +66,11 @@ CONCURRENT_JOBS = 2
 _VIDEO_KINDS = ("animation", "video", "video_note")
 _AUDIO_KINDS = ("voice", "audio")
 
+#: Telegram content types :func:`media_ref` can resolve. A message of
+#: any other kind is not worth serializing a payload to find that out —
+#: the handler sees one per message, media or not.
+MEDIA_CONTENT_TYPES = frozenset({"photo", "sticker", *_VIDEO_KINDS, *_AUDIO_KINDS})
+
 
 @dataclass(frozen=True)
 class MediaRef:
