@@ -170,6 +170,11 @@ class Agent(ModelLoop):
         # trigger. Heartbeat-only turns with no outward action leave it
         # alone, or regular heartbeats would keep idleness at zero.
         self.last_active = datetime.now(UTC)
+        # Events _inject_steering slipped into the turn in flight. They
+        # read as external events but did not start the turn, and
+        # _active_turn_start has to tell the two apart. Held by identity
+        # rather than by index, so a mid-turn trim cannot stale it.
+        self._injected_events: list[dict[str, Any]] = []
         self.prune_completed_reasoning = settings.prune_completed_reasoning
 
     async def load(self) -> None:
@@ -254,12 +259,14 @@ class Agent(ModelLoop):
         """
         rows = await self.db.claim_steering(urgent=True)
         for row in rows:
-            await self._remember(
-                {
-                    "role": "user",
-                    "content": steering_event(row["id"], row["text"], self.tz),
-                }
-            )
+            item = {
+                "role": "user",
+                "content": steering_event(row["id"], row["text"], self.tz),
+            }
+            # Noted before it lands: from here on it is in the window,
+            # and the turn it joined has to keep its own start.
+            self._injected_events.append(item)
+            await self._remember(item)
         if rows:
             self.last_active = datetime.now(UTC)
             log.info("injected %d urgent operator instruction(s)", len(rows))
@@ -351,6 +358,10 @@ class Agent(ModelLoop):
             }
         return item
 
+    def _was_injected(self, item: dict[str, Any]) -> bool:
+        """Whether the turn in flight slipped this event in mid-way."""
+        return any(item is injected for injected in self._injected_events)
+
     def _active_turn_start(self) -> int:
         """Index of the first window item the turn in flight produced.
 
@@ -358,12 +369,19 @@ class Agent(ModelLoop):
         this turn's own reasoning, tool calls and output. Derived from
         the window on every call rather than tracked across appends, so
         a mid-turn trim can't leave a stale index behind.
+
+        An urgent console instruction is the one external event that can
+        appear inside a turn instead of starting one, and counting it as
+        a boundary would cut the turn in half — leaving its earlier
+        rounds unpruned and outside the window the provider fallback
+        keeps whole. Those are skipped by identity.
         """
         last_event = next(
             (
                 i
                 for i in range(len(self._context) - 1, -1, -1)
                 if self._is_external_event(self._context[i])
+                and not self._was_injected(self._context[i])
             ),
             -1,
         )

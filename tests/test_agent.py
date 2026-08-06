@@ -129,6 +129,7 @@ def test_provider_fallback_keeps_active_turn_suffix() -> None:
     current_call = {**CALL, "call_id": "current"}
     current_output = {**CALL_OUTPUT, "call_id": "current"}
     agent._context = [EVENT, old_call, old_output, EVENT, current_call, current_output]
+    agent._injected_events = []
 
     assert agent._provider_fallback_context() == [
         EVENT,
@@ -235,6 +236,7 @@ async def test_active_turn_boundary_survives_a_mid_turn_trim() -> None:
     agent.max_context_items = MAX_CONTEXT_ITEMS
     agent.trim_context_items = TRIM_CONTEXT_ITEMS
     agent._context = [dict(EVENT) for _ in range(MAX_CONTEXT_ITEMS)]
+    agent._injected_events = []
     active_event = {"role": "user", "content": "[event] current"}
 
     await agent._remember(active_event)
@@ -259,6 +261,7 @@ def make_processing_agent(outward_calls_per_turn: int = 0) -> Agent:
     agent.tools = cast(Any, SimpleNamespace(outward_calls=0))
     agent.last_active = STALE
     agent.tz = UTC_TZ
+    agent._injected_events = []
 
     async def turn() -> None:
         agent.tools.outward_calls += outward_calls_per_turn
@@ -481,6 +484,7 @@ def make_turn_agent(
     agent.tools = tools
     agent.tz = UTC_TZ
     agent.last_active = STALE
+    agent._injected_events = []
     return agent, calls, db
 
 
@@ -832,6 +836,32 @@ async def test_turn_leaves_queued_steering_for_the_next_turn() -> None:
         "function_call_output",
     ]
     assert db.steering == [{"id": 5, "text": "when you have a moment", "urgent": False}]
+
+
+async def test_injected_steering_does_not_split_the_turn() -> None:
+    """An instruction mid-turn is not the boundary the turn started at."""
+    agent, _, db = make_turn_agent(
+        [api_response([REASONING, CALL]), api_response([REASONING, MESSAGE])],
+        [EVENT],
+        max_rounds=3,
+        prune=True,
+        reasoning={"effort": "low", "context": "current_turn"},
+        tools=StubTools(),
+    )
+    db.steering = [{"id": 7, "text": "leave it", "urgent": True}]
+
+    await agent._turn()
+
+    # Both rounds' reasoning is gone, the first round's included: the
+    # injected event sits inside the turn, it did not open a new one.
+    assert [item.get("type") for item in agent._context] == [
+        None,
+        "function_call",
+        "function_call_output",
+        None,
+    ]
+    assert "leave it" in agent._context[-1]["content"]
+    assert agent._injected_events == [agent._context[-1]]
 
 
 async def test_record_usage_maps_all_authoritative_counts() -> None:

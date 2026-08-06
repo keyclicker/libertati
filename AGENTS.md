@@ -92,6 +92,11 @@ One package, `src/libertati/`, no sub-packages:
   Urgent ones are injected only at a round boundary
   (`Agent._inject_steering`), where every function call already has its
   output; anywhere else would separate a call from its answer.
+- **An injected instruction is inside a turn, not the start of one.**
+  It reads as an external event, so `Agent._active_turn_start` skips
+  the ones `_injected_events` holds; counting one as a boundary would
+  halve the turn, leaving its earlier rounds unpruned by `_finish_turn`
+  and outside what `_provider_fallback_context` keeps whole.
 - **Idle clock**: `Agent.last_active` moves only on activity events or
   outward tool calls — heartbeat-only turns must not reset it, or idle
   dreams become unreachable.
