@@ -35,6 +35,26 @@ def _sender(row: dict[str, Any]) -> str:
     return f"@{username}" if username else UNKNOWN_SENDER
 
 
+def media_body(content_type: str | None, note: str | None, body: str) -> str:
+    """Prefix a body with what the message carries, described if known.
+
+    ``<sticker>`` alone says a sticker happened; ``<sticker: a cat
+    knocking a mug off a table>`` says what everyone else in the chat
+    saw. The note comes from a model looking at the file (see
+    ``media.py``) and is folded like any other untrusted text — it lives
+    inside one transcript line and must not be able to become two.
+
+    Text messages keep their body unadorned; the caller passes the body
+    already folded and capped.
+    """
+    if not content_type or content_type == "text":
+        return body
+    label = content_type
+    if note:
+        label += ": " + " ".join(note.split())
+    return f"<{label}> {body}".rstrip()
+
+
 def _body(row: dict[str, Any], text_limit: int | None) -> str:
     """Render a message body, naming the media of non-text messages.
 
@@ -45,10 +65,7 @@ def _body(row: dict[str, Any], text_limit: int | None) -> str:
     body = "\\n".join(text.splitlines())
     if text_limit is not None and len(body) > text_limit:
         body = body[:text_limit] + f" […{len(body) - text_limit} chars]"
-    content_type = row.get("content_type")
-    if content_type and content_type != "text":
-        return f"<{content_type}> {body}".rstrip()
-    return body
+    return media_body(row.get("content_type"), row.get("media_note"), body)
 
 
 def render_message(

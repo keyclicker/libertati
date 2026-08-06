@@ -13,11 +13,13 @@ import logging
 import random
 import re
 from collections.abc import Awaitable, Callable
+from contextlib import nullcontext
 from datetime import UTC, datetime
 from typing import Any
 from zoneinfo import ZoneInfo
 
 from aiogram import BaseMiddleware, Bot, Dispatcher, Router
+from aiogram.enums import ContentType
 from aiogram.types import (
     Message,
     MessageReactionUpdated,
@@ -34,7 +36,9 @@ from libertati.chats import ChatRegistry
 from libertati.config import Settings
 from libertati.db import Database, effective_reply_to
 from libertati.dream import Dreamer, DreamGate
-from libertati.transcript import render_message, render_messages
+from libertati.media import MEDIA_CONTENT_TYPES, MediaLens
+from libertati.prompts import load_prompts
+from libertati.transcript import media_body, render_message, render_messages
 
 log = logging.getLogger(__name__)
 
@@ -90,7 +94,12 @@ class PersistMiddleware(BaseMiddleware):
         return await handler(event, data)
 
 
-def format_event(message: Message, tz: ZoneInfo, topic_name: str | None = None) -> str:
+def format_event(
+    message: Message,
+    tz: ZoneInfo,
+    topic_name: str | None = None,
+    media_note: str | None = None,
+) -> str:
     """Format an incoming message as a one-line event for the agent.
 
     Strictly one line: every interpolated field is sender-controlled, and
@@ -125,10 +134,14 @@ def format_event(message: Message, tz: ZoneInfo, topic_name: str | None = None) 
     if message.forum_topic_created is not None:
         body = f"<forum_topic_created “{one_line(message.forum_topic_created.name)}”>"
     else:
-        body = message.text or message.caption or f"<{message.content_type}>"
-    body = "\\n".join(body.splitlines())
-    if len(body) > EVENT_TEXT_LIMIT:
-        body = body[:EVENT_TEXT_LIMIT] + f" […{len(body) - EVENT_TEXT_LIMIT} chars]"
+        body = "\\n".join((message.text or message.caption or "").splitlines())
+        if len(body) > EVENT_TEXT_LIMIT:
+            body = body[:EVENT_TEXT_LIMIT] + f" […{len(body) - EVENT_TEXT_LIMIT} chars]"
+        # The cap applies to what the sender wrote, not to the media
+        # note: that one is a model's own sentence, already bounded.
+        # Through ContentType because aiogram's value formats as
+        # "ContentType.PHOTO", where the stored column says "photo".
+        body = media_body(ContentType(message.content_type).value, media_note, body)
     return (
         f"[{clock.format_local(message.date, tz)}] {where} | {one_line(sender)}"
         f" ({ref}): {body}"
@@ -182,6 +195,60 @@ async def event_context(db: Database, message: Message, tz: ZoneInfo) -> list[st
             )
         )
     return lines
+
+
+def start_media(
+    lens: MediaLens | None, message: Message
+) -> "asyncio.Task[str | None] | None":
+    """Begin describing an incoming message's media, if it has any.
+
+    Started before anything else the handler does, and for every message
+    rather than only the ones the agent will hear about: media that just
+    lands in history rides along with some later event as context, and
+    the note should be there by then. Messages of a kind that carries no
+    media skip the payload dump entirely.
+    """
+    if lens is None or message.content_type not in MEDIA_CONTENT_TYPES:
+        return None
+    payload = message.model_dump(mode="json", exclude_none=True)
+    return lens.start(message.chat.id, message.message_id, payload)
+
+
+async def media_note_for(
+    lens: MediaLens | None, job: "asyncio.Task[str | None] | None"
+) -> str | None:
+    """Give a started description a moment to land, for the event's sake.
+
+    A message the agent is about to hear about is worth waiting for — an
+    event saying ``<sticker>`` where it could say what the sticker is
+    costs the turn a tool call, or a wrong answer. Nothing is held up for
+    longer than ``media_wait_seconds``, and the work continues either
+    way.
+    """
+    if lens is None or job is None:
+        return None
+    return await lens.wait_briefly(job)
+
+
+class ChatOrder:
+    """One lock per chat, keeping its events in the order they arrived.
+
+    aiogram runs every update in its own task, and describing a picture
+    takes seconds: without this, the question typed right after a photo
+    reaches the agent before the photo does, and the turn answers about
+    an image it has not been shown. The lock spans the wait and the push
+    both, so a chat's events queue in arrival order — the description
+    itself is started before it and runs while the lock is held by
+    someone else, so a burst is still described in parallel.
+    """
+
+    def __init__(self) -> None:
+        """Start with no chat seen."""
+        self._locks: dict[int, asyncio.Lock] = {}
+
+    def lock(self, chat_id: int) -> asyncio.Lock:
+        """Return the lock serializing one chat's events."""
+        return self._locks.setdefault(chat_id, asyncio.Lock())
 
 
 def is_addressed(message: Message, me: User) -> bool:
@@ -259,6 +326,8 @@ async def on_message(
     me: User,
     registry: ChatRegistry,
     db: Database,
+    lens: MediaLens | None = None,
+    order: ChatOrder | None = None,
 ) -> None:
     """Push an incoming message to the agent loop as an event.
 
@@ -271,6 +340,13 @@ async def on_message(
     the message, so even the first message seen in a topic can name
     itself from its own payload).
 
+    Media is described on the way past (see :func:`start_media`), so the
+    event can say what a picture is instead of that there was one. That
+    wait is why the push happens under the chat's :class:`ChatOrder`
+    lock: an event must not overtake the one for the message before it.
+    ``order`` is always injected by the dispatcher; a caller handling one
+    message at a time may leave it out.
+
     Everything the event carries counts as read, the skipped older
     messages included: they were deliberately left out, and leaving them
     unread would quote them into every later event instead. The cursor
@@ -279,15 +355,25 @@ async def on_message(
     """
     if not registry.register(message.chat.id, chat_label(message)):
         return
+    # Before the early return: media nobody addressed still lands in the
+    # history that later events carry, and is worth describing there.
+    job = start_media(lens, message)
     if message.chat.type != "private" and not is_addressed(message, me):
         return
-    thread_id = event_thread_id(message)
-    topic_name = await db.topic_name(message.chat.id, thread_id) if thread_id else None
-    context = await event_context(db, message, tz)
-    await agent.push(
-        [format_event(message, tz, topic_name=topic_name), *context],
-        read_mark=(message.chat.id, message.message_id, thread_id),
-    )
+    async with order.lock(message.chat.id) if order else nullcontext():
+        note = await media_note_for(lens, job)
+        thread_id = event_thread_id(message)
+        topic_name = (
+            await db.topic_name(message.chat.id, thread_id) if thread_id else None
+        )
+        context = await event_context(db, message, tz)
+        await agent.push(
+            [
+                format_event(message, tz, topic_name=topic_name, media_note=note),
+                *context,
+            ],
+            read_mark=(message.chat.id, message.message_id, thread_id),
+        )
 
 
 @router.message_reaction()
@@ -497,7 +583,11 @@ async def run() -> None:
         db, settings.dream_daily_budget, settings.dream_cooldown_minutes
     )
     registry = ChatRegistry(settings.chats_path, settings.chat_approval)
-    agent = Agent(settings, db, bot, registry, dream_gate)
+    prompts = load_prompts(settings.prompts_path)
+    lens = MediaLens.from_settings(settings, prompts, db=db, bot=bot)
+    if lens is not None:
+        lens.ensure()
+    agent = Agent(settings, db, bot, registry, dream_gate, lens=lens, prompts=prompts)
     await agent.load()
     tz = agent.tz
     dreamer = Dreamer(settings, db, bot, agent, dream_gate)
@@ -512,7 +602,13 @@ async def run() -> None:
     ]
 
     dispatcher = Dispatcher(
-        agent=agent, tz=tz, me=await bot.me(), registry=registry, db=db
+        agent=agent,
+        tz=tz,
+        me=await bot.me(),
+        registry=registry,
+        db=db,
+        lens=lens,
+        order=ChatOrder(),
     )
     persist_middleware = PersistMiddleware(db)
     dispatcher.message.outer_middleware(persist_middleware)

@@ -28,8 +28,9 @@ from libertati.config import Settings
 from libertati.db import Database
 from libertati.dream import DreamGate
 from libertati.loop import ModelLoop
+from libertati.media import MediaLens
 from libertati.memory import Mind
-from libertati.prompts import load_prompts
+from libertati.prompts import Prompts, load_prompts
 from libertati.tools import Toolbox, build_tools
 
 log = logging.getLogger(__name__)
@@ -123,11 +124,18 @@ class Agent(ModelLoop):
         bot: Bot,
         registry: ChatRegistry,
         dream_gate: DreamGate | None = None,
+        lens: MediaLens | None = None,
+        prompts: Prompts | None = None,
     ) -> None:
-        """Create the API client, toolbox and the (empty) context window."""
+        """Create the API client, toolbox and the (empty) context window.
+
+        ``prompts`` are read from disk unless the caller has already done
+        so — the media lens needs its own prompt before the agent that
+        owns it exists, and one parse is enough for both.
+        """
         client = AsyncOpenAI(api_key=settings.api_key, base_url=settings.base_url)
         self.registry = registry
-        self.prompts = load_prompts(settings.prompts_path)
+        self.prompts = prompts or load_prompts(settings.prompts_path)
         self.base_prompt = self.prompts.system
         if settings.roleplay:
             self.base_prompt += "\n" + self.prompts.roleplay
@@ -157,9 +165,12 @@ class Agent(ModelLoop):
                 client=client,
                 mind=self.mind,
                 registry=registry,
+                lens=lens,
                 dream_gate=dream_gate if dreaming else None,
             ),
-            api_tools=build_tools(settings.web_search, dreaming=dreaming),
+            api_tools=build_tools(
+                settings.web_search, dreaming=dreaming, media=lens is not None
+            ),
             reasoning=cast(Reasoning, reasoning) if reasoning else omit,
             api_retries=settings.api_retries,
         )
