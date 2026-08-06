@@ -926,7 +926,12 @@ def valid_tool_arguments(name: str, args: object) -> bool:
     properties = schema["properties"]
     if not set(schema["required"]).issubset(args):
         return False
-    if schema.get("additionalProperties") is False and not set(args) <= set(properties):
+    # Every schema in the supported subset is closed, so an undeclared
+    # argument is invalid by definition. Rejecting it here rather than
+    # conditionally is also what keeps the per-property lookup below
+    # total: `Toolbox.run` calls this outside its own error handling and
+    # is documented never to raise.
+    if not set(args) <= set(properties):
         return False
     for key, value in args.items():
         parameter = properties[key]

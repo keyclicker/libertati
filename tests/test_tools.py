@@ -21,6 +21,7 @@ from libertati.tools import (
     GATED_CHAT_ARGS,
     MESSAGING_TOOLS,
     SLEEP_TOOLS,
+    TOOL_PARAMETER_SCHEMAS,
     TOOLS,
     TYPING_MAX_SECONDS,
     TYPING_MIN_SECONDS,
@@ -1130,6 +1131,21 @@ def test_every_chat_targeting_tool_is_gated() -> None:
         )
         gated = GATED_CHAT_ARGS.get(schema["name"], ())
         assert set(gated) == set(expected), schema["name"]
+
+
+def test_every_tool_schema_stays_in_the_validated_subset() -> None:
+    """Local validation only holds while every schema is a closed object.
+
+    ``valid_tool_arguments`` rejects undeclared arguments outright and
+    then looks each remaining key up in ``properties`` — a lookup that is
+    total only because no schema allows extras. It also assumes optional
+    parameters are nullable rather than absent, so ``required`` covers
+    every property.
+    """
+    for name, schema in TOOL_PARAMETER_SCHEMAS.items():
+        assert schema["type"] == "object", name
+        assert schema["additionalProperties"] is False, name
+        assert set(schema["required"]) == set(schema["properties"]), name
 
 
 async def test_remember_appends_and_confirms(tmp_path: Path) -> None:
