@@ -6,6 +6,7 @@ from types import SimpleNamespace
 from typing import Any, cast
 
 import httpx
+import pytest
 from openai import BadRequestError
 
 from libertati.agent import Agent
@@ -471,6 +472,31 @@ async def test_turn_chains_server_tool_and_duplicate_id_fallbacks() -> None:
     assert calls[1]["input"] != [EVENT, EVENT]
     assert calls[2]["tools"] == [function_tool]
     assert calls[2]["input"] == [EVENT, EVENT]
+
+
+async def test_turn_surfaces_the_provider_error_once_fallbacks_are_spent() -> None:
+    """A rejection no shed can answer reaches the caller as its own error.
+
+    Each fallback fires once; what follows must be the provider's own
+    message, not a synthetic "retries exhausted" that hides it.
+    """
+    agent, calls, _ = make_turn_agent(
+        [
+            bad_request("Duplicate tool call id in assistant message"),
+            bad_request("Server tool request failed"),
+            bad_request("Could not decrypt the provided encrypted_content"),
+        ],
+        [EVENT, CALL, CALL_OUTPUT, MESSAGE, EVENT],
+        api_tools=[
+            {"type": "function", "name": "send_message"},
+            {"type": "web_search"},
+        ],
+    )
+
+    with pytest.raises(BadRequestError, match="Could not decrypt"):
+        await agent._round("instructions", turn_id=None)
+
+    assert len(calls) == 3
 
 
 async def test_provider_fallback_preserves_tool_result_for_next_round() -> None:
