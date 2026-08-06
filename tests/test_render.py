@@ -113,6 +113,20 @@ def test_wakeup_event_names_its_alarm() -> None:
     assert block.plain.endswith("Check the flood topic.")
 
 
+def test_operator_instruction_separates_framing_from_words() -> None:
+    """What the operator typed reads apart from what the code said."""
+    item = event(
+        "[operator instruction #12 at Tue 2026-08-04 14:52 — from the console"
+        " you are run from, not from a chat] Leave the flood topic alone."
+    )
+
+    block = build_block(row(item))
+
+    assert block is not None
+    assert "operator instruction #12" in block.plain.splitlines()[0]
+    assert block.plain.endswith("Leave the flood topic alone.")
+
+
 def test_free_text_event_keeps_its_line() -> None:
     """An event that fits no known shape is shown as it was written."""
     item = event("something nobody planned for")

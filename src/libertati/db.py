@@ -147,6 +147,21 @@ CREATE TABLE IF NOT EXISTS wakeups (
 );
 
 CREATE INDEX IF NOT EXISTS idx_wakeups_due ON wakeups (done, due_at);
+
+-- Instructions typed at the operator console (the spy TUI) and waiting
+-- to be handed to the agent as events. The console is a separate
+-- process that shares nothing with the bot but this file, so the table
+-- is the channel; ``urgent`` picks between waiting for the running turn
+-- to end and landing between its rounds.
+CREATE TABLE IF NOT EXISTS steering (
+    id         INTEGER PRIMARY KEY AUTOINCREMENT,
+    text       TEXT NOT NULL,
+    urgent     INTEGER NOT NULL DEFAULT 0,
+    done       INTEGER NOT NULL DEFAULT 0,
+    created_at TEXT NOT NULL DEFAULT (datetime('now'))
+);
+
+CREATE INDEX IF NOT EXISTS idx_steering_pending ON steering (done, id);
 """
 
 
@@ -543,6 +558,50 @@ class Database:
         )
         await self.conn.commit()
         return cursor.rowcount > 0
+
+    async def add_steering(self, text: str, urgent: bool = False) -> int:
+        """Queue one operator instruction from the console; return its id."""
+        cursor = await self.conn.execute(
+            "INSERT INTO steering (text, urgent) VALUES (?, ?)",
+            (text, int(urgent)),
+        )
+        await self.conn.commit()
+        return cursor.lastrowid or 0
+
+    async def claim_steering(self, urgent: bool | None = None) -> list[aiosqlite.Row]:
+        """Take undelivered operator instructions, oldest first.
+
+        ``urgent`` selects one class of them (``True`` only the urgent
+        ones, ``False`` only the rest) or, left as ``None``, both.
+
+        Claiming and returning are one step: two deliverers race for
+        these rows — the background loop and the turn in flight — and a
+        row is only returned to whoever's ``UPDATE`` actually flipped it,
+        so an instruction cannot be delivered twice. The cost is the
+        opposite guarantee wakeups have: a crash between the claim and
+        the event being persisted drops it. Repeating an instruction is
+        worse than losing one you can see is still unread.
+        """
+        scope = "" if urgent is None else " AND urgent = ?"
+        params = () if urgent is None else (int(urgent),)
+        async with self.conn.execute(
+            f"SELECT id, text, urgent FROM steering WHERE done = 0{scope} ORDER BY id",
+            params,
+        ) as cursor:
+            pending = list(await cursor.fetchall())
+        claimed = []
+        for row in pending:
+            updated = await self.conn.execute(
+                "UPDATE steering SET done = 1 WHERE id = ? AND done = 0", (row["id"],)
+            )
+            if updated.rowcount > 0:
+                claimed.append(row)
+        # Only when an ``UPDATE`` actually ran. This is polled every few
+        # seconds on the connection everything else shares, and a commit
+        # on an empty poll would end a transaction someone else opened.
+        if pending:
+            await self.conn.commit()
+        return claimed
 
     #: Forum housekeeping messages, which nobody is waiting on an answer
     #: to. Inlined into SQL rather than bound, so the planner can see the

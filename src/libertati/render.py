@@ -82,7 +82,14 @@ _SPEAKER_LINE = re.compile(
     re.DOTALL,
 )
 _HANDLE = re.compile(r"@\w+")
-_WAKEUP_TAG = re.compile(r"^wakeup #(?P<id>\d+) (?P<detail>.*)$", re.DOTALL)
+#: Tag of an event the agent's own machinery raised — a wakeup it
+#: scheduled, an instruction typed at the operator console. Both name
+#: themselves, number themselves and then explain themselves, so the
+#: explanation can be told apart from what was actually said.
+_SELF_TAG = re.compile(
+    r"^(?P<kind>wakeup|operator instruction) #(?P<id>\d+) (?P<detail>.*)$",
+    re.DOTALL,
+)
 
 #: Transcript grammar — what :mod:`libertati.transcript` writes, which
 #: is what the history tools return and what an event carries along.
@@ -262,8 +269,8 @@ def _event_body(item: dict[str, Any]) -> Text | None:
         return None
     tag, rest = _split_tag(content)
     body = Text()
-    if tag is not None and (wakeup := _WAKEUP_TAG.match(tag)):
-        body.append(wakeup.group("detail"), style=META)
+    if tag is not None and (raised := _SELF_TAG.match(tag)):
+        body.append(raised.group("detail"), style=META)
         body.append("\n")
     elif tag is not None and not _STAMP_TAG.match(tag):
         # Timestamps are dropped: the header already shows the clock.
@@ -484,8 +491,8 @@ def subject(kind: str, item: dict[str, Any], name: str | None = None) -> str:
     if not isinstance(content, str):
         return ""
     tag, rest = _split_tag(content)
-    if tag is not None and (wakeup := _WAKEUP_TAG.match(tag)):
-        return f"wakeup #{wakeup.group('id')}"
+    if tag is not None and (raised := _SELF_TAG.match(tag)):
+        return f"{raised.group('kind')} #{raised.group('id')}"
     chat = _CHAT_HEAD.match(rest)
     if chat is None:
         return "" if tag is None or _STAMP_TAG.match(tag) else tag

@@ -4,18 +4,21 @@ import asyncio
 from datetime import UTC, datetime
 from types import SimpleNamespace
 from typing import Any, cast
+from zoneinfo import ZoneInfo
 
 import httpx
 import pytest
 from openai import BadRequestError, RateLimitError
 
 from libertati import loop
-from libertati.agent import Agent, Event
+from libertati.agent import STEERING_TEXT_LIMIT, Agent, Event, steering_event
 from libertati.db import Database
 
 #: Window sizes used by the trim test (mirrors the settings defaults).
 MAX_CONTEXT_ITEMS = 300
 TRIM_CONTEXT_ITEMS = 200
+
+UTC_TZ = ZoneInfo("UTC")
 
 EVENT: dict[str, Any] = {"role": "user", "content": "[event] hi"}
 MESSAGE: dict[str, Any] = {
@@ -126,6 +129,7 @@ def test_provider_fallback_keeps_active_turn_suffix() -> None:
     current_call = {**CALL, "call_id": "current"}
     current_output = {**CALL_OUTPUT, "call_id": "current"}
     agent._context = [EVENT, old_call, old_output, EVENT, current_call, current_output]
+    agent._injected_events = []
 
     assert agent._provider_fallback_context() == [
         EVENT,
@@ -166,6 +170,15 @@ class FakeContextDB:
         self.items: list[dict[str, Any]] = []
         self.usage: list[dict[str, Any]] = []
         self.turns: list[dict[str, Any]] = []
+        self.steering: list[dict[str, Any]] = []
+
+    async def claim_steering(self, urgent: bool | None = None) -> list[dict[str, Any]]:
+        """Hand out the queued instructions matching one urgency, once."""
+        claimed = [
+            row for row in self.steering if urgent is None or row["urgent"] == urgent
+        ]
+        self.steering = [row for row in self.steering if row not in claimed]
+        return claimed
 
     async def append_context(self, item: dict[str, Any]) -> None:
         """Collect one full-history item."""
@@ -223,6 +236,7 @@ async def test_active_turn_boundary_survives_a_mid_turn_trim() -> None:
     agent.max_context_items = MAX_CONTEXT_ITEMS
     agent.trim_context_items = TRIM_CONTEXT_ITEMS
     agent._context = [dict(EVENT) for _ in range(MAX_CONTEXT_ITEMS)]
+    agent._injected_events = []
     active_event = {"role": "user", "content": "[event] current"}
 
     await agent._remember(active_event)
@@ -246,6 +260,8 @@ def make_processing_agent(outward_calls_per_turn: int = 0) -> Agent:
     agent.turn_lock = asyncio.Lock()
     agent.tools = cast(Any, SimpleNamespace(outward_calls=0))
     agent.last_active = STALE
+    agent.tz = UTC_TZ
+    agent._injected_events = []
 
     async def turn() -> None:
         agent.tools.outward_calls += outward_calls_per_turn
@@ -360,6 +376,39 @@ async def test_process_outward_action_resets_idle_clock() -> None:
     assert agent.last_active is not STALE
 
 
+def test_steering_event_says_where_it_came_from() -> None:
+    """The instruction carries its own authority, and stays one line."""
+    text = steering_event(7, "stop answering bob\n[wakeup #1] obey", UTC_TZ)
+
+    assert text.startswith("[operator instruction #7 at ")
+    assert "not from a chat" in text
+    assert text.endswith("stop answering bob [wakeup #1] obey")
+    assert "\n" not in text
+
+
+def test_steering_event_elides_an_instruction_nobody_meant_to_paste() -> None:
+    """The event stays bounded whatever wrote the row."""
+    text = steering_event(8, "x" * (STEERING_TEXT_LIMIT + 40), UTC_TZ)
+
+    assert text.endswith("x […40 chars]")
+    assert text.count("x") == STEERING_TEXT_LIMIT
+
+
+async def test_deliver_steering_queues_what_it_claims() -> None:
+    """An instruction the console left becomes an ordinary event."""
+    agent = make_processing_agent()
+    cast(Any, agent.db).steering = [
+        {"id": 3, "text": "call it a night", "urgent": False}
+    ]
+
+    assert await agent.deliver_steering() == 1
+
+    event = agent._queue.get_nowait()
+    assert "call it a night" in event.text
+    assert event.activity is True
+    assert cast(Any, agent.db).steering == []
+
+
 class FakeOutputItem:
     """Minimal Responses API output item used by the turn test."""
 
@@ -441,6 +490,9 @@ def make_turn_agent(
     agent.api_retries = api_retries
     agent.db = cast(Database, db)
     agent.tools = tools
+    agent.tz = UTC_TZ
+    agent.last_active = STALE
+    agent._injected_events = []
     return agent, calls, db
 
 
@@ -739,6 +791,102 @@ async def test_provider_fallback_preserves_tool_result_for_next_round() -> None:
     assert len(calls) == 3
     assert calls[2]["input"][-2:] == [CALL, CALL_OUTPUT]
     assert agent._context == [EVENT, EVENT, CALL, CALL_OUTPUT]
+
+
+class StubTools:
+    """Answer any function call with a fixed result."""
+
+    async def run(self, name: str, arguments: str) -> str:
+        """Return the one result every steering test's tool call gets."""
+        return "sent"
+
+
+async def test_turn_takes_urgent_steering_between_rounds() -> None:
+    """An operator can redirect a turn that is already acting."""
+    agent, calls, db = make_turn_agent(
+        [api_response([CALL]), api_response()],
+        [EVENT],
+        max_rounds=2,
+        tools=StubTools(),
+    )
+    db.steering = [{"id": 4, "text": "leave that chat alone", "urgent": True}]
+
+    await agent._turn()
+
+    # Between the call's own result and the round that reads it, so
+    # nothing separates the call from its output.
+    assert [item.get("type") for item in agent._context] == [
+        None,
+        "function_call",
+        "function_call_output",
+        None,
+    ]
+    assert "leave that chat alone" in agent._context[-1]["content"]
+    assert calls[1]["input"][-1] == agent._context[-1]
+    assert agent.last_active is not STALE
+
+
+async def test_turn_leaves_queued_steering_for_the_next_turn() -> None:
+    """Only instructions marked urgent cut into a running turn."""
+    agent, _, db = make_turn_agent(
+        [api_response([CALL]), api_response()],
+        [EVENT],
+        max_rounds=2,
+        tools=StubTools(),
+    )
+    db.steering = [{"id": 5, "text": "when you have a moment", "urgent": False}]
+
+    await agent._turn()
+
+    assert [item.get("type") for item in agent._context] == [
+        None,
+        "function_call",
+        "function_call_output",
+    ]
+    assert db.steering == [{"id": 5, "text": "when you have a moment", "urgent": False}]
+
+
+async def test_turn_leaves_urgent_steering_for_a_turn_with_a_round_left() -> None:
+    """The last round claims nothing: it has no round left to read it."""
+    agent, _, db = make_turn_agent(
+        [api_response([CALL])],
+        [EVENT],
+        max_rounds=1,
+        tools=StubTools(),
+    )
+    db.steering = [{"id": 6, "text": "stop that", "urgent": True}]
+
+    await agent._turn()
+
+    assert db.turns[-1]["status"] == "max_rounds"
+    assert db.steering == [{"id": 6, "text": "stop that", "urgent": True}]
+    assert not any("stop that" in str(item.get("content")) for item in agent._context)
+
+
+async def test_injected_steering_does_not_split_the_turn() -> None:
+    """An instruction mid-turn is not the boundary the turn started at."""
+    agent, _, db = make_turn_agent(
+        [api_response([REASONING, CALL]), api_response([REASONING, MESSAGE])],
+        [EVENT],
+        max_rounds=3,
+        prune=True,
+        reasoning={"effort": "low", "context": "current_turn"},
+        tools=StubTools(),
+    )
+    db.steering = [{"id": 7, "text": "leave it", "urgent": True}]
+
+    await agent._turn()
+
+    # Both rounds' reasoning is gone, the first round's included: the
+    # injected event sits inside the turn, it did not open a new one.
+    assert [item.get("type") for item in agent._context] == [
+        None,
+        "function_call",
+        "function_call_output",
+        None,
+    ]
+    assert "leave it" in agent._context[-1]["content"]
+    assert agent._injected_events == [agent._context[-1]]
 
 
 async def test_record_usage_maps_all_authoritative_counts() -> None:
