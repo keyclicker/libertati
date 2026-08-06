@@ -985,6 +985,15 @@ async def test_search_messages_reports_no_matches() -> None:
     assert db.search_calls == [(1, "cat", 20, None)]
 
 
+async def test_search_messages_refuses_an_empty_query() -> None:
+    """A blank needle would match every row, not none."""
+    db = FakeDB()
+    args = {"chat_id": 1, "query": "  ", "limit": None, "message_thread_id": None}
+    result = await make_toolbox(db=db).run("search_messages", json.dumps(args))
+    assert result == "error: query must not be empty"
+    assert db.search_calls == []
+
+
 async def test_list_chats() -> None:
     """Chats come back as JSON; an empty list says so."""
     db = FakeDB()

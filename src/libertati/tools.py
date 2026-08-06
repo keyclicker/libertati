@@ -1431,11 +1431,19 @@ class Toolbox:
         return json.dumps(rows, ensure_ascii=False)
 
     async def _search_messages(self, args: dict[str, Any]) -> str:
-        """Return a chat's messages matching a substring as JSON."""
+        """Return a chat's messages matching a substring as JSON.
+
+        An empty needle is refused rather than passed down: SQLite's
+        ``instr`` reports it as a match in every row, so the search would
+        quietly hand back the newest messages as if they were hits.
+        """
+        query = args["query"].strip()
+        if not query:
+            return "error: query must not be empty"
         limit = max(1, min(args.get("limit") or 20, 50))
         rows = await self.db.search_messages(
             args["chat_id"],
-            args["query"],
+            query,
             limit,
             args.get("message_thread_id"),
         )
