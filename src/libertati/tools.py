@@ -90,8 +90,10 @@ MESSAGING_TOOLS: list[ToolParam] = [
         "type": "function",
         "name": "send_message",
         "description": (
-            "Send a Telegram message to a chat. This is the ONLY way to "
-            "actually say something; plain text output sends nothing."
+            "Send a Telegram message to a chat. The ONLY way to say "
+            "anything to anyone: text you write outside this tool is "
+            "private thinking that reaches nobody, however it is "
+            "phrased. If you meant it for a person, it goes here."
         ),
         "parameters": {
             "type": "object",
@@ -650,9 +652,10 @@ MEMORY_TOOLS: list[ToolParam] = [
         "type": "function",
         "name": "recall",
         "description": (
-            "Ask your long-term memory a question. Use before answering "
-            "anything that depends on the past beyond what you currently "
-            "see: names, preferences, promises, earlier plans."
+            "Ask your long-term memory a question: names, preferences, "
+            "promises, earlier plans, what you have concluded. It reads "
+            "your saved notes and has never seen a chat — for what was "
+            "actually said, use get_recent_messages or search_messages."
         ),
         "parameters": {
             "type": "object",
