@@ -5,8 +5,8 @@ import sqlite3
 
 import pytest
 
+from libertati.render import TRUNCATE_AT
 from libertati.spy import (
-    TRUNCATE_AT,
     SpyApp,
     Usage,
     build_block,
@@ -161,7 +161,8 @@ def test_internal_input_message_renders_legacy_string_content() -> None:
 
     assert block is not None
     assert "INTERNAL INPUT" in block.plain
-    assert "[delivery correction] legacy" in block.plain
+    # The tag becomes the first line; the text it prefixed follows it.
+    assert block.plain.endswith("delivery correction\nlegacy")
 
 
 def test_estimate_scales_with_script_and_shape() -> None:

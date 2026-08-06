@@ -88,7 +88,12 @@ uv run pytest             # tests
 uv run libertati-spy      # live full-screen view of the agent's context
 ```
 
-`libertati-spy` tails the context table as it is written. Navigation is
+`libertati-spy` tails the context table as it is written. Every item is
+laid out by kind: chat events split into chat, speaker and text, tool
+calls list their arguments (long ones as their own block), a
+`get_recent_messages` result reads as one row per message rather than as
+a JSON dump, and a web search lists the queries it ran. Anything that
+does not fit its shape falls back to the plain body. Navigation is
 vim-like: `j`/`k` and `ctrl+e`/`ctrl+y` by line, `ctrl+d`/`ctrl+u` by
 half a screen, `ctrl+f`/`ctrl+b` by screen, `g`/`G` for the ends,
 `/`, `?`, `n`, `N` to search (smartcase, highlighted), `f` to un-truncate

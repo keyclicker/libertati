@@ -1,8 +1,8 @@
 """Dev TUI: live spy on the agent's context (``libertati-spy``).
 
 Tails the ``context`` table in a full-screen viewer: external events,
-hidden reasoning, tool calls/results and private final output, each
-styled by kind. Navigation is vim-like — ``j``/``k``, ``ctrl+e``/
+hidden reasoning, tool calls/results and private final output, each laid
+out by kind (:mod:`libertati.render`). Navigation is vim-like — ``j``/``k``, ``ctrl+e``/
 ``ctrl+y``, ``ctrl+d``/``ctrl+u``, ``ctrl+f``/``ctrl+b``, ``g``/``G`` —
 with ``/``, ``?``, ``n``, ``N`` search and ``f`` to un-truncate bodies.
 
@@ -21,7 +21,6 @@ dependencies; run via ``uv run libertati-spy``.
 """
 
 import argparse
-import json
 import re
 import sqlite3
 from dataclasses import dataclass, field
@@ -40,39 +39,13 @@ from textual.strip import Strip
 from textual.widgets import Input, Static
 
 from libertati.config import Settings
-
-#: Header style and label per item kind.
-KINDS = {
-    "event": ("cyan", "EVENT"),
-    "internal_message": ("bright_black", "INTERNAL INPUT"),
-    "reasoning": ("bright_black", "REASONING"),
-    "message": ("yellow", "FINAL OUTPUT"),
-    "function_call": ("magenta", "TOOL CALL"),
-    "function_call_output": ("blue", "TOOL RESULT"),
-    "web_search_call": ("green", "WEB SEARCH"),
-    "other": ("white", "OTHER"),
-}
-
-#: Body truncation limit until ``f`` toggles full bodies.
-TRUNCATE_AT = 600
+from libertati.render import Row, build_block, call_name, decode, estimate_tokens
 
 #: Seconds between polls for newly appended context rows.
 POLL_SECONDS = 0.5
 
 #: History pages a single search may pull in before giving up.
 SEARCH_PAGES = 20
-
-#: UTF-8 bytes per o200k token, by content shape. ASCII in the context
-#: is mostly dense JSON framing; multi-byte text is mostly Cyrillic and
-#: emoji; reasoning items are base64 blobs, which pack far more tokens
-#: per byte than anything else here.
-ASCII_BYTES_PER_TOKEN = 2.8
-WIDE_BYTES_PER_TOKEN = 5.0
-BASE64_BYTES_PER_TOKEN = 1.5
-
-_NON_ASCII = re.compile(r"[^\x00-\x7f]")
-
-Row = tuple[int, str, str]
 
 
 @dataclass(frozen=True)
@@ -87,64 +60,7 @@ class Usage:
     context_id: int
 
 
-def estimate_tokens(raw: str, kind: str) -> int:
-    """Estimate what one raw context item costs as API input.
-
-    Byte-length based rather than tokenizer based: loading a real BPE
-    table costs seconds of startup for numbers that are approximate
-    anyway (encrypted reasoning bills as its hidden original, not as the
-    base64 that is actually sent).
-    """
-    size = len(raw.encode())
-    if kind == "reasoning":
-        return round(size / BASE64_BYTES_PER_TOKEN)
-    if raw.isascii():
-        return round(size / ASCII_BYTES_PER_TOKEN)
-    narrow = len(_NON_ASCII.sub("", raw))
-    return round(
-        narrow / ASCII_BYTES_PER_TOKEN + (size - narrow) / WIDE_BYTES_PER_TOKEN
-    )
-
-
-def classify(item: dict[str, Any]) -> str:
-    """Map a raw context item to one of the ``KINDS``."""
-    if item.get("role") == "user" and "type" not in item:
-        return "event"
-    if item.get("role") == "user" and item.get("type") == "message":
-        return "internal_message"
-    kind = item.get("type", "other")
-    return kind if kind in KINDS else "other"
-
-
-def body_text(kind: str, item: dict[str, Any]) -> str:
-    """Extract the human-interesting body of an item, by kind."""
-    if kind == "event":
-        return str(item.get("content", ""))
-    if kind == "reasoning":
-        parts = [s.get("text", "") for s in item.get("summary", [])]
-        return "\n".join(p for p in parts if p) or "(hidden)"
-    if kind in {"message", "internal_message"}:
-        parts = item.get("content", [])
-        if isinstance(parts, str):
-            return parts
-        return "\n".join(
-            p.get("text", "") or p.get("refusal", "")
-            for p in parts
-            if isinstance(p, dict)
-            and p.get("type") in {"input_text", "output_text", "refusal"}
-        )
-    if kind == "function_call":
-        args = item.get("arguments") or "{}"
-        try:
-            args = json.dumps(json.loads(args), ensure_ascii=False)
-        except json.JSONDecodeError:
-            pass
-        return f"{item.get('name', '?')} {args}"
-    if kind == "function_call_output":
-        return str(item.get("output", ""))
-    if kind == "web_search_call":
-        return json.dumps(item.get("action", {}), ensure_ascii=False)
-    return json.dumps(item, ensure_ascii=False)
+# ===== Timestamps =====
 
 
 def parse_stamp(created_at: str) -> datetime | None:
@@ -181,35 +97,17 @@ def age_text(created_at: str) -> str:
     return f"{seconds // 3600}h {seconds % 3600 // 60}m"
 
 
-def build_block(
+def render_row(
     row: Row,
     full: bool = False,
     pattern: re.Pattern[str] | None = None,
+    name: str | None = None,
 ) -> Text | None:
-    """Render one context row, or ``None`` for empty output envelopes."""
-    row_id, created_at, raw = row
-    try:
-        item = json.loads(raw)
-    except json.JSONDecodeError:
-        item = {"type": "other", "unparsed": raw}
-    kind = classify(item)
-    color, label = KINDS[kind]
-    body = body_text(kind, item)
-    if kind == "message" and not body:
-        return None
-    if not full and len(body) > TRUNCATE_AT:
-        body = f"{body[:TRUNCATE_AT]} […{len(body) - TRUNCATE_AT} chars]"
-    block = Text()
-    block.append(f"#{row_id} ", style="bold bright_black")
-    block.append(label, style=f"bold {color}")
-    block.append(
-        f"  {local_clock(created_at)}  ~{estimate_tokens(raw, kind)} tok\n",
-        style="bright_black",
-    )
-    block.append(body, style="default" if kind == "event" else color)
-    if pattern is not None:
-        block.highlight_regex(pattern, style="reverse")
-    return block
+    """Render one stored row, stamped with its local arrival time."""
+    return build_block(row, full, pattern, local_clock(row[1]), name)
+
+
+# ===== Queries =====
 
 
 def source(dream_id: int | None) -> tuple[str, str, tuple[int, ...]]:
@@ -367,6 +265,9 @@ def predict_context(
     return _estimate_rows(window) or None
 
 
+# ===== Status =====
+
+
 def build_status(
     last_id: int,
     last_activity: str | None,
@@ -411,6 +312,9 @@ def build_status(
             style="bright_black",
         )
     return status
+
+
+# ===== View =====
 
 
 @dataclass
@@ -482,6 +386,8 @@ class ContextView(ScrollView):
         self.lines: list[Strip] = []
         self.oldest_id: int | None = None
         self.has_older = True
+        # A tool result names no tool; the call that opened it does.
+        self.call_names: dict[str, str] = {}
         self._paging = False
 
     def switch(self, dream_id: int | None) -> None:
@@ -495,6 +401,7 @@ class ContextView(ScrollView):
         self.lines = []
         self.oldest_id = None
         self.has_older = True
+        self.call_names = {}
         self._resize_virtual()
         self.refresh()
 
@@ -601,7 +508,16 @@ class ContextView(ScrollView):
         blocks: list[Block] = []
         line = start
         for row in rows:
-            text = build_block(row, self.full, self.pattern)
+            item = decode(row[2])
+            named = call_name(item)
+            if named is not None:
+                self.call_names[named[0]] = named[1]
+            text = render_row(
+                row,
+                self.full,
+                self.pattern,
+                self.call_names.get(str(item.get("call_id", ""))),
+            )
             if text is None:
                 continue
             rendered = self.app.console.render_lines(text, options, pad=False)
@@ -695,6 +611,9 @@ class ContextView(ScrollView):
     def action_scroll_end(self) -> None:
         """Jump to the latest item and resume following."""
         self.scroll_end(animate=False, immediate=True)
+
+
+# ===== App =====
 
 
 class SearchInput(Input):

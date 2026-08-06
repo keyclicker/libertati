@@ -43,6 +43,9 @@ One package, `src/libertati/`, no sub-packages:
 - `clock.py` — the only place timestamp formats live.
 - `spy.py` — standalone read-only TUI; must not import aiogram/openai
   at module level (keeps `libertati-spy` startup fast).
+- `render.py` — how the spy lays out one context item: a layout per
+  kind, each falling back to the generic body. Pure functions over
+  decoded items; no database, no terminal.
 
 ## Invariants to preserve
 
