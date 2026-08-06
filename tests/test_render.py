@@ -1,6 +1,7 @@
 """Tests for the per-kind context rendering."""
 
 import json
+import re
 
 from rich.style import Style
 
@@ -10,6 +11,7 @@ from libertati.render import (
     call_name,
     classify,
     render_body,
+    searchable,
     subject,
 )
 
@@ -24,6 +26,15 @@ def row(item: dict, row_id: int = 1) -> tuple[int, str, str]:
 def event(content: str) -> dict:
     """Build an external event item."""
     return {"role": "user", "content": content}
+
+
+def marks(text) -> list:
+    """Return the spans carrying the current-match mark."""
+    return [
+        span
+        for span in text.spans
+        if isinstance(span.style, Style) and span.style.meta.get("spy_cursor")
+    ]
 
 
 def styles_at(text, needle: str) -> list[Style]:
@@ -219,7 +230,7 @@ def test_web_search_lists_its_queries() -> None:
     assert block.plain.splitlines()[1:] == ["? libertarian кіт", "? SLOP"]
 
 
-# ===== Truncation =====
+# ===== Truncation, search marks =====
 
 
 def test_long_bodies_truncate_until_asked_for_in_full() -> None:
@@ -232,6 +243,66 @@ def test_long_bodies_truncate_until_asked_for_in_full() -> None:
     assert cut is not None and whole is not None
     assert "[…40 chars]" in cut.plain
     assert "chars]" not in whole.plain
+
+
+def test_a_matched_body_is_never_left_truncated() -> None:
+    """A hit past the truncation point pulls the whole body into view."""
+    item = event("z" * (TRUNCATE_AT + 40) + " needle")
+
+    block = build_block(row(item), pattern=re.compile("needle"))
+
+    assert block is not None
+    assert "needle" in block.plain
+
+
+def test_the_current_hit_is_marked_apart_from_the_others() -> None:
+    """Every hit is highlighted; the one under the cursor carries the mark."""
+    item = event("needle and needle again")
+    pattern = re.compile("needle")
+
+    block = build_block(row(item), pattern=pattern, cursor=1)
+
+    assert block is not None
+    first, second = list(pattern.finditer(block.plain))
+    marked = marks(block)
+    assert [(span.start, span.end) for span in marked] == [
+        (second.start(), second.end())
+    ]
+    assert any(span.start == first.start() for span in block.spans)
+
+
+def test_search_covers_the_headline_a_layout_moved_out_of_the_body() -> None:
+    """A tool name shown only in the header is still findable, and marked."""
+    item = {
+        "type": "function_call",
+        "name": "dream",
+        "call_id": "call_6",
+        "arguments": "{}",
+    }
+    pattern = re.compile("dream")
+
+    text = searchable(json.dumps(item))
+    block = build_block(row(item), pattern=pattern, cursor=0)
+
+    assert text.startswith("dream\n")
+    assert block is not None
+    marked = marks(block)
+    assert len(marked) == 1
+    assert block.plain[marked[0].start : marked[0].end] == "dream"
+
+
+def test_a_result_headline_borrowed_from_its_call_is_not_indexed() -> None:
+    """A tool result carries its call's name, which its own row cannot match."""
+    item = {"type": "function_call_output", "call_id": "call_7", "output": "done"}
+    pattern = re.compile("send_message")
+
+    text = searchable(json.dumps(item))
+    block = build_block(row(item), pattern=pattern, name="send_message")
+
+    assert "send_message" not in text
+    assert block is not None
+    assert "send_message" in block.plain
+    assert not [span for span in block.spans if span.style == Style(reverse=True)]
 
 
 # ===== Plumbing =====

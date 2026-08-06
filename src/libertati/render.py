@@ -17,6 +17,7 @@ import re
 from datetime import datetime
 from typing import Any
 
+from rich.style import Style
 from rich.text import Text
 
 #: Header style and label per item kind.
@@ -43,6 +44,14 @@ QUERY = "green"
 ERROR = "bold red"
 INCOMING = "cyan"
 OUTGOING = "green"
+
+#: Every hit of the active search is reversed; the one the cursor sits
+#: on is marked as well, so :mod:`libertati.spy` can find the line it
+#: was rendered onto without redoing the layout by hand.
+MATCH = Style(reverse=True)
+CURRENT_MATCH = Style(
+    reverse=True, bold=True, underline=True, meta={"spy_cursor": True}
+)
 
 #: Body truncation limit until ``f`` toggles full bodies.
 TRUNCATE_AT = 600
@@ -474,34 +483,66 @@ def call_name(item: dict[str, Any]) -> tuple[str, str] | None:
     return None
 
 
+def searchable(raw: str) -> str:
+    """Return everything of one stored row a search may match.
+
+    The headline comes first, then the body — the order the highlights
+    are numbered in, and the reason ``/send_message`` finds a call whose
+    name the layout moved out of the body and into the header. Only the
+    part of the headline the item itself carries counts: a tool result
+    is labelled with the name of the call that opened it, which lives in
+    another row and so cannot be indexed from this one.
+    """
+    item = decode(raw)
+    kind = classify(item)
+    return f"{subject(kind, item)}\n{render_body(kind, item).plain}"
+
+
 def build_block(
     row: Row,
     full: bool = False,
     pattern: re.Pattern[str] | None = None,
     clock: str = "",
     name: str | None = None,
+    cursor: int | None = None,
 ) -> Text | None:
-    """Render one context row, or ``None`` for empty output envelopes."""
+    """Render one context row, or ``None`` for empty output envelopes.
+
+    ``cursor`` picks one occurrence of ``pattern`` inside this row to
+    mark as the current search hit, numbered exactly as
+    :func:`searchable` counts them: headline first, then body.
+    """
     row_id, _, raw = row
     item = decode(raw)
     kind = classify(item)
     color, label = KINDS[kind]
+    own = subject(kind, item)
     headline = subject(kind, item, name)
     body = render_body(kind, item)
     if kind == "message" and not body.plain:
         return None
+    if pattern is not None and pattern.search(body.plain):
+        full = True  # a hit the search found must be a hit you can see
     if not full and len(body.plain) > TRUNCATE_AT:
         cut = len(body.plain) - TRUNCATE_AT
         body = body[:TRUNCATE_AT]
         body.append(f" […{cut} chars]", style=META)
+    head_spans = list(pattern.finditer(own)) if pattern is not None and own else []
+    if pattern is not None:
+        for index, span in enumerate(pattern.finditer(body.plain)):
+            style = CURRENT_MATCH if index + len(head_spans) == cursor else MATCH
+            body.stylize(style, span.start(), span.end())
     block = Text()
     block.append(f"#{row_id} ", style=f"bold {META}")
     block.append(label, style=f"bold {color}")
     if headline:
+        offset = len(block.plain) + 2
         block.append(f"  {headline}", style=color)
+        # Only the item's own headline is indexed, so only it is marked.
+        for index, span in enumerate(head_spans if headline == own else []):
+            style = CURRENT_MATCH if index == cursor else MATCH
+            block.stylize(style, offset + span.start(), offset + span.end())
     block.append(f"  {clock}" if clock else "", style=META)
     block.append(f"  ~{estimate_tokens(raw, kind)} tok\n", style=META)
     block.append_text(body)
-    if pattern is not None:
-        block.highlight_regex(pattern, style="reverse")
     return block

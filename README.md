@@ -99,6 +99,15 @@ half a screen, `ctrl+f`/`ctrl+b` by screen, `g`/`G` for the ends,
 `/`, `?`, `n`, `N` to search (smartcase, highlighted), `f` to un-truncate
 long bodies, `q` to quit. Older history pages in as you scroll up.
 
+Search covers the whole stored context, not the part currently on
+screen: the pattern is indexed occurrence by occurrence out of the
+database, `n`/`N` step through those occurrences (paging history in when
+the next one is older than what is loaded), the hit under the cursor is
+underlined apart from the other highlights, and the status line counts
+your position (`match 4/109`). A body long enough to be truncated is
+shown in full when the pattern matched inside it, and a wrap around the
+ends says so the way vim does.
+
 `d` switches to a dream's context and back. While you are at the bottom
 and have not pressed `d`, a starting dream is followed on its own and let
 go again on waking, so leaving the viewer open shows the dream as it

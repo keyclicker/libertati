@@ -2,9 +2,16 @@
 
 Tails the ``context`` table in a full-screen viewer: external events,
 hidden reasoning, tool calls/results and private final output, each laid
-out by kind (:mod:`libertati.render`). Navigation is vim-like — ``j``/``k``, ``ctrl+e``/
-``ctrl+y``, ``ctrl+d``/``ctrl+u``, ``ctrl+f``/``ctrl+b``, ``g``/``G`` —
-with ``/``, ``?``, ``n``, ``N`` search and ``f`` to un-truncate bodies.
+out by kind (:mod:`libertati.render`). Navigation is vim-like —
+``j``/``k``, ``ctrl+e``/``ctrl+y``, ``ctrl+d``/``ctrl+u``, ``ctrl+f``/
+``ctrl+b``, ``g``/``G`` — with ``/``, ``?``, ``n``, ``N`` search and
+``f`` to un-truncate bodies.
+
+Search runs over the whole stored history, not the part that happens to
+be on screen: a pattern is indexed occurrence by occurrence out of the
+database, ``n``/``N`` step through those occurrences in order (paging
+history in as they go), the one under the cursor is marked apart from
+the rest, and the status line counts them.
 
 ``d`` switches to a dream's context (``dream_context``) and back; while
 nothing is pinned and the view is following, a starting dream is picked
@@ -29,6 +36,7 @@ from pathlib import Path
 from typing import Any, ClassVar, cast
 
 from pydantic import ValidationError
+from rich.segment import Segment
 from rich.text import Text
 from textual import events
 from textual.app import App, ComposeResult
@@ -39,13 +47,25 @@ from textual.strip import Strip
 from textual.widgets import Input, Static
 
 from libertati.config import Settings
-from libertati.render import Row, build_block, call_name, decode, estimate_tokens
+from libertati.render import (
+    Row,
+    build_block,
+    call_name,
+    decode,
+    estimate_tokens,
+    searchable,
+)
 
 #: Seconds between polls for newly appended context rows.
 POLL_SECONDS = 0.5
 
-#: History pages a single search may pull in before giving up.
-SEARCH_PAGES = 20
+#: History pages one jump may page in before giving up. Generous on
+#: purpose: the cap exists so a pathological database cannot hang the
+#: viewer, not to bound how far back a search may reach.
+SEARCH_PAGES = 500
+
+#: Rows read at a time while indexing a pattern.
+SCAN_CHUNK = 500
 
 
 @dataclass(frozen=True)
@@ -58,6 +78,14 @@ class Usage:
     output_tokens: int
     reasoning_tokens: int
     context_id: int
+
+
+@dataclass(frozen=True)
+class Match:
+    """One occurrence of the active pattern: its row, and where in it."""
+
+    row_id: int
+    index: int
 
 
 # ===== Timestamps =====
@@ -102,9 +130,10 @@ def render_row(
     full: bool = False,
     pattern: re.Pattern[str] | None = None,
     name: str | None = None,
+    cursor: int | None = None,
 ) -> Text | None:
     """Render one stored row, stamped with its local arrival time."""
-    return build_block(row, full, pattern, local_clock(row[1]), name)
+    return build_block(row, full, pattern, local_clock(row[1]), name, cursor)
 
 
 # ===== Queries =====
@@ -149,6 +178,34 @@ def fetch_before(
         (*params, first_id, limit),
     ).fetchall()
     return list(reversed(rows))
+
+
+def scan_matches(
+    conn: sqlite3.Connection,
+    pattern: re.Pattern[str],
+    dream_id: int | None = None,
+    after: int = 0,
+) -> list[Match]:
+    """Index every occurrence of a pattern in the stored context.
+
+    The search space is the database, not the loaded window: the viewer
+    holds a tail of history, and a match older than that tail has to be
+    findable all the same. Occurrences are counted in the very body the
+    block renders, so counts and highlights cannot disagree.
+    """
+    table, scope, params = source(dream_id)
+    cursor = conn.execute(
+        f"SELECT id, item FROM {table} WHERE {scope} AND id > ? ORDER BY id",
+        (*params, after),
+    )
+    matches: list[Match] = []
+    while chunk := cursor.fetchmany(SCAN_CHUNK):
+        for row_id, raw in chunk:
+            matches.extend(
+                Match(row_id, index)
+                for index, _ in enumerate(pattern.finditer(searchable(raw)))
+            )
+    return matches
 
 
 #: Usage columns the status line needs, in :class:`Usage` field order.
@@ -276,6 +333,7 @@ def build_status(
     next_tokens: int | None = None,
     note: str = "",
     dream_id: int | None = None,
+    matches: tuple[int, int] | None = None,
 ) -> Text:
     """Build the two-line status: position on top, token figures below."""
     status = Text()
@@ -290,6 +348,12 @@ def build_status(
         "  FOLLOW" if following else "  SCROLLED",
         style="green" if following else "yellow",
     )
+    if matches is not None:
+        at, total = matches
+        status.append(
+            f"  match {at}/{total}" if at else f"  {total} matches",
+            style="bold blue",
+        )
     if note:
         status.append(f"  {note}", style="bright_black")
     status.append("\n")
@@ -325,11 +389,26 @@ class Block:
     plain: str
     start: int
     lines: list[Strip] = field(repr=False, default_factory=list)
+    cursor_line: int | None = None
 
     @property
     def height(self) -> int:
         """How many lines the block occupies."""
         return len(self.lines)
+
+
+def cursor_line(rendered: list[list[Segment]]) -> int | None:
+    """Find which rendered line carries the current-match mark.
+
+    The mark rides along as style metadata, so the line is read back off
+    the finished layout instead of being recomputed from character
+    offsets that word wrapping has already invalidated.
+    """
+    for index, line in enumerate(rendered):
+        for segment in line:
+            if segment.style is not None and segment.style.meta.get("spy_cursor"):
+                return index
+    return None
 
 
 class ContextView(ScrollView):
@@ -382,6 +461,7 @@ class ContextView(ScrollView):
         self.dream_id = dream_id
         self.full = False
         self.pattern: re.Pattern[str] | None = None
+        self.cursor: Match | None = None
         self.blocks: list[Block] = []
         self.lines: list[Strip] = []
         self.oldest_id: int | None = None
@@ -401,9 +481,17 @@ class ContextView(ScrollView):
         self.lines = []
         self.oldest_id = None
         self.has_older = True
+        self.cursor = None
         self.call_names = {}
         self._resize_virtual()
         self.refresh()
+
+    @property
+    def top_row_id(self) -> int | None:
+        """Row id of the block the viewport currently starts on."""
+        origin = self.scroll_offset.y
+        block = next((b for b in self.blocks if b.start + b.height > origin), None)
+        return block.row[0] if block else None
 
     def append(self, rows: list[Row]) -> None:
         """Append newly arrived rows, keeping the follow position."""
@@ -458,46 +546,61 @@ class ContextView(ScrollView):
     def set_pattern(self, pattern: re.Pattern[str] | None) -> None:
         """Set (or clear) the highlighted search pattern."""
         self.pattern = pattern
+        self.cursor = None
         self._rebuild()
 
-    def search(self, backward: bool) -> bool:
-        """Jump to the next block matching the pattern; vim semantics."""
-        if self.pattern is None or not self.blocks:
+    # ----- Search -----
+
+    def reveal(self, match: Match) -> bool:
+        """Put one occurrence on screen and mark it as the current hit.
+
+        History pages in until the row is loaded, so a match the index
+        found in the database is reachable even when it sits thousands
+        of rows behind the tail the viewer opened on.
+        """
+        if not self._ensure_loaded(match.row_id):
             return False
-        origin = self.scroll_offset.y
-        if backward:
-            target = self._search_backward(origin)
-        else:
-            target = next(
-                (b for b in self.blocks if b.start > origin and self._matches(b)), None
-            )
-        if target is None:  # wrap around the loaded buffer, like vim
-            matches = [b for b in self.blocks if self._matches(b)]
-            target = (matches[-1] if backward else matches[0]) if matches else None
-        if target is None:
+        previous = self.cursor
+        self.cursor = match
+        self._restyle({match.row_id} | ({previous.row_id} if previous else set()))
+        block = next((b for b in self.blocks if b.row[0] == match.row_id), None)
+        if block is None:
             return False
-        self.scroll_to(y=target.start, animate=False, immediate=True)
+        # A third of a screen of lead-in, so the hit arrives together
+        # with the header that says which item it is in.
+        margin = self.scrollable_content_region.height // 3
+        line = block.start + (block.cursor_line or 0)
+        self.scroll_to(y=max(0, line - margin), animate=False, immediate=True)
         return True
 
-    def _search_backward(self, origin: int) -> Block | None:
-        """Look backwards, pulling in history until a match or the start."""
+    def _ensure_loaded(self, row_id: int) -> bool:
+        """Page history in until ``row_id`` is among the loaded blocks."""
         for _ in range(SEARCH_PAGES):
-            match = next(
-                (
-                    b
-                    for b in reversed(self.blocks)
-                    if b.start < origin and self._matches(b)
-                ),
-                None,
-            )
-            if match is not None or not self.has_older:
-                return match
-            origin += self.load_older()
-        return None
+            if self.oldest_id is not None and row_id >= self.oldest_id:
+                return True
+            if not self.has_older or not self.load_older():
+                break
+        return self.oldest_id is not None and row_id >= self.oldest_id
 
-    def _matches(self, block: Block) -> bool:
-        """Whether a block's rendered text contains the search pattern."""
-        return self.pattern is not None and self.pattern.search(block.plain) is not None
+    def _restyle(self, row_ids: set[int]) -> None:
+        """Re-render the given blocks in place, keeping the layout.
+
+        Only the cursor mark changes, so heights hold; should one move
+        anyway, the whole buffer is rebuilt rather than left torn.
+        """
+        for block in self.blocks:
+            if block.row[0] not in row_ids:
+                continue
+            rebuilt = self._build([block.row], start=block.start)
+            if len(rebuilt) != 1 or rebuilt[0].height != block.height:
+                self._rebuild()
+                return
+            block.lines = rebuilt[0].lines
+            block.cursor_line = rebuilt[0].cursor_line
+            self.lines[block.start : block.start + block.height] = block.lines
+        self.refresh()
+
+    # ----- Rendering -----
 
     def _build(self, rows: list[Row], start: int) -> list[Block]:
         """Render rows to strips, laid out from line ``start``."""
@@ -512,18 +615,28 @@ class ContextView(ScrollView):
             named = call_name(item)
             if named is not None:
                 self.call_names[named[0]] = named[1]
+            marked = self.cursor is not None and self.cursor.row_id == row[0]
             text = render_row(
                 row,
                 self.full,
                 self.pattern,
                 self.call_names.get(str(item.get("call_id", ""))),
+                self.cursor.index if marked and self.cursor else None,
             )
             if text is None:
                 continue
             rendered = self.app.console.render_lines(text, options, pad=False)
             lines = [Strip(segments).adjust_cell_length(width) for segments in rendered]
             lines.append(Strip.blank(width))  # one blank line between blocks
-            blocks.append(Block(row, text.plain, line, lines))
+            blocks.append(
+                Block(
+                    row,
+                    text.plain,
+                    line,
+                    lines,
+                    cursor_line(rendered) if marked else None,
+                )
+            )
             line += len(lines)
         return blocks
 
@@ -701,6 +814,11 @@ class SpyApp(App[None]):
         self.note = ""
         self.hint = ""
         self.search_backward = False
+        # Every occurrence of the active pattern in the stored history,
+        # and where in that list the cursor sits.
+        self.matches: list[Match] = []
+        self.match_at: int | None = None
+        self.scanned_id = 0
 
     @property
     def view(self) -> ContextView:
@@ -730,6 +848,7 @@ class SpyApp(App[None]):
             self.last_id = rows[-1][0]
             self.last_activity = rows[-1][1]
             self.view.append(rows)
+            self.extend_matches()
         usage = fetch_usage(self.conn, self.dream_id)
         if rows or usage != self.usage:
             self.usage = usage
@@ -774,9 +893,19 @@ class SpyApp(App[None]):
         self.usage = None
         self.next_tokens = None
         self.view.switch(dream_id)
+        # An index belongs to the context it was built from.
+        self.matches = []
+        self.match_at = None
+        self.scanned_id = 0
+        if self.view.pattern is not None:
+            self.index_matches(self.view.pattern)
 
     def update_status(self) -> None:
         """Redraw the status line."""
+        counts = None
+        if self.view.pattern is not None:
+            at = 0 if self.match_at is None else self.match_at + 1
+            counts = (at, len(self.matches))
         self.query_one("#status", Static).update(
             build_status(
                 self.last_id,
@@ -786,6 +915,7 @@ class SpyApp(App[None]):
                 self.next_tokens,
                 self.note or self.hint,
                 self.dream_id,
+                counts,
             )
         )
 
@@ -806,6 +936,8 @@ class SpyApp(App[None]):
                 self.open_dream(target)
         self.update_status()
 
+    # ----- Search -----
+
     def action_search(self, direction: str) -> None:
         """Open the search prompt."""
         self.search_backward = direction == "backward"
@@ -816,7 +948,7 @@ class SpyApp(App[None]):
         prompt.focus()
 
     def on_input_submitted(self, event: Input.Submitted) -> None:
-        """Run the typed search and close the prompt."""
+        """Index the typed search, close the prompt and jump to a hit."""
         pattern = event.value
         self.close_search()
         if not pattern:
@@ -829,19 +961,89 @@ class SpyApp(App[None]):
             self.update_status()
             return
         self.view.set_pattern(compiled)
-        self.action_repeat_search(self.search_backward)
+        self.index_matches(compiled)
+        self.jump_match(self.search_backward, first=True)
+
+    def index_matches(self, pattern: re.Pattern[str]) -> None:
+        """Index a pattern over the whole stored context."""
+        self.matches = scan_matches(self.conn, pattern, self.dream_id)
+        self.match_at = None
+        self.scanned_id = newest_id(self.conn, self.dream_id)
+
+    def extend_matches(self) -> None:
+        """Index the rows appended since the last scan, if searching."""
+        pattern = self.view.pattern
+        if pattern is None:
+            return
+        self.matches.extend(
+            scan_matches(self.conn, pattern, self.dream_id, self.scanned_id)
+        )
+        self.scanned_id = newest_id(self.conn, self.dream_id)
+
+    def jump_match(self, backward: bool, first: bool = False) -> None:
+        """Move the cursor to the next occurrence and put it on screen.
+
+        The first jump of a search starts from the row on screen; later
+        ones step through the index, wrapping the way vim does — and
+        saying so when they do.
+        """
+        if not self.matches:
+            self.note = "pattern not found"
+            self.update_status()
+            return
+        if first or self.match_at is None:
+            found = self._first_target(backward)
+            wrapped = found is None
+            target = (len(self.matches) - 1 if backward else 0) if wrapped else found
+        else:
+            target = self.match_at + (-1 if backward else 1)
+            wrapped = not 0 <= target < len(self.matches)
+            target %= len(self.matches)
+        self.match_at = target
+        if not self.view.reveal(self.matches[self.match_at]):
+            self.note = "match is older than the loaded history"
+        elif wrapped:
+            self.note = (
+                "search hit TOP, continuing at BOTTOM"
+                if backward
+                else "search hit BOTTOM, continuing at TOP"
+            )
+        else:
+            self.note = ""
+        self.update_status()
+
+    def _first_target(self, backward: bool) -> int | None:
+        """Index of the first occurrence from the row the viewport is on.
+
+        Inclusive of that row: a hit inside the item already on screen
+        is the nearest one there is, and skipping it to land further
+        away reads as the search having missed it.
+        """
+        top = self.view.top_row_id
+        if top is None:
+            return 0
+        if backward:
+            return next(
+                (
+                    i
+                    for i in reversed(range(len(self.matches)))
+                    if self.matches[i].row_id <= top
+                ),
+                None,
+            )
+        return next((i for i, m in enumerate(self.matches) if m.row_id >= top), None)
 
     def action_repeat_search(self, backward: bool) -> None:
         """Jump to the next (or previous) match of the active pattern."""
         if self.view.pattern is None:
             return
-        found = self.view.search(backward)
-        self.note = "" if found else "pattern not found"
-        self.update_status()
+        self.jump_match(backward)
 
     def action_clear_search(self) -> None:
-        """Drop the search highlight."""
+        """Drop the search highlight and its index."""
         self.view.set_pattern(None)
+        self.matches = []
+        self.match_at = None
         self.note = ""
         self.update_status()
 
