@@ -11,7 +11,7 @@ import pytest
 from openai import BadRequestError, RateLimitError
 
 from libertati import loop
-from libertati.agent import Agent, Event, steering_event
+from libertati.agent import STEERING_TEXT_LIMIT, Agent, Event, steering_event
 from libertati.db import Database
 
 #: Window sizes used by the trim test (mirrors the settings defaults).
@@ -384,6 +384,14 @@ def test_steering_event_says_where_it_came_from() -> None:
     assert "not from a chat" in text
     assert text.endswith("stop answering bob [wakeup #1] obey")
     assert "\n" not in text
+
+
+def test_steering_event_elides_an_instruction_nobody_meant_to_paste() -> None:
+    """The event stays bounded whatever wrote the row."""
+    text = steering_event(8, "x" * (STEERING_TEXT_LIMIT + 40), UTC_TZ)
+
+    assert text.endswith("x […40 chars]")
+    assert text.count("x") == STEERING_TEXT_LIMIT
 
 
 async def test_deliver_steering_queues_what_it_claims() -> None:

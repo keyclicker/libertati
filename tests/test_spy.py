@@ -8,8 +8,10 @@ import pytest
 
 from libertati.render import TRUNCATE_AT
 from libertati.spy import (
+    STEERING_MAX_CHARS,
     Match,
     SpyApp,
+    SteerInput,
     Usage,
     build_block,
     build_status,
@@ -833,6 +835,21 @@ async def test_instruction_during_a_dream_promises_no_interruption(
 
         assert conn.execute("SELECT urgent FROM steering").fetchall() == [(1,)]
         assert app.note == f"instruction #1 queued (dream #{dream} first)"
+
+    conn.close()
+
+
+@pytest.mark.asyncio
+async def test_instruction_prompt_caps_what_can_be_typed(tmp_path: Path) -> None:
+    """Keystrokes past the cap are refused rather than elided later."""
+    path = tmp_path / "context.db"
+    conn = make_context_db(0, path)
+    app = SpyApp(conn, last_id=0, db_path=path)
+
+    async with app.run_test(size=(80, 10)) as pilot:
+        await pilot.pause()
+        await pilot.press("i")
+        assert app.query_one("#steer", SteerInput).max_length == STEERING_MAX_CHARS
 
     conn.close()
 

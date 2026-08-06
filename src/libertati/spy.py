@@ -80,6 +80,12 @@ SCAN_CHUNK = 500
 #: normal and worth waiting out rather than reporting as a failure.
 STEERING_TIMEOUT = 5.0
 
+#: Longest instruction the prompt accepts. Mirrors ``STEERING_TEXT_LIMIT``
+#: on the bot side, which is what actually bounds the event; stopping the
+#: keystrokes here just means a long paste is visibly refused instead of
+#: silently elided later.
+STEERING_MAX_CHARS = 1000
+
 
 @dataclass(frozen=True)
 class Usage:
@@ -900,7 +906,7 @@ class SpyApp(App[None]):
         """Create the context view, both prompts and the status."""
         yield ContextView(self.conn, self.page_size, self.dream_id, id="context")
         yield SearchInput(id="search")
-        yield SteerInput(id="steer")
+        yield SteerInput(id="steer", max_length=STEERING_MAX_CHARS)
         yield Static(id="status")
 
     def on_mount(self) -> None:

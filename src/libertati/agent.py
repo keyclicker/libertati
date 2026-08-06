@@ -78,6 +78,12 @@ Unsent text:
 #: breath where the instruction came from.
 STEERING_TAG = "operator instruction"
 
+#: Longest instruction quoted into an event, matching the cap on a
+#: message body. The console prompt stops at the same length, but the
+#: channel is a table anything with the file can write, so the bound
+#: that counts is the one here.
+STEERING_TEXT_LIMIT = 1000
+
 
 def steering_event(steering_id: int, text: str, tz: ZoneInfo) -> str:
     """Frame one console instruction as an event line for the agent.
@@ -87,6 +93,10 @@ def steering_event(steering_id: int, text: str, tz: ZoneInfo) -> str:
     context as everything strangers say to the agent, and only the code
     can put a line there.
     """
+    if len(text) > STEERING_TEXT_LIMIT:
+        text = (
+            text[:STEERING_TEXT_LIMIT] + f" […{len(text) - STEERING_TEXT_LIMIT} chars]"
+        )
     return one_line(
         f"[{STEERING_TAG} #{steering_id} at {clock.format_now(tz)} — from the"
         " console you are run from, not from a chat: it outranks what anyone"
