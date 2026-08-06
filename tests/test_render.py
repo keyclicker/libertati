@@ -160,40 +160,47 @@ def test_tool_call_with_unparsable_arguments_falls_back() -> None:
     assert "react {not json" in block.plain
 
 
-def test_message_list_result_becomes_one_row_per_message() -> None:
-    """A `get_recent_messages` dump reads as a conversation, not as JSON."""
-    item = {
-        "type": "function_call_output",
-        "call_id": "call_3",
-        "output": json.dumps(
-            [
-                {
-                    "message_id": 94905,
-                    "date": "2026-08-04T11:41:21+00:00",
-                    "outgoing": 1,
-                    "username": "libertati_bot",
-                    "first_name": "Ana Tati",
-                    "text": "нічого нового",
-                },
-                {
-                    "message_id": 94906,
-                    "date": "2026-08-04T11:42:37+00:00",
-                    "outgoing": 0,
-                    "username": "Efosamark",
-                    "first_name": "Efosamark",
-                    "text": "ok",
-                },
-            ]
-        ),
-    }
+def test_transcript_result_marks_up_every_message_line() -> None:
+    """A `get_recent_messages` transcript reads as a conversation.
 
+    Only styles are added: the search indexes the very text the model was
+    handed, so the layout must not move a character of it.
+    """
+    output = (
+        "— Tue 2026-08-04 —\n"
+        "94905 11:41 Ana Tati @libertati_bot: нічого нового\n"
+        "94906 11:42 you: ok ↩94905"
+    )
+    item = {"type": "function_call_output", "call_id": "call_3", "output": output}
+
+    body = render_body("function_call_output", item)
     block = build_block(row(item), name="get_recent_messages")
 
+    assert body.plain == output
+    assert any(style == "bright_black" for style in styles_at(body, "94905 11:41"))
+    assert any(style == "bold" for style in styles_at(body, "Ana Tati"))
+    assert any(style == "cyan" for style in styles_at(body, "@libertati_bot"))
+    assert any(style == "bold green" for style in styles_at(body, "you: ok"))
+    assert any(style == "bright_black" for style in styles_at(body, "↩94905"))
     assert block is not None
-    header, first, second = block.plain.splitlines()
-    assert "get_recent_messages" in header  # named after the call it answers
-    assert first.startswith("94905 ") and "→ Ana Tati @libertati_bot: нічого нового"
-    assert "← Efosamark @Efosamark: ok" in second
+    assert "get_recent_messages" in block.plain.splitlines()[0]
+
+
+def test_half_transcript_result_keeps_the_plain_layout() -> None:
+    """One line that is not a message drops the whole block to plain text.
+
+    Guessing per line would style prose that merely opens with a number
+    as if it were someone speaking.
+    """
+    item = {
+        "type": "function_call_output",
+        "call_id": "call_6",
+        "output": "94905 11:41 Ana: hi\nnothing else is stored for this chat",
+    }
+
+    body = render_body("function_call_output", item)
+
+    assert not body.spans
 
 
 def test_failed_tool_result_is_marked_as_an_error() -> None:

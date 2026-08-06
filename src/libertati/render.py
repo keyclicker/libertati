@@ -2,7 +2,7 @@
 
 Every item type gets a layout of its own — chat events split into chat,
 speaker and text, tool calls list their arguments field by field,
-message-list results collapse to one row per message — and each layout
+transcript results mark up who said what line by line — and each layout
 falls back to the generic JSON-ish body whenever an item does not have
 the shape its renderer expects. The fallback is the format the viewer
 used before there were layouts at all, so an unknown item still reads.
@@ -14,11 +14,12 @@ the whole module testable on plain dictionaries.
 
 import json
 import re
-from datetime import datetime
 from typing import Any
 
 from rich.style import Style
 from rich.text import Text
+
+from libertati.transcript import SELF_SENDER
 
 #: Header style and label per item kind.
 KINDS = {
@@ -42,7 +43,6 @@ FIELD = "bright_black"
 NUMBER = "cyan"
 QUERY = "green"
 ERROR = "bold red"
-INCOMING = "cyan"
 OUTGOING = "green"
 
 #: Every hit of the active search is reversed; the one the cursor sits
@@ -83,6 +83,14 @@ _SPEAKER_LINE = re.compile(
 )
 _HANDLE = re.compile(r"@\w+")
 _WAKEUP_TAG = re.compile(r"^wakeup #(?P<id>\d+) (?P<detail>.*)$", re.DOTALL)
+
+#: Transcript grammar — what :mod:`libertati.transcript` writes, which
+#: is what the history tools return and what an event carries along.
+_DAY_HEADER = re.compile(r"^— \w{3} \d{4}-\d{2}-\d{2} —$")
+_TRANSCRIPT_LINE = re.compile(
+    r"^(?P<stamp>\d+ \d{2}:\d{2}) (?P<who>.+?): (?P<text>.*)$"
+)
+_TRANSCRIPT_MARKS = re.compile(r"(?: ↩\d+)?(?: #\d+)?$")
 
 Row = tuple[int, str, str]
 
@@ -217,14 +225,6 @@ def _handles(text: str, style: str = SPEAKER) -> Text:
     return rendered
 
 
-def _local_time(iso: str) -> str:
-    """Render an ISO timestamp as local ``HH:MM``, or ``?`` if malformed."""
-    try:
-        return datetime.fromisoformat(iso).astimezone().strftime("%H:%M")
-    except ValueError:
-        return "?"
-
-
 def _balanced(text: str, start: int) -> tuple[str, int] | None:
     """Return the parenthesised run at ``start`` and the index after it.
 
@@ -343,36 +343,55 @@ def _call_body(item: dict[str, Any]) -> Text | None:
     return _fields(args)
 
 
-def _messages_body(rows: list[Any]) -> Text | None:
-    """Lay out a message list as one row per message, newest last."""
-    if not rows or not all(
-        isinstance(row, dict) and "message_id" in row and "date" in row for row in rows
-    ):
-        return None
-    body = Text()
-    for index, row in enumerate(rows):
-        if index:
-            body.append("\n")
-        outgoing = bool(row.get("outgoing"))
-        body.append(f"{row['message_id']} ", style=META)
-        body.append(f"{_local_time(str(row['date']))} ", style=META)
-        body.append(
-            "→ " if outgoing else "← ", style=OUTGOING if outgoing else INCOMING
+def _transcript_line(body: Text, line: str, offset: int) -> bool:
+    """Mark up one transcript line in place; ``False`` if it is not one.
+
+    Styles only: the characters stay exactly as the tool wrote them, so a
+    search still matches the transcript the model was shown.
+    """
+    said = _TRANSCRIPT_LINE.match(line)
+    if said is None:
+        return False
+    body.stylize(META, offset, offset + said.end("stamp"))
+    who = said.group("who")
+    speaker = f"bold {OUTGOING}" if who == SELF_SENDER else SPEAKER
+    body.stylize(speaker, offset + said.start("who"), offset + said.end("who"))
+    for handle in _HANDLE.finditer(who):
+        start = offset + said.start("who") + handle.start()
+        body.stylize(HANDLE, start, start + len(handle.group()))
+    # A reply arrow and a topic id trail the text; they are structure the
+    # renderer added, not something anybody typed.
+    marks = _TRANSCRIPT_MARKS.search(said.group("text"))
+    if marks is not None and marks.group():
+        body.stylize(
+            META, offset + said.start("text") + marks.start(), offset + len(line)
         )
-        name = row.get("first_name") or row.get("username") or "?"
-        body.append(str(name), style=SPEAKER)
-        if row.get("username"):
-            body.append(f" @{row['username']}", style=HANDLE)
-        body.append(": ")
-        said = str(row.get("text") or row.get("caption") or "").strip()
-        # Messages carry newlines of their own; indenting them keeps the
-        # row boundaries visible in a long dump.
-        body.append(said.replace("\n", "\n  "))
-    return body
+    return True
+
+
+def _transcript_body(output: str) -> Text | None:
+    """Lay out a transcript result: one styled line per stored message.
+
+    Recognised only when every line is one — a day header or a message —
+    so an ordinary tool result that happens to start with a number is
+    left to the plain layout.
+    """
+    body = Text(output)
+    offset = 0
+    messages = 0
+    for line in output.split("\n"):
+        if _DAY_HEADER.match(line):
+            body.stylize(f"bold {META}", offset, offset + len(line))
+        elif _transcript_line(body, line, offset):
+            messages += 1
+        elif line:
+            return None
+        offset += len(line) + 1
+    return body if messages else None
 
 
 def _output_body(item: dict[str, Any]) -> Text | None:
-    """Lay out a tool result: message rows, fields, or its plain text."""
+    """Lay out a tool result: a transcript, fields, or its plain text."""
     output = item.get("output")
     if not isinstance(output, str) or not output:
         return None
@@ -381,10 +400,8 @@ def _output_body(item: dict[str, Any]) -> Text | None:
     try:
         data = json.loads(output)
     except json.JSONDecodeError:
-        return Text(output)
+        return _transcript_body(output) or Text(output)
     if isinstance(data, list):
-        if (rows := _messages_body(data)) is not None:
-            return rows
         body = Text()
         for index, entry in enumerate(data):
             if index:
