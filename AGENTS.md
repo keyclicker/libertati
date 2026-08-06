@@ -176,6 +176,10 @@ it in `READ_ONLY_MESSAGING_TOOLS`.
   and the `MEDIA_TOOL_NAMES` subtraction in `Toolbox.__init__`.
 - ffmpeg is a hard dependency of the media path only; tests never invoke
   it (they pre-create the artifact), so CI needs no ffmpeg.
+- `Database.message_thread` spells its columns out instead of reusing
+  `_MESSAGE_ROW` (a recursive CTE gets in the way), so a column added to
+  one has to be added to the other — a transcript rendered from rows
+  missing a column just quietly loses what it carried.
 - Not every `api_usage` row measures the context window: a memory
   extraction (`recall`, `summarize_memory`) books itself against the
   turn with `input_context_id = 0`, and lands after the round it served.

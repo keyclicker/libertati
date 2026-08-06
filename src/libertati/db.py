@@ -778,6 +778,11 @@ class Database:
         :meth:`recent_messages` plus ``reply_to_message_id`` so the
         reply structure is visible. When the thread exceeds ``limit``
         the newest messages are kept. Unknown messages yield no rows.
+
+        The recursive CTE keeps this query from reusing
+        :data:`_MESSAGE_ROW`, so its column list has to track that one by
+        hand — a transcript rendered from rows missing a column silently
+        loses what the column carried.
         """
         query = r"""
             WITH RECURSIVE thread (message_id, reply_to_message_id) AS (
@@ -792,8 +797,10 @@ class Database:
             )
             SELECT m.message_id, m.date, m.outgoing, u.username, u.first_name,
                    m.text, m.caption, m.content_type, m.message_thread_id,
-                   m.reply_to_message_id
-            FROM messages m LEFT JOIN users u ON u.id = m.from_user_id
+                   m.reply_to_message_id, n.note AS media_note
+            FROM messages m
+            LEFT JOIN users u ON u.id = m.from_user_id
+            LEFT JOIN media_notes n ON n.file_unique_id = m.media_uid
             WHERE m.chat_id = :chat_id
               AND m.message_id IN (SELECT message_id FROM thread)
             ORDER BY m.date DESC, m.message_id DESC

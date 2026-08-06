@@ -877,6 +877,26 @@ async def test_a_media_note_reaches_every_message_of_that_file(db: Database) -> 
     assert await db.media_note("u") == "a cat glaring"
 
 
+async def test_a_thread_shows_what_its_media_turned_out_to_be(db: Database) -> None:
+    """A reply thread renders through the same transcript as the rest."""
+    sticker = {
+        "file_id": "f",
+        "file_unique_id": "u",
+        "width": 512,
+        "height": 512,
+        "is_animated": False,
+        "is_video": False,
+        "type": "regular",
+    }
+    await db.save_message(make_message(1, None, sticker=sticker))
+    await db.save_message(make_reply(2, "what is that?", 1, STAMP + 60))
+    await db.save_media_note("u", "sticker", "a cat glaring", "eyes")
+    await db.set_message_media(100, 1, "u")
+
+    rows = await db.message_thread(100, 2, 10)
+    assert [row["media_note"] for row in rows] == ["a cat glaring", None]
+
+
 async def test_an_undescribed_message_carries_no_note(db: Database) -> None:
     """Nothing joins until a description exists for what it carries."""
     await db.save_message(make_message(1, "hi"))
