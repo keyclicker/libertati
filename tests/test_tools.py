@@ -594,6 +594,16 @@ async def test_list_stickers() -> None:
     assert json.loads(result) == db.stickers
 
 
+async def test_listing_stickers_is_not_outward_activity() -> None:
+    """A lookup must not pass for reaching out, or idle dreams never fire."""
+    db = FakeDB()
+    db.chats = [{"chat_id": 1}]
+    toolbox = make_toolbox(db=db)
+    await toolbox.run("list_stickers", "{}")
+    assert toolbox.outward_calls == 0
+    assert toolbox.steps == 1
+
+
 async def test_forward_message() -> None:
     """Forwards reach the bot with the right chats and are confirmed."""
     bot = RecordingBot()

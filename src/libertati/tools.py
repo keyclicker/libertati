@@ -874,9 +874,18 @@ TOOL_PARAMETER_SCHEMAS: dict[str, dict[str, Any]] = {
     for schema in [cast(dict[str, Any], tool)]
 }
 
+#: Messaging tools that only look something up. They sit in
+#: ``MESSAGING_TOOLS`` because that is where the model expects them, not
+#: because they reach anyone.
+READ_ONLY_MESSAGING_TOOLS: frozenset[str] = frozenset({"list_stickers"})
+
 #: Tools that visibly act on Telegram. Dispatching one counts as real
-#: activity for the dream idle clock, unlike read-only lookups.
-OUTWARD_TOOL_NAMES: frozenset[str] = function_names(MESSAGING_TOOLS)
+#: activity for the dream idle clock, unlike read-only lookups — a
+#: lookup that reset the clock would keep idleness at zero and put idle
+#: dreams out of reach.
+OUTWARD_TOOL_NAMES: frozenset[str] = (
+    function_names(MESSAGING_TOOLS) - READ_ONLY_MESSAGING_TOOLS
+)
 
 #: Chat-id arguments checked against the approval registry before a
 #: handler runs. The incoming-event gate in ``bot.py`` is not enough on
