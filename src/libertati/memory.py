@@ -1,4 +1,4 @@
-"""The agent's file-based mind: soul, long-term memory, inbox and dreams.
+"""The agent's file-based mind: soul, habits, long-term memory and more.
 
 Plain markdown files the user (and the dreaming loop) can inspect and
 edit directly:
@@ -6,6 +6,9 @@ edit directly:
 - ``SOUL.md`` — personality, attached to the instructions every turn.
   Rewritten only while dreaming, and only after the previous text is
   snapshotted under ``soul/``.
+- ``HABITS.md`` — behaviour learned from experience, attached to the
+  instructions every turn next to the soul. Rewritten only while
+  dreaming, and unlike the soul, most dreams touch it.
 - ``MEMORY.md`` — curated long-term memory; rewritten only while
   dreaming, read by the ``recall``/``summarize_memory`` tools, never
   inlined into context.
@@ -32,12 +35,17 @@ not a service.
 #: the instructions of every single turn, so it has to stay small.
 SOUL_MAX_CHARS = 4000
 
+#: Largest HABITS.md a dream may write, in characters. It rides in
+#: every turn's instructions too, and a habit list nobody prunes stops
+#: being a list of habits.
+HABITS_MAX_CHARS = 2000
+
 #: Largest MEMORY.md a dream may write, in characters. Consolidation
 #: that only ever grows the file is not consolidation.
 MEMORY_MAX_CHARS = 20000
 
 #: Mind files addressable by name from the dreaming loop.
-MIND_FILES = ("soul", "memory", "inbox", "dreams")
+MIND_FILES = ("soul", "habits", "memory", "inbox", "dreams")
 
 
 def _atomic_write(path: Path, text: str) -> None:
@@ -67,6 +75,7 @@ class Mind:
         """Remember the mind directory and derive the file paths."""
         self.path = path
         self.soul_path = path / "SOUL.md"
+        self.habits_path = path / "HABITS.md"
         self.memory_path = path / "MEMORY.md"
         self.inbox_path = path / "INBOX.md"
         self.dreams_path = path / "DREAMS.md"
@@ -88,6 +97,7 @@ class Mind:
             _atomic_write(self.soul_path, DEFAULT_SOUL)
         for file in (
             self.soul_path,
+            self.habits_path,
             self.memory_path,
             self.inbox_path,
             self.dreams_path,
@@ -98,6 +108,23 @@ class Mind:
     def soul(self) -> str:
         """Return the current personality text."""
         return self.soul_path.read_text(encoding="utf-8").strip()
+
+    def habits(self) -> str:
+        """Return the learned-behaviour text ('' when nothing is learned)."""
+        return self.habits_path.read_text(encoding="utf-8").strip()
+
+    def resident(self) -> str:
+        """Return the mind text that rides in every turn's instructions.
+
+        Soul and habits under their own headers; an empty habits file is
+        left out entirely rather than shown as a bare header, which reads
+        to the model as a section it should fill.
+        """
+        parts = [f"## Soul\n{self.soul()}"]
+        habits = self.habits()
+        if habits:
+            parts.append(f"## Habits\n{habits}")
+        return "\n\n".join(parts)
 
     def notes(self) -> str:
         """Return curated memory and inbox as one document ('' when empty).
@@ -123,6 +150,7 @@ class Mind:
         """Resolve one of :data:`MIND_FILES` to its path."""
         paths = {
             "soul": self.soul_path,
+            "habits": self.habits_path,
             "memory": self.memory_path,
             "inbox": self.inbox_path,
             "dreams": self.dreams_path,
@@ -168,6 +196,23 @@ class Mind:
             )
         _atomic_write(self.memory_path, memory.strip() + "\n")
         _atomic_write(self.inbox_path, "")
+
+    def write_habits(self, text: str) -> None:
+        """Replace HABITS.md atomically; raise on oversized text.
+
+        Emptying the file is allowed: a dream that decides nothing here
+        was ever a habit should be able to say so. No snapshots, same as
+        :meth:`fold_inbox` — the text a dream wrote is already in its
+        ``dream_context`` trace, and unlike the soul this changes most
+        nights, so a snapshot dir would be churn.
+        """
+        if len(text) > HABITS_MAX_CHARS:
+            raise ValueError(
+                f"habits are {len(text)} chars, over the "
+                f"{HABITS_MAX_CHARS} limit — keep only what you act on"
+            )
+        stripped = text.strip()
+        _atomic_write(self.habits_path, f"{stripped}\n" if stripped else "")
 
     def write_soul(self, text: str, stamp: str) -> Path:
         """Snapshot the current soul, then replace it; return the snapshot.

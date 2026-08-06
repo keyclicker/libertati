@@ -688,7 +688,7 @@ SLEEP_TOOLS: list[ToolParam] = [
         "description": (
             "Fall asleep and dream. Your waking self pauses while a "
             "dreaming self wanders, reflects, rewrites your long-term "
-            "memory and may revise who you are; you wake up with a "
+            "memory and habits and may revise who you are; you wake up with a "
             "summary of it. Use it when nothing needs you and there is "
             "a lot to digest. You only get a few dreams a day."
         ),
@@ -715,16 +715,17 @@ DREAM_TOOLS: list[ToolParam] = [
         "type": "function",
         "name": "read_mind",
         "description": (
-            "Re-read one of your mind files. All four were handed to you "
-            "when you fell asleep; use this to look at one again after "
-            "you have written to it."
+            "Re-read one of your mind files. Your soul and habits are in "
+            "the sections above and the rest were handed to you when you "
+            "fell asleep; use this to look at one again after you have "
+            "written to it."
         ),
         "parameters": {
             "type": "object",
             "properties": {
                 "file": {
                     "type": "string",
-                    "enum": ["soul", "memory", "inbox", "dreams"],
+                    "enum": ["soul", "habits", "memory", "inbox", "dreams"],
                     "description": "Which mind file to read.",
                 },
             },
@@ -783,6 +784,33 @@ DREAM_TOOLS: list[ToolParam] = [
     },
     {
         "type": "function",
+        "name": "write_habits",
+        "description": (
+            "Rewrite what you have learned about how to act (HABITS.md). "
+            "Pass the complete new file: keep the habits you still act "
+            "on, sharpen the ones experience has refined, drop what you "
+            "have stopped doing or never really did. Facts go to memory "
+            "instead; this is only for behaviour, and it rides along in "
+            "every waking thought, so it has to stay short."
+        ),
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "text": {
+                    "type": "string",
+                    "description": (
+                        "The complete new contents of HABITS.md: short "
+                        "lines, one learned behaviour each."
+                    ),
+                },
+            },
+            "required": ["text"],
+            "additionalProperties": False,
+        },
+        "strict": True,
+    },
+    {
+        "type": "function",
         "name": "write_soul",
         "description": (
             "Rewrite who you are (SOUL.md). Sparingly and gently: small "
@@ -812,8 +840,8 @@ DREAM_TOOLS: list[ToolParam] = [
         "description": (
             "End the dream and wake up. Call it only once you have "
             "wandered properly, written your journal entry, folded the "
-            "inbox into memory and considered your soul. Your summary is "
-            "the first thing your waking self sees."
+            "inbox into memory, updated your habits and considered your "
+            "soul. Your summary is the first thing your waking self sees."
         ),
         "parameters": {
             "type": "object",
@@ -1070,6 +1098,7 @@ class Toolbox:
             "read_mind": self._read_mind,
             "write_dream": self._write_dream,
             "fold_inbox": self._fold_inbox,
+            "write_habits": self._write_habits,
             "write_soul": self._write_soul,
             "wake_up": self._wake_up,
         }
@@ -1597,6 +1626,17 @@ class Toolbox:
             f"MEMORY.md rewritten ({len(args['memory'].strip())} chars),"
             " INBOX.md cleared"
         )
+
+    async def _write_habits(self, args: dict[str, Any]) -> str:
+        """Replace learned behaviour with the dream's new version."""
+        try:
+            self.mind.write_habits(args["text"])
+        except ValueError as exc:
+            return f"error: {exc}"
+        text = args["text"].strip()
+        if not text:
+            return "HABITS.md cleared"
+        return f"HABITS.md rewritten ({len(text)} chars)"
 
     async def _write_soul(self, args: dict[str, Any]) -> str:
         """Snapshot the current soul and replace it."""

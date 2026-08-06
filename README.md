@@ -29,8 +29,8 @@ when to reply. Plain assistant output is ignored and sends nothing.
   agent calls `dream` itself — the waking loop pauses and a
   differently-prompted loop runs one long offline session. It wanders
   with read-only and web tools, writes a reflection into `DREAMS.md`,
-  folds `INBOX.md` into a rewritten `MEMORY.md`, and may revise
-  `SOUL.md`. Its context is recorded in `dream_context` for the viewer
+  folds `INBOX.md` into a rewritten `MEMORY.md`, updates `HABITS.md`,
+  and may revise `SOUL.md`. Its context is recorded in `dream_context` for the viewer
   but never read back — the agent wakes to a `[dream ended …]` event
   carrying its summary, and nothing else carries over. Budgeted per 24h.
 - **Wiring** (`bot.py`): aiogram handlers persist every message and push
@@ -39,14 +39,17 @@ when to reply. Plain assistant output is ignored and sends nothing.
 - **Storage** (`db.py`): SQLite (WAL) with full raw Telegram payloads,
   append-only model context (waking and dreaming kept apart), and exact
   API token/cache usage per turn or dream.
-- **Mind** (`memory.py`): four markdown files under `data/memory/`,
-  editable by hand at any time. `SOUL.md` is the personality, re-read
-  and attached to the instructions every turn. `INBOX.md` is where the
-  `remember` tool drops raw dated facts. `MEMORY.md` is the curated
-  long-term store the `recall` tool answers questions from with a
-  one-shot extraction call (it is never inlined into the agent's
-  context) — only a dream rewrites it. `DREAMS.md` is the dream
-  journal. Every soul rewrite is snapshotted under `soul/` first.
+- **Mind** (`memory.py`): five markdown files under `data/memory/`,
+  editable by hand at any time. `SOUL.md` is the personality and
+  `HABITS.md` the behaviour learned from experience; both are re-read
+  and attached to the instructions every turn, and only a dream writes
+  them. `INBOX.md` is where the `remember` tool drops raw dated facts.
+  `MEMORY.md` is the curated long-term store the `recall` tool answers
+  questions from with a one-shot extraction call (it is never inlined
+  into the agent's context) — only a dream rewrites it. `DREAMS.md` is
+  the dream journal. Every soul rewrite is snapshotted under `soul/`
+  first; memory and habits are replaced in place, and the text of each
+  rewrite stays in the dream's `dream_context` trace.
 - **Prompts** (`prompts.toml`): user-editable agent, roleplay,
   web-search, dream and memory-helper instructions loaded at startup.
 

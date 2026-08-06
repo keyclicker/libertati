@@ -369,7 +369,7 @@ def make_turn_agent(
     agent = Agent.__new__(Agent)
     agent.client = cast(Any, SimpleNamespace(responses=SimpleNamespace(create=create)))
     agent.model = "test-model"
-    agent.mind = cast(Any, SimpleNamespace(soul=lambda: "soul"))
+    agent.mind = cast(Any, SimpleNamespace(resident=lambda: "## Soul\nsoul"))
     agent.base_prompt = "base"
     agent.max_rounds = max_rounds
     agent.max_context_items = MAX_CONTEXT_ITEMS

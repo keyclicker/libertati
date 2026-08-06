@@ -360,10 +360,10 @@ class Agent(ModelLoop):
         The turn ends when the model produces no tool calls or ``max_rounds``
         is reached. A non-empty private final output gets one corrective retry
         because some compatible providers mistake it for a delivered reply.
-        Everything the model produces is remembered. SOUL.md is re-read every
-        turn so personality edits apply live.
+        Everything the model produces is remembered. SOUL.md and HABITS.md
+        are re-read every turn so edits to either apply live.
         """
-        instructions = f"{self.base_prompt}\n\n## Soul\n{self.mind.soul()}"
+        instructions = f"{self.base_prompt}\n\n{self.mind.resident()}"
         turn_id = await self.db.start_agent_turn(await self.db.latest_context_id())
         turn_status = "failed"
         corrected_private_output = False
