@@ -33,7 +33,7 @@ One package, `src/libertati/`, no sub-packages:
 - `tools.py` — every function-tool schema and its handler (`Toolbox`).
 - `db.py` — aiosqlite persistence: messages/chats/users, append-only
   agent context, turns, usage, dreams, wakeups.
-- `memory.py` — `Mind`: the four markdown mind files under
+- `memory.py` — `Mind`: the five markdown mind files under
   `data/memory/`.
 - `config.py` — pydantic-settings `Settings` (env > .env >
   settings.toml > defaults).

@@ -14,7 +14,13 @@ from openai import AsyncOpenAI, Omit
 
 from libertati.chats import ChatRegistry
 from libertati.db import Database
-from libertati.memory import DEFAULT_SOUL, MEMORY_MAX_CHARS, SOUL_MAX_CHARS, Mind
+from libertati.memory import (
+    DEFAULT_SOUL,
+    HABITS_MAX_CHARS,
+    MEMORY_MAX_CHARS,
+    SOUL_MAX_CHARS,
+    Mind,
+)
 from libertati.tools import (
     DREAM_API_TOOLS,
     DREAM_TOOL_NAMES,
@@ -1371,6 +1377,11 @@ async def test_waking_toolbox_refuses_dream_writers(tmp_path: Path) -> None:
     assert result == "error: unknown tool 'write_soul'"
     assert mind.soul() == DEFAULT_SOUL.strip()
 
+    result = await toolbox.run("write_habits", json.dumps({"text": "hijacked"}))
+
+    assert result == "error: unknown tool 'write_habits'"
+    assert mind.habits() == ""
+
 
 async def test_read_mind_returns_each_file(tmp_path: Path) -> None:
     """Every mind file is addressable by name; empty ones say so."""
@@ -1383,6 +1394,9 @@ async def test_read_mind_returns_each_file(tmp_path: Path) -> None:
     )
     assert await toolbox.run("read_mind", json.dumps({"file": "inbox"})) == (
         "inbox is empty"
+    )
+    assert await toolbox.run("read_mind", json.dumps({"file": "habits"})) == (
+        "habits is empty"
     )
 
 
@@ -1424,6 +1438,33 @@ async def test_fold_inbox_over_cap_is_an_error_not_a_crash(tmp_path: Path) -> No
 
     assert result.startswith("error:")
     assert "fresh fact" in mind.read("inbox")
+
+
+async def test_write_habits_replaces_the_file(tmp_path: Path) -> None:
+    """A dream's rewrite lands whole, like a memory fold."""
+    mind = make_mind(tmp_path)
+    toolbox = make_dream_toolbox(mind)
+
+    result = await toolbox.run(
+        "write_habits", json.dumps({"text": "two lines at most with Anna"})
+    )
+
+    assert mind.habits() == "two lines at most with Anna"
+    assert "rewritten" in result
+
+
+async def test_write_habits_over_cap_is_an_error(tmp_path: Path) -> None:
+    """An oversized rewrite leaves the current habits in place."""
+    mind = make_mind(tmp_path)
+    mind.write_habits("one real habit")
+    toolbox = make_dream_toolbox(mind)
+
+    result = await toolbox.run(
+        "write_habits", json.dumps({"text": "x" * (HABITS_MAX_CHARS + 1)})
+    )
+
+    assert result.startswith("error:")
+    assert mind.habits() == "one real habit"
 
 
 async def test_write_soul_snapshots_and_replaces(tmp_path: Path) -> None:
