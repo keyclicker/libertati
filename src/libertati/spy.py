@@ -52,6 +52,7 @@ from sqlalchemy.pool import NullPool
 from textual import events
 from textual.app import App, ComposeResult
 from textual.binding import Binding
+from textual.containers import Horizontal
 from textual.geometry import Size
 from textual.scroll_view import ScrollView
 from textual.strip import Strip
@@ -814,29 +815,54 @@ class SpyApp(App[None]):
     # transparent, and every style follows its palette.
     THEME = "ansi-dark"
 
+    # The prompt bars live on their own layer: docked to the same edge
+    # as the status they would otherwise fight it for the bottom rows,
+    # and the loser is painted over. On a layer they overlay the second
+    # status line only while open, vim-style, and the context view never
+    # reflows (a reflow re-wraps every loaded block).
     CSS = """
     Screen {
         background: transparent;
         layout: vertical;
+        layers: base prompt;
     }
 
     ContextView {
         height: 1fr;
     }
 
-    #search, #steer {
-        dock: bottom;
-        display: none;
-        height: 1;
-        border: none;
-        padding: 0 1;
-        background: transparent;
-    }
-
     #status {
         dock: bottom;
         height: 2;
         padding: 0 1;
+        background: transparent;
+    }
+
+    #searchbar, #steerbar {
+        layer: prompt;
+        dock: bottom;
+        display: none;
+        height: 1;
+        background: transparent;
+    }
+
+    #search-prefix {
+        width: auto;
+        padding: 0 0 0 1;
+        background: transparent;
+    }
+
+    #steer-prefix {
+        width: auto;
+        padding: 0 1;
+        background: transparent;
+    }
+
+    #search, #steer {
+        width: 1fr;
+        height: 1;
+        border: none;
+        padding: 0 1 0 0;
         background: transparent;
     }
     """
@@ -906,11 +932,15 @@ class SpyApp(App[None]):
         return self.query_one(ContextView)
 
     def compose(self) -> ComposeResult:
-        """Create the context view, both prompts and the status."""
+        """Create the context view, both prompt bars and the status."""
         yield ContextView(self.conn, self.page_size, self.dream_id, id="context")
-        yield SearchInput(id="search")
-        yield SteerInput(id="steer", max_length=STEERING_MAX_CHARS)
         yield Static(id="status")
+        with Horizontal(id="searchbar"):
+            yield Static(id="search-prefix")
+            yield SearchInput(id="search", placeholder="pattern")
+        with Horizontal(id="steerbar"):
+            yield Static(id="steer-prefix")
+            yield SteerInput(id="steer", max_length=STEERING_MAX_CHARS)
 
     def on_mount(self) -> None:
         """Load the initial tail and start polling for new rows."""
@@ -1020,12 +1050,14 @@ class SpyApp(App[None]):
     # ----- Search -----
 
     def action_search(self, direction: str) -> None:
-        """Open the search prompt."""
+        """Open the search prompt, prefixed with its direction."""
         self.search_backward = direction == "backward"
+        self.query_one("#search-prefix", Static).update(
+            "?" if self.search_backward else "/"
+        )
         prompt = self.query_one("#search", SearchInput)
         prompt.value = ""
-        prompt.placeholder = "?pattern" if self.search_backward else "/pattern"
-        prompt.display = True
+        self.query_one("#searchbar", Horizontal).display = True
         prompt.focus()
 
     async def on_input_submitted(self, event: Input.Submitted) -> None:
@@ -1136,8 +1168,7 @@ class SpyApp(App[None]):
 
     def close_search(self) -> None:
         """Hide the search prompt and focus the context again."""
-        prompt = self.query_one("#search", SearchInput)
-        prompt.display = False
+        self.query_one("#searchbar", Horizontal).display = False
         self.view.focus()
 
     # ----- Steering -----
@@ -1146,22 +1177,28 @@ class SpyApp(App[None]):
         """Open the prompt for an instruction to the agent."""
         prompt = self.query_one("#steer", SteerInput)
         prompt.value = ""
-        prompt.display = True
+        self.query_one("#steerbar", Horizontal).display = True
         self.set_steer_urgent(urgent)
         prompt.focus()
 
     def set_steer_urgent(self, urgent: bool) -> None:
         """Choose when the instruction lands, and say so in the prompt.
 
-        The two differ enough to be worth naming: one waits for whatever
-        the agent is doing, the other cuts into it at the next round.
+        The two differ enough to be worth naming — one waits for
+        whatever the agent is doing, the other cuts into it at the next
+        round — and the mode lives in the prefix label, not the
+        placeholder: a placeholder vanishes under the first keystroke,
+        and ctrl+t is pressed mid-sentence more often than not.
         """
         self.steer_urgent = urgent
-        self.query_one("#steer", SteerInput).placeholder = (
-            "instruct now (ctrl+t: after this turn)"
-            if urgent
-            else "instruct (ctrl+t: interrupt)"
-        )
+        prefix = self.query_one("#steer-prefix", Static)
+        if urgent:
+            prefix.update(Text("instruct now!", style="bold red"))
+            hint = "interrupts the turn (ctrl+t: queue)"
+        else:
+            prefix.update(Text("instruct:", style="bold"))
+            hint = "queued for the next turn (ctrl+t: interrupt)"
+        self.query_one("#steer", SteerInput).placeholder = hint
 
     async def submit_steering(self, text: str) -> None:
         """Post the typed instruction for the bot process to deliver.
@@ -1205,8 +1242,7 @@ class SpyApp(App[None]):
 
     def close_steering(self) -> None:
         """Hide the instruction prompt and focus the context again."""
-        prompt = self.query_one("#steer", SteerInput)
-        prompt.display = False
+        self.query_one("#steerbar", Horizontal).display = False
         self.view.focus()
 
 

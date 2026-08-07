@@ -6,6 +6,7 @@ from pathlib import Path
 import pytest
 from sqlalchemy import Connection, create_engine, insert, select, text
 from sqlalchemy.pool import StaticPool
+from textual.widgets import Static
 
 from libertati import schema
 from libertati.render import TRUNCATE_AT
@@ -856,5 +857,56 @@ async def test_instruction_reports_a_database_that_refuses_it(
 
         assert app.note.startswith("instruction failed:")
         assert app.is_running
+
+    conn.close()
+
+
+@pytest.mark.asyncio
+async def test_prompts_paint_over_the_status_not_under_it() -> None:
+    """An open prompt owns the bottom row; the status never covers it.
+
+    The bars live on a layer above the status because both dock to the
+    bottom edge; before they did, the status was painted last and the
+    prompts were typed into blind.
+    """
+    conn = make_context_db(5)
+    app = SpyApp(conn, last_id=0)
+
+    async with app.run_test(size=(80, 12)) as pilot:
+        await pilot.pause()
+        widget, _ = app.screen.get_widget_at(5, 11)
+        assert widget.id == "status"
+
+        await pilot.press("slash")
+        await pilot.pause()
+        widget, _ = app.screen.get_widget_at(5, 11)
+        assert widget.id == "search"
+
+        await pilot.press("escape")
+        await pilot.press("i")
+        await pilot.pause()
+        widget, _ = app.screen.get_widget_at(20, 11)
+        assert widget.id == "steer"
+        widget, _ = app.screen.get_widget_at(1, 11)
+        assert widget.id == "steer-prefix"
+
+    conn.close()
+
+
+@pytest.mark.asyncio
+async def test_steer_prefix_names_the_mode_while_typing() -> None:
+    """ctrl+t mid-typing changes the visible mode, not just the flag."""
+    conn = make_context_db(1)
+    app = SpyApp(conn, last_id=0)
+
+    async with app.run_test(size=(80, 12)) as pilot:
+        await pilot.pause()
+        await pilot.press("I")
+        await pilot.press(*"wait")
+        prefix = app.query_one("#steer-prefix", Static)
+        assert "instruct now!" in str(prefix.render())
+
+        await pilot.press("ctrl+t")
+        assert "instruct:" in str(prefix.render())
 
     conn.close()
