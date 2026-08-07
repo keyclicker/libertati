@@ -26,11 +26,6 @@ db_path = "data/libertati.db"
 # rewrite).
 memory_dir = "data/memory"
 
-# Directory holding compressed media artifacts: one small webp per
-# described picture, sticker or video frame strip, one low-bitrate opus
-# per voice message. Originals are never kept.
-media_dir = "data/media"
-
 
 # ==========================================================
 #                     Model & reasoning

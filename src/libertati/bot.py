@@ -588,8 +588,6 @@ async def run() -> None:
     registry = ChatRegistry(settings.chats_path, settings.chat_approval)
     prompts = load_prompts(settings.prompts_path)
     lens = MediaLens.from_settings(settings, prompts, db=db, bot=bot)
-    if lens is not None:
-        lens.ensure()
     agent = Agent(settings, db, bot, registry, dream_gate, lens=lens, prompts=prompts)
     await agent.load()
     tz = agent.tz

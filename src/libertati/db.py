@@ -25,6 +25,7 @@ from .schema import (
     dream_context,
     dreams,
     media_notes,
+    media_refusals,
     message_read_cursors,
     messages,
     steering,
@@ -978,6 +979,33 @@ class Database:
                 "model": stmt.excluded.model,
                 "created_at": func.datetime("now"),
             },
+        )
+        async with self.engine.begin() as conn:
+            await conn.execute(stmt)
+
+    async def media_refused(self, file_unique_id: str) -> bool:
+        """Whether a model once refused to look at this file."""
+        stmt = (
+            select(1)
+            .select_from(media_refusals)
+            .where(media_refusals.c.file_unique_id == file_unique_id)
+        )
+        async with self.engine.connect() as conn:
+            return (await conn.execute(stmt)).first() is not None
+
+    async def save_media_refusal(
+        self, file_unique_id: str, kind: str, model: str
+    ) -> None:
+        """Remember that a model refused a file, for good.
+
+        Ignoring rather than replacing the conflict: the first refusal
+        already retired the file, and which model said no second is not
+        worth a write.
+        """
+        stmt = (
+            sqlite_insert(media_refusals)
+            .values(file_unique_id=file_unique_id, kind=kind, model=model)
+            .on_conflict_do_nothing(index_elements=[media_refusals.c.file_unique_id])
         )
         async with self.engine.begin() as conn:
             await conn.execute(stmt)

@@ -833,3 +833,13 @@ async def test_re_describing_a_file_replaces_its_note(db: Database) -> None:
     await db.save_media_note("u", "photo", "a blurry shape", "eyes")
     await db.save_media_note("u", "photo", "a lighthouse at dusk", "better-eyes")
     assert await db.media_note("u") == "a lighthouse at dusk"
+
+
+async def test_a_media_refusal_sticks_and_keeps_its_first_record(
+    db: Database,
+) -> None:
+    """The first no retires the file; a second changes nothing."""
+    assert not await db.media_refused("u")
+    await db.save_media_refusal("u", "photo", "eyes")
+    await db.save_media_refusal("u", "photo", "other-eyes")
+    assert await db.media_refused("u")
