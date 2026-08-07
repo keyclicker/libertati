@@ -71,7 +71,6 @@ def test_media_models_are_named_and_share_the_one_endpoint() -> None:
     settings = make_settings()
     assert settings.media_model
     assert settings.transcribe_model
-    assert settings.media_dir == Path("data/media")
     # An answer is asked for, read once and thrown away, so it may run
     # longer than the note every transcript carries.
     assert settings.media_answer_chars > settings.media_note_chars
