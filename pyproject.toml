@@ -11,8 +11,10 @@ requires-python = ">=3.12"
 dependencies = [
     "aiogram>=3.30.0",
     "aiosqlite>=0.22.1",
+    "alembic>=1.16",
     "openai>=2.52.0",
     "pydantic-settings>=2.14.2",
+    "sqlalchemy[asyncio]>=2.0",
 ]
 
 [project.scripts]

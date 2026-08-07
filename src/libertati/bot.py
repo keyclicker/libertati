@@ -30,7 +30,7 @@ from aiogram.types import (
     User,
 )
 
-from libertati import clock
+from libertati import clock, migrations
 from libertati.agent import Agent, one_line
 from libertati.chats import ChatRegistry
 from libertati.config import Settings
@@ -575,6 +575,9 @@ async def run() -> None:
     settings = Settings()
     logging.basicConfig(level=settings.log_level)
 
+    # Alembic is sync; a worker thread keeps startup from blocking the
+    # loop. The database is at head before anything connects to it.
+    await asyncio.to_thread(migrations.upgrade_to_head, settings.db_path)
     db = Database(settings.db_path)
     await db.connect()
 
