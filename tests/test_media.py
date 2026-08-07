@@ -6,10 +6,11 @@ from pathlib import Path
 from types import SimpleNamespace
 from typing import Any, cast
 
+import httpx
 import pytest
 from aiogram import Bot
 from conftest import run_sql
-from openai import AsyncOpenAI
+from openai import AsyncOpenAI, BadRequestError, InternalServerError
 
 from libertati.db import Database
 from libertati.media import (
@@ -53,6 +54,10 @@ class FakeResponses:
         self.delay = delay
         self.calls: list[dict[str, Any]] = []
         self.started = asyncio.Event()
+        #: Set to make every call refuse (a Responses refusal part) or
+        #: raise, the way a real provider would.
+        self.refusal: str | None = None
+        self.error: Exception | None = None
 
     async def create(self, **kwargs: Any) -> Any:
         """Return a fake Responses-API result."""
@@ -60,6 +65,12 @@ class FakeResponses:
         self.started.set()
         if self.delay:
             await asyncio.sleep(self.delay)
+        if self.error is not None:
+            raise self.error
+        if self.refusal is not None:
+            part = SimpleNamespace(type="refusal", refusal=self.refusal)
+            message = SimpleNamespace(type="message", content=[part])
+            return SimpleNamespace(output_text="", output=[message], usage=None)
         return SimpleNamespace(output_text=self.text, usage=None)
 
 
@@ -542,6 +553,89 @@ async def test_a_files_lock_is_forgotten_once_nobody_holds_it(db: Database) -> N
     )
 
     assert lens._locks == {}
+
+
+# ==========================================================
+#                        Refusals
+# ==========================================================
+
+
+def api_error(status: int, message: str) -> Exception:
+    """Build the exception the OpenAI client raises for one status."""
+    request = httpx.Request("POST", "http://provider.test")
+    response = httpx.Response(status, request=request)
+    if status == 400:
+        return BadRequestError(message, response=response, body=None)
+    return InternalServerError(message, response=response, body=None)
+
+
+async def test_a_refusal_retires_the_file_for_good(db: Database) -> None:
+    """One no from the model and the file is never fetched or sent again."""
+    client = FakeClient()
+    client.responses.refusal = "I can't help with that"
+    bot = FakeBot()
+    lens = make_lens(db, client, bot)
+
+    assert await lens.look(10, 1, {"sticker": STICKER}) is None
+    assert await db.media_refused("sticker-uid")
+    assert await db.media_note("sticker-uid") is None
+
+    # The second look is over before it starts: no download, no call.
+    assert await lens.look(10, 2, {"sticker": STICKER}) is None
+    assert bot.downloads == ["sticker-file"]
+    assert len(client.responses.calls) == 1
+
+
+async def test_a_content_policy_400_is_a_refusal_too(db: Database) -> None:
+    """Some providers say no as an error rather than a refusal part."""
+    client = FakeClient()
+    client.responses.error = api_error(400, "your input was flagged")
+    lens = make_lens(db, client)
+
+    assert await lens.look(10, 1, {"sticker": STICKER}) is None
+    assert await db.media_refused("sticker-uid")
+
+
+async def test_a_transient_error_is_not_a_refusal(db: Database) -> None:
+    """A 500 tonight must not blacklist an innocent file forever."""
+    client = FakeClient()
+    client.responses.error = api_error(500, "upstream fell over")
+    lens = make_lens(db, client)
+
+    assert await lens.look(10, 1, {"sticker": STICKER}) is None
+    assert not await db.media_refused("sticker-uid")
+
+
+async def test_a_malformed_request_is_our_bug_not_a_refusal(db: Database) -> None:
+    """A 400 without a policy smell stays retryable — we asked wrong."""
+    client = FakeClient()
+    client.responses.error = api_error(400, "image exceeds maximum dimensions")
+    lens = make_lens(db, client)
+
+    assert await lens.look(10, 1, {"sticker": STICKER}) is None
+    assert not await db.media_refused("sticker-uid")
+
+
+async def test_a_question_about_a_retired_file_is_never_asked(db: Database) -> None:
+    """The flag guards the asking path the same as the describing one."""
+    await db.save_media_refusal("sticker-uid", "sticker", "eyes")
+    client = FakeClient()
+    bot = FakeBot()
+    lens = make_lens(db, client, bot)
+
+    assert await lens.ask(10, 1, {"sticker": STICKER}, "what is it?") is None
+    assert bot.downloads == []
+    assert client.responses.calls == []
+
+
+async def test_a_refused_question_retires_the_file_too(db: Database) -> None:
+    """Both model calls carry the same media; a no on either retires it."""
+    client = FakeClient()
+    client.responses.refusal = "not this one"
+    lens = make_lens(db, client)
+
+    assert await lens.ask(10, 1, {"sticker": STICKER}, "what is it?") is None
+    assert await db.media_refused("sticker-uid")
 
 
 async def test_media_without_eyes_is_never_looked_at(db: Database) -> None:

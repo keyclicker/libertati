@@ -39,8 +39,9 @@ when to reply. Plain assistant output is ignored and sends nothing.
   as the agent itself. Nothing binary touches disk either: a file is
   downloaded into memory, piped through ffmpeg and sent to the model as
   bytes, and what survives a look is the text in the database — a second
-  look fetches the file from Telegram again. Media that arrives while
-  nobody is addressing the bot
+  look fetches the file from Telegram again. A file the model refuses to
+  look at is remembered and never downloaded or sent again. Media that
+  arrives while nobody is addressing the bot
   is described in the background, so the note is ready by the time that
   message rides along with a later event. Off until `media_model` is
   set (`media_model` / `transcribe_model`).
