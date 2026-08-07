@@ -110,9 +110,12 @@ One package, `src/libertati/`, no sub-packages:
   back. Nothing binary is kept — a second look
   (`look_at_media` with a question) fetches the file from Telegram
   again. A file a model refused (a Responses refusal part, or a 400
-  that smells of content policy) is retired via `media_refusals` and
-  never downloaded or sent again; transient errors and our own bad
-  requests are not refusals and stay retryable.
+  whose code or message says content policy) is retired via
+  `media_refusals` and never downloaded or sent again; transient errors
+  and our own bad requests are not refusals and stay retryable. Nothing
+  clears a refusal, so `_policy_error` errs towards no: whole-word codes
+  first, and phrases matched against the message alone — a bare word
+  against the whole error retires a file over a parameter name.
 - **Events arrive in the order they were sent.** aiogram runs every
   update in its own task and `on_message` waits up to
   `media_wait_seconds` for a description, so the push happens under

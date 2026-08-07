@@ -422,22 +422,59 @@ class _Refusal(Exception):
     """The model declined to look at a file, as a matter of policy."""
 
 
-#: What marks a 400 as the provider saying no rather than us asking
-#: wrong. A plain bad request is our bug and must stay retryable; only
-#: a policy no retires the file for good.
-_POLICY_MARKERS = (
-    "content_policy",
+#: The machine-readable labels a provider gives a refusal. Matched
+#: whole, against the error's code and type only.
+_POLICY_CODES = frozenset(
+    {
+        "content_policy_violation",
+        "content_filter",
+        "invalid_prompt",
+        "moderation_blocked",
+        "prompt_blocked",
+    }
+)
+
+#: What marks the *message* of an uncoded 400 as the provider saying no
+#: rather than us asking wrong. Every one is a phrase, and only the
+#: message is searched: a bare word tested against the whole error reads
+#: "safety" out of a rejected ``safety_identifier`` parameter and retires
+#: an innocent file for good, and nothing ever clears a refusal.
+_POLICY_PHRASES = (
     "content policy",
-    "moderation",
-    "flagged",
-    "safety",
+    "content management policy",
+    "content filter",
+    "usage policy",
+    "usage policies",
+    "safety system",
+    "flagged as",
 )
 
 
+def _error_labels(error: BadRequestError) -> set[str]:
+    """Collect the codes a 400 carries, from wherever it carries them.
+
+    The client fills ``code`` from an OpenAI-shaped body; a provider
+    that answers in its own shape leaves it empty and names the reason
+    inside the body instead.
+    """
+    labels = {str(getattr(error, "code", "") or "")}
+    body = getattr(error, "body", None)
+    detail = body.get("error") if isinstance(body, dict) else None
+    if isinstance(detail, dict):
+        labels |= {str(detail.get(key) or "") for key in ("code", "type")}
+    return {label.lower() for label in labels if label}
+
+
 def _policy_error(error: BadRequestError) -> bool:
-    """Whether a 400 refuses the content instead of the request."""
-    detail = str(error).lower()
-    return any(marker in detail for marker in _POLICY_MARKERS)
+    """Whether a 400 refuses the content instead of the request.
+
+    A plain bad request is our bug and must stay retryable; only a
+    policy no retires the file for good, so this errs towards no.
+    """
+    if _error_labels(error) & _POLICY_CODES:
+        return True
+    message = str(getattr(error, "message", "") or "").lower()
+    return any(phrase in message for phrase in _POLICY_PHRASES)
 
 
 def _refusal_reason(response: Any) -> str | None:
