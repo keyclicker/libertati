@@ -35,12 +35,16 @@ def make_context_db(rows: int = 30, path: Path | None = None) -> Connection:
     post instructions need, since those open a connection of their own.
     The real schema, straight from the metadata — a hand-written subset
     would drift. Autocommit, like the viewer's own connection: each
-    write lands at once and each poll reads a fresh snapshot.
+    write lands at once and each poll reads a fresh snapshot. Search
+    indexing runs in a thread, so the shared in-memory connection must
+    be allowed to cross threads — a file database gets that from the
+    sqlite dialect by default, in memory it has to be asked for.
     """
     engine = create_engine(
         f"sqlite:///{path}" if path else "sqlite://",
         poolclass=StaticPool,
         isolation_level="AUTOCOMMIT",
+        connect_args={"check_same_thread": False},
     )
     schema.metadata.create_all(engine)
     conn = engine.connect()

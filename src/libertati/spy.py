@@ -215,6 +215,7 @@ def scan_matches(
     pattern: re.Pattern[str],
     dream_id: int | None = None,
     after: int = 0,
+    upto: int | None = None,
 ) -> list[Match]:
     """Index every occurrence of a pattern in the stored context.
 
@@ -222,6 +223,10 @@ def scan_matches(
     holds a tail of history, and a match older than that tail has to be
     findable all the same. Occurrences are counted in the very body the
     block renders, so counts and highlights cannot disagree.
+
+    ``upto`` bounds the scan to rows the caller has already counted as
+    scanned, so a row appended mid-scan waits for the next incremental
+    pass instead of being indexed twice.
     """
     table, conditions = source(dream_id)
     stmt = (
@@ -229,6 +234,8 @@ def scan_matches(
         .where(*conditions, table.c.id > after)
         .order_by(table.c.id)
     )
+    if upto is not None:
+        stmt = stmt.where(table.c.id <= upto)
     result = conn.execute(stmt)
     matches: list[Match] = []
     while chunk := result.fetchmany(SCAN_CHUNK):
@@ -944,6 +951,11 @@ class SpyApp(App[None]):
         self.matches: list[Match] = []
         self.match_at: int | None = None
         self.scanned_id = 0
+        # A full index being rebuilt off the UI thread; while one runs,
+        # the incremental per-poll scan stands down (its low-water mark
+        # is not meaningful yet, and rescanning from it would block the
+        # very thread the rebuild was moved off of).
+        self.indexing = False
 
     @property
     def view(self) -> ContextView:
@@ -1025,12 +1037,14 @@ class SpyApp(App[None]):
         self.usage = None
         self.next_tokens = None
         self.view.switch(dream_id)
-        # An index belongs to the context it was built from.
+        # An index belongs to the context it was built from; rebuilding
+        # one for the new context happens off the UI thread, like the
+        # scan a fresh search runs.
         self.matches = []
         self.match_at = None
         self.scanned_id = 0
         if self.view.pattern is not None:
-            self.index_matches(self.view.pattern)
+            self.run_worker(self.reindex(self.view.pattern))
 
     def update_status(self) -> None:
         """Redraw the status line."""
@@ -1086,9 +1100,9 @@ class SpyApp(App[None]):
         if event.input.id == "steer":
             await self.submit_steering(event.value)
         else:
-            self.submit_search(event.value)
+            await self.submit_search(event.value)
 
-    def submit_search(self, pattern: str) -> None:
+    async def submit_search(self, pattern: str) -> None:
         """Index the typed search, close the prompt and jump to a hit."""
         self.close_search()
         if not pattern:
@@ -1101,24 +1115,48 @@ class SpyApp(App[None]):
             self.update_status()
             return
         self.view.set_pattern(compiled)
-        self.index_matches(compiled)
-        self.jump_match(self.search_backward, first=True)
+        self.note = "indexing…"
+        self.update_status()
+        if await self.reindex(compiled):
+            self.note = ""
+            self.jump_match(self.search_backward, first=True)
 
-    def index_matches(self, pattern: re.Pattern[str]) -> None:
-        """Index a pattern over the whole stored context."""
-        self.matches = scan_matches(self.conn, pattern, self.dream_id)
-        self.match_at = None
-        self.scanned_id = newest_id(self.conn, self.dream_id)
+    async def reindex(self, compiled: re.Pattern[str]) -> bool:
+        """Rebuild the match index off the UI thread.
+
+        Indexing reads the whole stored history, which on a large
+        database takes long enough to feel; the scan runs in a thread on
+        a connection of its own, so the viewer keeps scrolling and the
+        UI connection is never shared across threads. ``False`` means
+        the pattern was cleared or replaced while the scan ran and its
+        result was thrown away.
+        """
+        self.indexing = True
+        try:
+            matches, scanned = await asyncio.to_thread(self._index_offline, compiled)
+        finally:
+            self.indexing = False
+        if self.view.pattern is not compiled:
+            return False
+        self.matches, self.match_at, self.scanned_id = matches, None, scanned
+        return True
+
+    def _index_offline(self, pattern: re.Pattern[str]) -> tuple[list[Match], int]:
+        """Scan one full index on a connection of this thread's own."""
+        with self.conn.engine.connect() as conn:
+            newest = newest_id(conn, self.dream_id)
+            return scan_matches(conn, pattern, self.dream_id, upto=newest), newest
 
     def extend_matches(self) -> None:
         """Index the rows appended since the last scan, if searching."""
         pattern = self.view.pattern
-        if pattern is None:
+        if pattern is None or self.indexing:
             return
+        newest = newest_id(self.conn, self.dream_id)
         self.matches.extend(
-            scan_matches(self.conn, pattern, self.dream_id, self.scanned_id)
+            scan_matches(self.conn, pattern, self.dream_id, self.scanned_id, newest)
         )
-        self.scanned_id = newest_id(self.conn, self.dream_id)
+        self.scanned_id = newest
 
     def jump_match(self, backward: bool, first: bool = False) -> None:
         """Move the cursor to the next occurrence and put it on screen.
