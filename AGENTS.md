@@ -231,6 +231,11 @@ it in `READ_ONLY_MESSAGING_TOOLS`.
   asks for `response_format="json"`, not `"text"`: an endpoint reads the
   format off the filename, and OpenRouter rejects `text` outright. Both
   were found by running real files through the lens, not by tests.
+- DREAMS.md is the one mind file with no write cap — it only grows — so
+  both paths into a dream cap the read instead: the opening event takes
+  `DREAMS_TAIL_CHARS`, `read_mind` takes `DREAMS_READ_CHARS`. Anything
+  read mid-dream rides every round that follows, because a dream session
+  is one unbroken chain.
 - Every history query, `Database.message_thread` included, builds on
   `_message_select()` in `db.py`; a column a transcript needs is added
   there once and reaches all of them.

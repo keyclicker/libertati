@@ -44,6 +44,12 @@ HABITS_MAX_CHARS = 2000
 #: that only ever grows the file is not consolidation.
 MEMORY_MAX_CHARS = 20000
 
+#: Most of DREAMS.md ``read_mind`` hands back, in characters. The
+#: journal is the one mind file nothing caps on write — it only grows —
+#: so the cap sits on the read instead, and a dream that asks for it
+#: mid-session cannot bury the rest of that session in old entries.
+DREAMS_READ_CHARS = 20000
+
 #: Mind files addressable by name from the dreaming loop.
 MIND_FILES = ("soul", "habits", "memory", "inbox", "dreams")
 

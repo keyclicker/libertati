@@ -128,6 +128,12 @@ context_trim_items = 200
 # Max model/tool rounds per agent turn (one turn per event batch).
 max_rounds = 8
 
+# When a turn ends in plain text instead of a tool call, spend one more
+# round telling the model that text reached nobody. Weaker models end
+# turns that way believing they replied; a model that always sends
+# through send_message only pays for the correction. Turn it off there.
+delivery_nudge = true
+
 
 # ==========================================================
 #                         Persona

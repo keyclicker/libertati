@@ -16,6 +16,7 @@ from libertati.chats import ChatRegistry
 from libertati.db import Database
 from libertati.memory import (
     DEFAULT_SOUL,
+    DREAMS_READ_CHARS,
     HABITS_MAX_CHARS,
     MEMORY_MAX_CHARS,
     SOUL_MAX_CHARS,
@@ -1664,6 +1665,21 @@ async def test_read_mind_returns_each_file(tmp_path: Path) -> None:
     assert await toolbox.run("read_mind", json.dumps({"file": "habits"})) == (
         "habits is empty"
     )
+
+
+async def test_read_mind_caps_the_journal(tmp_path: Path) -> None:
+    """An oversized DREAMS.md comes back as its tail, not whole."""
+    mind = make_mind(tmp_path)
+    mind.dreams_path.write_text(
+        "old" * DREAMS_READ_CHARS + "\nlatest entry", encoding="utf-8"
+    )
+    toolbox = make_dream_toolbox(mind)
+
+    result = await toolbox.run("read_mind", json.dumps({"file": "dreams"}))
+
+    assert result.endswith("latest entry")
+    assert result.startswith("[…earlier entries elided…]")
+    assert len(result) < DREAMS_READ_CHARS + 100
 
 
 async def test_write_dream_appends_a_dated_entry(tmp_path: Path) -> None:
