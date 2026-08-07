@@ -36,7 +36,7 @@ from libertati.config import Settings
 from libertati.db import Database
 from libertati.loop import response_usage
 from libertati.media import MediaLens, media_ref
-from libertati.memory import Mind
+from libertati.memory import DREAMS_READ_CHARS, Mind
 from libertati.prompts import Prompts
 from libertati.transcript import render_transcript
 
@@ -780,7 +780,8 @@ DREAM_TOOLS: list[ToolParam] = [
             "Re-read one of your mind files. Your soul and habits are in "
             "the sections above and the rest were handed to you when you "
             "fell asleep; use this to look at one again after you have "
-            "written to it."
+            "written to it. The dream journal comes back as its recent "
+            "tail, not the whole thing."
         ),
         "parameters": {
             "type": "object",
@@ -1745,9 +1746,19 @@ class Toolbox:
     # ==========================================================
 
     async def _read_mind(self, args: dict[str, Any]) -> str:
-        """Return one mind file's current text."""
-        text = self.mind.read(args["file"])
-        return text or f"{args['file']} is empty"
+        """Return one mind file's current text, the journal only in part.
+
+        A dream session is one unbroken chain of rounds, so whatever this
+        returns rides every round that follows it — and DREAMS.md is the
+        file that grows without bound.
+        """
+        name = args["file"]
+        text = (
+            self.mind.dreams_tail(DREAMS_READ_CHARS)
+            if name == "dreams"
+            else self.mind.read(name)
+        )
+        return text or f"{name} is empty"
 
     async def _write_dream(self, args: dict[str, Any]) -> str:
         """Append one dated reflection to the dream journal."""
