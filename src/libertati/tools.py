@@ -1626,10 +1626,10 @@ class Toolbox:
 
         Without a question the note is stored against the file, so the
         same picture read back later — here or in any transcript — costs
-        nothing more. With one, the artifact is looked at again and the
-        answer goes only to the caller: it answers what was asked rather
-        than describing the file, and the stored note stays the line
-        every transcript renders.
+        nothing more. With one, the file is fetched and looked at again
+        and the answer goes only to the caller: it answers what was
+        asked rather than describing the file, and the stored note stays
+        the line every transcript renders.
         """
         chat_id, message_id = args["chat_id"], args["message_id"]
         question = args.get("question")
