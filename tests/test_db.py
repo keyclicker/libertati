@@ -5,6 +5,7 @@ import json
 import stat
 from typing import Any
 
+import pytest
 from aiogram.types import Message
 from conftest import fetch_rows
 
@@ -42,6 +43,18 @@ async def test_save_and_recent_messages(db: Database) -> None:
 async def test_database_is_private_to_its_owner(db: Database) -> None:
     """Stored chats and model context are not world-readable."""
     assert stat.S_IMODE(db.path.stat().st_mode) == 0o600
+
+
+async def test_units_of_work_queue_on_one_connection(db: Database) -> None:
+    """A second checkout waits for the first to be handed back.
+
+    SQLite takes one writer at a time and nothing here retries, so
+    concurrency has to queue in the pool; a wider pool turns a backlog
+    of writes into "database is locked" once it outlasts busy_timeout.
+    """
+    async with db.engine.connect():
+        with pytest.raises(TimeoutError):
+            await asyncio.wait_for(db.engine.connect().start(), 0.2)
 
 
 async def test_resave_updates_in_place(db: Database) -> None:

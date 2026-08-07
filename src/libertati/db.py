@@ -81,8 +81,8 @@ def _configure_connection(dbapi_connection: Any, _record: Any) -> None:
     cursor = dbapi_connection.cursor()
     cursor.execute("PRAGMA journal_mode = WAL")
     cursor.execute("PRAGMA foreign_keys = ON")
-    # Pooled connections write concurrently, so a briefly locked
-    # database is normal; wait it out instead of failing.
+    # The spy writes operator instructions from its own process, so the
+    # file can be locked by someone this engine cannot queue behind.
     cursor.execute("PRAGMA busy_timeout = 5000")
     cursor.close()
 
@@ -131,7 +131,7 @@ def _read_cursor(chat_id: int, thread_key: int):
 class Database:
     """Async wrapper around the bot's SQLite database.
 
-    Owns an async engine over a small connection pool; call
+    Owns an async engine over a single pooled connection; call
     :meth:`connect` before use and :meth:`close` on shutdown. Every
     method is one unit of work — a single transaction for writes, a
     single pooled connection for reads — and rows come back as plain
@@ -153,7 +153,13 @@ class Database:
     async def connect(self) -> None:
         """Open the engine and prove the database file is reachable."""
         self.path.parent.mkdir(parents=True, exist_ok=True)
-        self._engine = create_async_engine(f"sqlite+aiosqlite:///{self.path}")
+        # One connection, so concurrent units of work queue in the pool
+        # instead of racing for SQLite's single writer slot: a real pool
+        # turns a backlog of writes into "database is locked" once the
+        # wait passes busy_timeout, and nothing here retries.
+        self._engine = create_async_engine(
+            f"sqlite+aiosqlite:///{self.path}", pool_size=1, max_overflow=0
+        )
         event.listen(self._engine.sync_engine, "connect", _configure_connection)
         # Open one connection now so a bad path fails here, not on the
         # first query, and so the file exists before it is chmodded.

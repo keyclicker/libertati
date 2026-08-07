@@ -35,7 +35,7 @@ One package, `src/libertati/`, no sub-packages:
 - `tools.py` — every function-tool schema and its handler (`Toolbox`).
 - `db.py` — SQLAlchemy (async, Core) persistence: messages/chats/users,
   append-only agent context, turns, usage, dreams, wakeups, console
-  instructions. Every method is one unit of work on a pooled
+  instructions. Every method is one unit of work on the single pooled
   connection and returns plain dicts.
 - `schema.py` — the tables as SQLAlchemy metadata, shared by `db.py`,
   the spy's sync engines and Alembic. Must not import aiogram/openai.
@@ -111,6 +111,14 @@ One package, `src/libertati/`, no sub-packages:
   `ChatOrder`'s per-chat lock. Anything else that makes the handler wait
   belongs inside that lock too, or a later message overtakes an earlier
   one on the way to the agent.
+- **One connection, so writes queue instead of racing.** `Database`
+  opens its engine with `pool_size=1, max_overflow=0`. SQLite admits
+  one writer at a time and no caller retries — `Agent._process` calls
+  `_remember` and `mark_messages_read` outside its `try`, so a raised
+  "database is locked" escapes `run_forever` and the agent stops
+  consuming events for good. A wider pool makes that reachable as soon
+  as a write backlog outlasts `busy_timeout`; the timeout is there for
+  the spy, which writes from a process this pool cannot queue behind.
 - **Timestamps**: UTC in the DB (`clock.utc_stamp`, matches SQLite's
   `datetime('now')`), the configured timezone for anything the model
   sees (`clock.format_local`).
