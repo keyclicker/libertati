@@ -534,7 +534,9 @@ async def test_turn_retries_private_final_output_once() -> None:
     nudge = calls[1]["input"][-1]["content"][0]
     assert nudge["type"] == "input_text"
     assert "call send_message now" in nudge["text"]
-    assert "This should have been sent" in nudge["text"]
+    # The text itself is not quoted back; the message item above it is.
+    assert "This should have been sent" not in nudge["text"]
+    assert calls[1]["input"][-2] == MESSAGE
     assert db.turns == [
         {"start_context_id": 0, "end_context_id": 2, "status": "completed"}
     ]
