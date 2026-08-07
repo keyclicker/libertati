@@ -63,15 +63,16 @@ class Event(NamedTuple):
     read_mark: tuple[int, int, int | None] | None = None
 
 
-def private_output_nudge(text: str) -> str:
-    """Build an internal retry message carrying the undelivered text."""
-    return f"""{PRIVATE_OUTPUT_NUDGE_PREFIX}
-Plain text output is private and was not sent. If the text below was meant for
-someone, call send_message now with that text and the target chat_id. If it was
-only private thought and no action is needed, stop with no text.
-
-Unsent text:
-{text}"""
+#: The correction a private final output gets, when it gets one. The
+#: text itself is not quoted back: the message item that carried it sits
+#: directly above this one in the same window, so an echo would pay for
+#: every undelivered thought twice.
+PRIVATE_OUTPUT_NUDGE = (
+    f"{PRIVATE_OUTPUT_NUDGE_PREFIX}\n"
+    "Your text above was private and went nowhere. If it was meant for"
+    " someone, call send_message now with it and the target chat_id;"
+    " if it was only thought, stop with no text."
+)
 
 
 #: Tag opening the event an operator instruction arrives as. The spy
@@ -176,6 +177,8 @@ class Agent(ModelLoop):
         )
         # Max model/tool rounds per turn (one turn per batch of events).
         self.max_rounds = settings.max_rounds
+        # Whether a private final output is worth one corrective round.
+        self.delivery_nudge = settings.delivery_nudge
         # Overflow threshold and post-trim size of the context window.
         # Trimming in chunks (not one-by-one) keeps the context prefix
         # byte-stable between trims instead of rewriting it on every
@@ -493,10 +496,12 @@ class Agent(ModelLoop):
         """Run one agentic turn: call the model, execute tools, repeat.
 
         The turn ends when the model produces no tool calls or ``max_rounds``
-        is reached. A non-empty private final output gets one corrective retry
-        because some compatible providers mistake it for a delivered reply.
-        Everything the model produces is remembered. SOUL.md and HABITS.md
-        are re-read every turn so edits to either apply live.
+        is reached. Where ``delivery_nudge`` is on, a non-empty private final
+        output gets one corrective retry: weaker models mistake private text
+        for a delivered reply, while a model that never does pays a round for
+        a reminder it does not need. Everything the model produces is
+        remembered. SOUL.md and HABITS.md are re-read every turn so edits to
+        either apply live.
 
         Urgent console instructions are picked up between rounds, so an
         operator can redirect a turn that is already several tool calls
@@ -512,7 +517,11 @@ class Agent(ModelLoop):
         try:
             for remaining in range(self.max_rounds, 0, -1):
                 if not await self._round(instructions, turn_id):
-                    if self._last_output_text and not corrected_private_output:
+                    if (
+                        self.delivery_nudge
+                        and self._last_output_text
+                        and not corrected_private_output
+                    ):
                         corrected_private_output = True
                         await self._remember(
                             {
@@ -521,9 +530,7 @@ class Agent(ModelLoop):
                                 "content": [
                                     {
                                         "type": "input_text",
-                                        "text": private_output_nudge(
-                                            self._last_output_text
-                                        ),
+                                        "text": PRIVATE_OUTPUT_NUDGE,
                                     }
                                 ],
                             }

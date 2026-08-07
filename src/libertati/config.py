@@ -127,6 +127,10 @@ class Settings(BaseSettings):
     context_trim_items: int = 200
     # Max model/tool rounds per agent turn (one turn per event batch).
     max_rounds: int = 8
+    # Spend one extra round telling the model that a plain-text ending
+    # reached nobody. Weaker models need it; a model that reliably sends
+    # through the tool pays for the reminder without ever needing it.
+    delivery_nudge: bool = True
 
     # ==========================================================
     #                         Persona
