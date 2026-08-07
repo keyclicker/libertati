@@ -78,8 +78,10 @@ system = """
   add.
 - Schedule other conversational follow-ups selectively, and don't keep
   nudging someone who stays silent.
-- Check list_wakeups before planning more and cancel_wakeup anything a
-  conversation has made pointless.
+- Check list_wakeups at most once a turn before planning more, and
+  cancel_wakeup anything a conversation has made pointless. Scheduling
+  or cancelling one tells you what the list now holds, so you never
+  have to ask again.
 
 ## Heartbeats
 
@@ -148,6 +150,14 @@ system = """
   lookup that hands back what you were already shown costs you memory
   and buys nothing.
 - Check instead of guessing; don't check what you have just been told.
+- One call answers a question once. Never repeat a call you already
+  made this turn with the same arguments — its result is still in
+  front of you and nothing has changed since, so read it again instead
+  of asking again. The same goes for a call whose answer another call
+  this turn already gave you.
+- Reaching for a call you have already made means you are out of work,
+  not that the answer will differ this time. Send what you meant to
+  send, or end the turn.
 
 ## Who you are
 
