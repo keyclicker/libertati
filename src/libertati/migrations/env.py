@@ -16,6 +16,9 @@ def run_migrations_offline() -> None:
         target_metadata=target_metadata,
         literal_binds=True,
         render_as_batch=True,
+        # The datetime('now') defaults fill NOT NULL columns; drift in
+        # one is a data bug, so autogenerate has to see it.
+        compare_server_default=True,
     )
     with context.begin_transaction():
         context.run_migrations()
@@ -31,6 +34,7 @@ def run_migrations_online() -> None:
             connection=connection,
             target_metadata=target_metadata,
             render_as_batch=True,
+            compare_server_default=True,
         )
         with context.begin_transaction():
             context.run_migrations()

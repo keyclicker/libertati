@@ -12,12 +12,20 @@ from libertati.migrations import upgrade_to_head
 
 
 def test_upgrade_creates_the_declared_schema(tmp_path: Path) -> None:
-    """A fresh upgrade matches schema.metadata with no drift."""
+    """A fresh upgrade matches schema.metadata with no drift.
+
+    Server defaults are compared too: they are off by default, and a
+    revision whose datetime('now') default drifted from the metadata
+    would otherwise pass while writing NULLs into NOT NULL columns.
+    """
     db_path = tmp_path / "fresh.db"
     upgrade_to_head(db_path)
     engine = create_engine(f"sqlite:///{db_path}")
     with engine.connect() as conn:
-        diff = compare_metadata(MigrationContext.configure(conn), schema.metadata)
+        migration_context = MigrationContext.configure(
+            conn, opts={"compare_server_default": True}
+        )
+        diff = compare_metadata(migration_context, schema.metadata)
     engine.dispose()
     assert diff == []
 
