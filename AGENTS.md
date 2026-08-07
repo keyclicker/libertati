@@ -46,9 +46,10 @@ One package, `src/libertati/`, no sub-packages:
 - `media.py` — `MediaLens`: turns a message's picture/sticker/gif/video
   into one cached text note (frames tiled into a single image), voice
   into a transcript; `media_ref` resolves what a raw payload carries.
-  Off unless `media_model` is set; runs on `base_url` with the one
-  `api_key`, so a model named there must be one that provider serves.
-  Needs ffmpeg on PATH.
+  Wholly in memory: downloads are buffers, ffmpeg reads stdin and
+  writes stdout, nothing binary lands on disk. Off unless `media_model`
+  is set; runs on `base_url` with the one `api_key`, so a model named
+  there must be one that provider serves. Needs ffmpeg on PATH.
 - `memory.py` — `Mind`: the five markdown mind files under
   `data/memory/`.
 - `config.py` — pydantic-settings `Settings` (env > .env >
@@ -101,10 +102,11 @@ One package, `src/libertati/`, no sub-packages:
   does, folded into one transcript line by `transcript.media_body`.
   Notes are keyed by `file_unique_id` (describe once, ever) and reach a
   transcript through `messages.media_uid`, which is written only after a
-  description exists. Originals are deleted straight after ffmpeg runs;
-  only the compressed artifact under `media_dir` stays, and it gets there
-  by rename — ffmpeg writes into `media_dir/tmp`, because anything in
-  `media_dir` is described again without being looked at.
+  description exists. Media never touches disk either: the original is
+  downloaded into memory, piped through ffmpeg (stdin to stdout) and
+  sent to the model as bytes. Nothing binary is kept — a second look
+  (`look_at_media` with a question) fetches the file from Telegram
+  again.
 - **Events arrive in the order they were sent.** aiogram runs every
   update in its own task and `on_message` waits up to
   `media_wait_seconds` for a description, so the push happens under
@@ -221,13 +223,14 @@ it in `READ_ONLY_MESSAGING_TOOLS`.
   both) when no `media_model` is configured — `build_tools(media=…)`
   and the `MEDIA_TOOL_NAMES` subtraction in `Toolbox.__init__`.
 - `look_at_media` with a `question` takes a different path: `MediaLens.
-  ask` reuses the artifact, answers with the looser `[media].answer`
-  prompt under `media_answer_chars`, and stores nothing. Only the
-  describing path writes `media_notes`, because only it describes the
-  file rather than answering about it.
+  ask` fetches the file from Telegram again (nothing of the first look
+  was kept), answers with the looser `[media].answer` prompt under
+  `media_answer_chars`, and stores nothing. Only the describing path
+  writes `media_notes`, because only it describes the file rather than
+  answering about it.
 - ffmpeg is a hard dependency of the media path only; tests never invoke
-  it (they pre-create the artifact), so CI needs no ffmpeg.
-- The voice artifact is named `.ogg`, not `.opus`, and transcription
+  it (the autouse `ffmpeg` fixture stubs `_run`), so CI needs no ffmpeg.
+- The voice upload is named `.ogg`, not `.opus`, and transcription
   asks for `response_format="json"`, not `"text"`: an endpoint reads the
   format off the filename, and OpenRouter rejects `text` outright. Both
   were found by running real files through the lens, not by tests.

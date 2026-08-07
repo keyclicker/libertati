@@ -12,23 +12,21 @@ small image, which any vision model reads — no native video input, no
 whole file uploaded anywhere. Voice notes take the other branch and go to
 a speech-to-text endpoint.
 
-Only compressed derivatives are kept (under ``media_dir``): one small
-webp per picture or frame strip, one low-bitrate opus per voice message.
-Originals live in ``tmp/`` for exactly as long as ffmpeg needs them, and
-so does the artifact until it is whole — what lands in ``media_dir`` is
-described without a second look, so it may never be half-written.
+Nothing binary touches disk either. A file is downloaded into memory,
+piped through ffmpeg's stdin and out of its stdout, and sent to the
+model as bytes; when the note lands, the bytes are gone. What survives a
+look is text in the database — a machine this bot runs on never holds a
+stranger's picture at rest. A second look at the same file (a
+``look_at_media`` question) downloads it again; Telegram keeps the
+original, so the ``file_id`` is the cache.
 """
 
 import asyncio
 import base64
-import hashlib
 import logging
-import re
-import shutil
 from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
 from dataclasses import dataclass
-from pathlib import Path
 from typing import Any
 
 from aiogram import Bot
@@ -40,16 +38,17 @@ from libertati.prompts import Prompts
 
 log = logging.getLogger(__name__)
 
-#: Width of every stored frame. Small on purpose: the describer is asked
-#: what is going on, not to read fine print, and a low-detail image costs
-#: a fraction of a full-size one on every provider that prices by tile.
+#: Width of every frame sent to the model. Small on purpose: the
+#: describer is asked what is going on, not to read fine print, and a
+#: low-detail image costs a fraction of a full-size one on every
+#: provider that prices by tile.
 FRAME_WIDTH = 320
 
-#: webp quality of the stored artifact (0-100, ffmpeg scale).
+#: webp quality of the encoded frame (0-100, ffmpeg scale).
 FRAME_QUALITY = 60
 
-#: Mono opus bitrate kept for voice/audio. Speech survives it; the file
-#: is a tenth of the original and stays re-transcribable.
+#: Mono opus bitrate voice/audio is sent at. Speech survives it; the
+#: upload is a tenth of the original and stays transcribable.
 AUDIO_BITRATE = "16k"
 
 #: Telegram refuses ``getFile`` past 20 MB, so anything bigger cannot be
@@ -96,7 +95,7 @@ class MediaRef:
     kind: str
     file_id: str
     file_unique_id: str
-    #: How the artifact is built: ``image``, ``video`` or ``audio``.
+    #: How the upload is built: ``image``, ``video`` or ``audio``.
     source: str
     #: What the file is, in words, for the describer's prompt.
     hint: str
@@ -113,7 +112,7 @@ def _photo_ref(variants: list[dict[str, Any]]) -> MediaRef | None:
 
     Telegram serves a photo pre-resized, which is the whole image
     pipeline for free: the smallest variant at least :data:`FRAME_WIDTH`
-    wide is already the artifact. Identity is the largest variant's
+    wide is already frame-sized. Identity is the largest variant's
     ``file_unique_id`` — variants have one each, and the largest is the
     only one every message of that photo is guaranteed to carry.
     """
@@ -240,41 +239,34 @@ def media_ref(payload: dict[str, Any]) -> MediaRef | None:
 #                      Building frames
 # ==========================================================
 
-
-def artifact_name(file_unique_id: str, suffix: str) -> str:
-    """Build the on-disk name of one file's artifact.
-
-    Telegram's ids are URL-safe base64 and land unchanged; anything else
-    is reduced to a hash, so an unexpected id can never name a path
-    outside the media directory.
-    """
-    safe = re.sub(r"[^A-Za-z0-9_-]", "", file_unique_id)
-    if safe != file_unique_id or not safe:
-        digest = hashlib.sha256(file_unique_id.encode("utf-8")).hexdigest()[:16]
-        safe = f"{safe[:16]}-{digest}" if safe else digest
-    return f"{safe}{suffix}"
+# Every command reads the original from stdin and writes the result to
+# stdout: files are what this module is built to avoid. Piped input
+# rules out formats that need seeking, but everything Telegram serves
+# here is written to stream — its videos and gifs are faststart mp4,
+# stickers webm, voice ogg.
 
 
-def image_command(source: Path, target: Path) -> list[str]:
-    """Build the ffmpeg call turning one picture into the stored webp."""
+def image_command() -> list[str]:
+    """Build the ffmpeg call turning one picture into a small webp."""
     return [
         "ffmpeg",
-        "-y",
         "-i",
-        str(source),
+        "pipe:0",
         "-vf",
         f"scale={FRAME_WIDTH}:-2:force_original_aspect_ratio=decrease",
         "-frames:v",
         "1",
+        "-c:v",
+        "libwebp",
         "-quality",
         str(FRAME_QUALITY),
-        str(target),
+        "-f",
+        "image2pipe",
+        "pipe:1",
     ]
 
 
-def frames_command(
-    source: Path, target: Path, frames: int, duration: float
-) -> list[str]:
+def frames_command(frames: int, duration: float) -> list[str]:
     """Build the ffmpeg call tiling a clip's frames into one webp.
 
     Frames are sampled at an even rate across the clip and laid out left
@@ -283,30 +275,32 @@ def frames_command(
     alone rather than risking a half-empty tile.
     """
     if frames < 2 or duration <= 0:
-        return image_command(source, target)
+        return image_command()
     scale = f"scale={FRAME_WIDTH}:-2:force_original_aspect_ratio=decrease"
     return [
         "ffmpeg",
-        "-y",
         "-i",
-        str(source),
+        "pipe:0",
         "-vf",
         f"fps={frames}/{duration:.3f},{scale},tile={frames}x1",
         "-frames:v",
         "1",
+        "-c:v",
+        "libwebp",
         "-quality",
         str(FRAME_QUALITY),
-        str(target),
+        "-f",
+        "image2pipe",
+        "pipe:1",
     ]
 
 
-def audio_command(source: Path, target: Path) -> list[str]:
+def audio_command() -> list[str]:
     """Build the ffmpeg call re-encoding sound to small mono opus."""
     return [
         "ffmpeg",
-        "-y",
         "-i",
-        str(source),
+        "pipe:0",
         "-vn",
         "-ac",
         "1",
@@ -314,12 +308,14 @@ def audio_command(source: Path, target: Path) -> list[str]:
         "libopus",
         "-b:a",
         AUDIO_BITRATE,
-        str(target),
+        "-f",
+        "ogg",
+        "pipe:1",
     ]
 
 
-async def _run(command: list[str]) -> bytes | None:
-    """Run one ffmpeg-family command; return its stdout, or ``None``.
+async def _run(command: list[str], data: bytes) -> bytes | None:
+    """Feed ``data`` to one ffmpeg-family command; stdout, or ``None``.
 
     Failures are logged and swallowed: a file that will not decode is a
     file without a description, never an exception reaching a handler.
@@ -327,6 +323,7 @@ async def _run(command: list[str]) -> bytes | None:
     try:
         process = await asyncio.create_subprocess_exec(
             *command,
+            stdin=asyncio.subprocess.PIPE,
             stdout=asyncio.subprocess.PIPE,
             stderr=asyncio.subprocess.PIPE,
         )
@@ -335,7 +332,7 @@ async def _run(command: list[str]) -> bytes | None:
         return None
     try:
         stdout, stderr = await asyncio.wait_for(
-            process.communicate(), timeout=FFMPEG_TIMEOUT
+            process.communicate(data), timeout=FFMPEG_TIMEOUT
         )
     except TimeoutError:
         process.kill()
@@ -353,7 +350,7 @@ async def _run(command: list[str]) -> bytes | None:
     return stdout
 
 
-async def probe_duration(source: Path) -> float:
+async def probe_duration(data: bytes) -> float:
     """Return a media file's duration in seconds, or 0 when unknown."""
     output = await _run(
         [
@@ -364,8 +361,9 @@ async def probe_duration(source: Path) -> float:
             "format=duration",
             "-of",
             "default=noprint_wrappers=1:nokey=1",
-            str(source),
-        ]
+            "pipe:0",
+        ],
+        data,
     )
     try:
         return max(0.0, float((output or b"").decode().strip()))
@@ -394,7 +392,6 @@ class MediaLens:
         bot: Bot,
         client: AsyncOpenAI,
         model: str,
-        media_dir: Path,
         describe_prompt: str,
         answer_prompt: str = "",
         transcribe_model: str | None = None,
@@ -408,7 +405,6 @@ class MediaLens:
         self.bot = bot
         self.client = client
         self.model = model
-        self.media_dir = media_dir
         self.describe_prompt = describe_prompt
         self.answer_prompt = answer_prompt
         self.transcribe_model = transcribe_model
@@ -448,7 +444,6 @@ class MediaLens:
             bot=bot,
             client=AsyncOpenAI(api_key=settings.api_key, base_url=settings.base_url),
             model=settings.media_model,
-            media_dir=settings.media_dir,
             describe_prompt=prompts.media_describe,
             answer_prompt=prompts.media_answer,
             transcribe_model=settings.transcribe_model or None,
@@ -457,23 +452,6 @@ class MediaLens:
             answer_chars=settings.media_answer_chars,
             wait_seconds=settings.media_wait_seconds,
         )
-
-    def ensure(self) -> None:
-        """Create the media directories, emptying leftover temporaries.
-
-        Nothing in ``tmp/`` is meant to outlive the job that put it
-        there — an original waiting for ffmpeg, an artifact waiting to be
-        whole — so whatever is still there is debris from a killed
-        process.
-        """
-        self.media_dir.mkdir(parents=True, exist_ok=True)
-        shutil.rmtree(self._tmp_dir, ignore_errors=True)
-        self._tmp_dir.mkdir(parents=True, exist_ok=True)
-
-    @property
-    def _tmp_dir(self) -> Path:
-        """Directory holding a job's files until they are wanted."""
-        return self.media_dir / "tmp"
 
     # ---------------------- entry points ----------------------
 
@@ -505,6 +483,8 @@ class MediaLens:
         breed the dog is, which frame the cup falls in. The answer is not
         written to ``media_notes``: it answers a question rather than
         describing the file, and every later transcript would carry it.
+        The file is fetched from Telegram anew — nothing of the first
+        look was kept to reuse.
 
         Audio has no such second look — a transcription endpoint takes no
         question — so a voice message answers with its transcript, which
@@ -517,10 +497,10 @@ class MediaLens:
             if ref.source == "audio":
                 return await self._note(chat_id, message_id, ref)
             async with self._file_lock(ref.file_unique_id), self._jobs:
-                artifact = await self._artifact(ref)
-                if artifact is None:
+                upload = await self._build(ref)
+                if upload is None:
                     return None
-                return await self._describe_image(ref, artifact, question=question)
+                return await self._describe_image(ref, upload, question=question)
         except Exception:
             log.exception("answering about %s in chat %s failed", ref.kind, chat_id)
             return None
@@ -610,71 +590,47 @@ class MediaLens:
             return self.transcribe_model or ""
         return self.model
 
-    async def _artifact(self, ref: MediaRef) -> Path | None:
-        """Return a file's compressed artifact, building it if needed.
+    async def _describe(self, ref: MediaRef) -> str | None:
+        """Fetch and compress the file, then ask a model what it is."""
+        if ref.source == "audio" and not self.transcribe_model:
+            return None
+        async with self._jobs:
+            upload = await self._build(ref)
+            if upload is None:
+                return None
+            if ref.source == "audio":
+                return await self._transcribe(upload)
+            return await self._describe_image(ref, upload)
 
-        One that survived an earlier look is reused as it stands, so a
-        second question about the same picture touches neither Telegram
-        nor ffmpeg.
+    async def _build(self, ref: MediaRef) -> bytes | None:
+        """Download the original and compress it, all in memory.
+
+        The original exists only as bytes between the Telegram download
+        and the pipe into ffmpeg; what comes back out of the pipe is the
+        small webp or opus the model is sent. Nothing is written
+        anywhere, so there is no half-written file to trust later and
+        nothing to clean up after a crash.
         """
         if ref.size > MAX_DOWNLOAD_BYTES:
             log.info(
                 "skipping %s: %d bytes is past Telegram's limit", ref.kind, ref.size
             )
             return None
-        # Named by container, not codec: a transcription endpoint reads
-        # the format off the filename it is handed, and ".ogg" is on
-        # every provider's list where ".opus" is on few.
-        suffix = ".ogg" if ref.source == "audio" else ".webp"
-        artifact = self.media_dir / artifact_name(ref.file_unique_id, suffix)
-        if artifact.exists():
-            return artifact
-        return artifact if await self._build(ref, artifact) else None
-
-    async def _describe(self, ref: MediaRef) -> str | None:
-        """Build the artifact if needed, then ask a model what it is."""
-        if ref.source == "audio" and not self.transcribe_model:
+        buffer = await self.bot.download(ref.file_id)
+        original = buffer.read() if buffer is not None else b""
+        if not original:
             return None
-        async with self._jobs:
-            artifact = await self._artifact(ref)
-            if artifact is None:
-                return None
-            if ref.source == "audio":
-                return await self._transcribe(artifact)
-            return await self._describe_image(ref, artifact)
-
-    async def _build(self, ref: MediaRef, artifact: Path) -> bool:
-        """Download the original and compress it into ``artifact``.
-
-        Both intermediate files live in ``tmp/`` and neither survives the
-        call: the original because it is the one file here nobody wants
-        on disk, the half-encoded artifact because everything in
-        ``media_dir`` is trusted and described without a second look. A
-        process killed mid-encode therefore loses the work, rather than
-        leaving behind a truncated picture it would describe forever.
-        """
-        original = self._tmp_dir / artifact_name(ref.file_unique_id, ".bin")
-        staged = self._tmp_dir / artifact.name
-        self._tmp_dir.mkdir(parents=True, exist_ok=True)
-        try:
-            await self.bot.download(ref.file_id, destination=original)
-            if ref.source == "video":
-                duration = await probe_duration(original)
-                command = frames_command(original, staged, self.max_frames, duration)
-            elif ref.source == "audio":
-                command = audio_command(original, staged)
-            else:
-                command = image_command(original, staged)
-            if await _run(command) is None or not staged.exists():
-                return False
-            staged.replace(artifact)
-        finally:
-            original.unlink(missing_ok=True)
-            staged.unlink(missing_ok=True)
-        return artifact.exists()
+        if ref.source == "video":
+            duration = await probe_duration(original)
+            command = frames_command(self.max_frames, duration)
+        elif ref.source == "audio":
+            command = audio_command()
+        else:
+            command = image_command()
+        return await _run(command, original) or None
 
     async def _describe_image(
-        self, ref: MediaRef, artifact: Path, question: str | None = None
+        self, ref: MediaRef, upload: bytes, question: str | None = None
     ) -> str | None:
         """Ask the vision model to put one small image into words.
 
@@ -682,7 +638,7 @@ class MediaLens:
         answer may run longer: it is read once, by the agent that asked,
         rather than stored and carried by every later transcript.
         """
-        data = base64.b64encode(artifact.read_bytes()).decode("ascii")
+        data = base64.b64encode(upload).decode("ascii")
         hint = ref.hint
         if ref.source == "video":
             hint += (
@@ -720,17 +676,20 @@ class MediaLens:
         cap = self.answer_chars if question else self.note_chars
         return self._clean(response.output_text, cap)
 
-    async def _transcribe(self, artifact: Path) -> str | None:
-        """Send one voice/audio artifact to the speech-to-text endpoint.
+    async def _transcribe(self, upload: bytes) -> str | None:
+        """Send one voice/audio recording to the speech-to-text endpoint.
 
-        ``json`` rather than ``text``: it is the one response format
-        every transcription endpoint offers (OpenRouter rejects ``text``
-        outright), and the answer is read the same either way — some
-        compatible endpoints hand back the bare string regardless.
+        The upload is named ``.ogg`` rather than ``.opus`` — an endpoint
+        reads the format off the filename it is handed, and ``.ogg`` is
+        on every provider's list where ``.opus`` is on few. ``json``
+        rather than ``text`` for the same reason: it is the one response
+        format every transcription endpoint offers (OpenRouter rejects
+        ``text`` outright), and the answer is read the same either way —
+        some compatible endpoints hand back the bare string regardless.
         """
         response = await self.client.audio.transcriptions.create(
             model=self.transcribe_model or "",
-            file=(artifact.name, artifact.read_bytes(), "audio/ogg"),
+            file=("voice.ogg", upload, "audio/ogg"),
             response_format="json",
         )
         text = response if isinstance(response, str) else getattr(response, "text", "")

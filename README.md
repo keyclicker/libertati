@@ -36,9 +36,11 @@ when to reply. Plain assistant output is ignored and sends nothing.
   Voice messages go to a speech-to-text model instead. Descriptions are
   keyed by Telegram's `file_unique_id`, so the sticker a group spams all
   day is paid for once; the describer runs on the same endpoint and key
-  as the agent itself; only compressed derivatives are kept on disk
-  (one small webp per picture or frame strip, one low-bitrate opus per
-  voice message). Media that arrives while nobody is addressing the bot
+  as the agent itself. Nothing binary touches disk either: a file is
+  downloaded into memory, piped through ffmpeg and sent to the model as
+  bytes, and what survives a look is the text in the database — a second
+  look fetches the file from Telegram again. Media that arrives while
+  nobody is addressing the bot
   is described in the background, so the note is ready by the time that
   message rides along with a later event. Off until `media_model` is
   set (`media_model` / `transcribe_model`).

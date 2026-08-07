@@ -55,9 +55,6 @@ class Settings(BaseSettings):
     db_path: Path = Path("data/libertati.db")
     # Directory holding SOUL.md / MEMORY.md / INBOX.md / DREAMS.md.
     memory_dir: Path = Path("data/memory")
-    # Directory holding the compressed media artifacts (one small webp
-    # or opus per described file); originals are never kept.
-    media_dir: Path = Path("data/media")
 
     # ==========================================================
     #                     Model & reasoning
