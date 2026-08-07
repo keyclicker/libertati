@@ -12,27 +12,32 @@ small image, which any vision model reads — no native video input, no
 whole file uploaded anywhere. Voice notes take the other branch and go to
 a speech-to-text endpoint.
 
-Only compressed derivatives are kept (under ``media_dir``): one small
-webp per picture or frame strip, one low-bitrate opus per voice message.
-Originals live in ``tmp/`` for exactly as long as ffmpeg needs them, and
-so does the artifact until it is whole — what lands in ``media_dir`` is
-described without a second look, so it may never be half-written.
+A model may refuse a file — its provider's content policy, not ours.
+A refusal is remembered (``media_refusals``) and is final: that file is
+never downloaded or sent to a model again, so the provider sees any
+given file at most once. Only an actual no counts — a timeout or a
+server error is not a refusal and stays retryable.
+
+Nothing binary touches disk either. A file is downloaded into memory,
+handed to ffmpeg as an anonymous in-memory file, and sent to the model
+as the bytes ffmpeg writes back down its stdout; when the note lands,
+the bytes are gone. What survives a look is text in the database — a
+machine this bot runs on never holds a stranger's picture at rest. A
+second look at the same file (a ``look_at_media`` question) downloads it
+again; Telegram keeps the original, so the ``file_id`` is the cache.
 """
 
 import asyncio
 import base64
-import hashlib
 import logging
-import re
-import shutil
-from collections.abc import AsyncIterator
-from contextlib import asynccontextmanager
+import os
+from collections.abc import AsyncIterator, Iterator
+from contextlib import asynccontextmanager, contextmanager
 from dataclasses import dataclass
-from pathlib import Path
 from typing import Any
 
 from aiogram import Bot
-from openai import AsyncOpenAI
+from openai import AsyncOpenAI, BadRequestError
 
 from libertati.config import Settings
 from libertati.db import Database
@@ -40,16 +45,17 @@ from libertati.prompts import Prompts
 
 log = logging.getLogger(__name__)
 
-#: Width of every stored frame. Small on purpose: the describer is asked
-#: what is going on, not to read fine print, and a low-detail image costs
-#: a fraction of a full-size one on every provider that prices by tile.
+#: Width of every frame sent to the model. Small on purpose: the
+#: describer is asked what is going on, not to read fine print, and a
+#: low-detail image costs a fraction of a full-size one on every
+#: provider that prices by tile.
 FRAME_WIDTH = 320
 
-#: webp quality of the stored artifact (0-100, ffmpeg scale).
+#: webp quality of the encoded frame (0-100, ffmpeg scale).
 FRAME_QUALITY = 60
 
-#: Mono opus bitrate kept for voice/audio. Speech survives it; the file
-#: is a tenth of the original and stays re-transcribable.
+#: Mono opus bitrate voice/audio is sent at. Speech survives it; the
+#: upload is a tenth of the original and stays transcribable.
 AUDIO_BITRATE = "16k"
 
 #: Telegram refuses ``getFile`` past 20 MB, so anything bigger cannot be
@@ -96,7 +102,7 @@ class MediaRef:
     kind: str
     file_id: str
     file_unique_id: str
-    #: How the artifact is built: ``image``, ``video`` or ``audio``.
+    #: How the upload is built: ``image``, ``video`` or ``audio``.
     source: str
     #: What the file is, in words, for the describer's prompt.
     hint: str
@@ -113,7 +119,7 @@ def _photo_ref(variants: list[dict[str, Any]]) -> MediaRef | None:
 
     Telegram serves a photo pre-resized, which is the whole image
     pipeline for free: the smallest variant at least :data:`FRAME_WIDTH`
-    wide is already the artifact. Identity is the largest variant's
+    wide is already frame-sized. Identity is the largest variant's
     ``file_unique_id`` — variants have one each, and the largest is the
     only one every message of that photo is guaranteed to carry.
     """
@@ -240,41 +246,65 @@ def media_ref(payload: dict[str, Any]) -> MediaRef | None:
 #                      Building frames
 # ==========================================================
 
+# Every command reads the original out of an anonymous in-memory file
+# and writes the result to stdout: files on disk are what this module is
+# built to avoid, but a *seekable* input is not optional. A pipe is not
+# seekable, and an mp4 whose moov atom sits at the end — which is most
+# of what people upload, Telegram stores it as sent — cannot be demuxed
+# without one. So the descriptor goes to the child instead of the bytes.
 
-def artifact_name(file_unique_id: str, suffix: str) -> str:
-    """Build the on-disk name of one file's artifact.
 
-    Telegram's ids are URL-safe base64 and land unchanged; anything else
-    is reduced to a hash, so an unexpected id can never name a path
-    outside the media directory.
+@contextmanager
+def in_memory_file(data: bytes) -> Iterator[int]:
+    """Hold ``data`` in an anonymous file and yield its descriptor.
+
+    A memfd lives in RAM, has no name in any directory and is gone when
+    the last descriptor closes — so ffmpeg gets something it can seek in
+    without a stranger's file ever existing on disk. The child reads it
+    by path (:func:`source_path`) rather than by inheriting our offset,
+    so several runs over the same original are free and independent.
     """
-    safe = re.sub(r"[^A-Za-z0-9_-]", "", file_unique_id)
-    if safe != file_unique_id or not safe:
-        digest = hashlib.sha256(file_unique_id.encode("utf-8")).hexdigest()[:16]
-        safe = f"{safe[:16]}-{digest}" if safe else digest
-    return f"{safe}{suffix}"
+    fd = os.memfd_create("libertati-media", os.MFD_CLOEXEC)
+    try:
+        view = memoryview(data)
+        while view:
+            view = view[os.write(fd, view) :]
+        yield fd
+    finally:
+        os.close(fd)
 
 
-def image_command(source: Path, target: Path) -> list[str]:
-    """Build the ffmpeg call turning one picture into the stored webp."""
+def source_path(source: int) -> str:
+    """Name a descriptor as the path the ffmpeg child opens it by.
+
+    ``pass_fds`` leaves the descriptor at the same number in the child,
+    where ``/proc/self/fd`` resolves to the child's own table — so this
+    path means the memfd there, opened afresh at offset zero.
+    """
+    return f"/proc/self/fd/{source}"
+
+
+def image_command(source: int) -> list[str]:
+    """Build the ffmpeg call turning one picture into a small webp."""
     return [
         "ffmpeg",
-        "-y",
         "-i",
-        str(source),
+        source_path(source),
         "-vf",
         f"scale={FRAME_WIDTH}:-2:force_original_aspect_ratio=decrease",
         "-frames:v",
         "1",
+        "-c:v",
+        "libwebp",
         "-quality",
         str(FRAME_QUALITY),
-        str(target),
+        "-f",
+        "image2pipe",
+        "pipe:1",
     ]
 
 
-def frames_command(
-    source: Path, target: Path, frames: int, duration: float
-) -> list[str]:
+def frames_command(source: int, frames: int, duration: float) -> list[str]:
     """Build the ffmpeg call tiling a clip's frames into one webp.
 
     Frames are sampled at an even rate across the clip and laid out left
@@ -283,30 +313,32 @@ def frames_command(
     alone rather than risking a half-empty tile.
     """
     if frames < 2 or duration <= 0:
-        return image_command(source, target)
+        return image_command(source)
     scale = f"scale={FRAME_WIDTH}:-2:force_original_aspect_ratio=decrease"
     return [
         "ffmpeg",
-        "-y",
         "-i",
-        str(source),
+        source_path(source),
         "-vf",
         f"fps={frames}/{duration:.3f},{scale},tile={frames}x1",
         "-frames:v",
         "1",
+        "-c:v",
+        "libwebp",
         "-quality",
         str(FRAME_QUALITY),
-        str(target),
+        "-f",
+        "image2pipe",
+        "pipe:1",
     ]
 
 
-def audio_command(source: Path, target: Path) -> list[str]:
+def audio_command(source: int) -> list[str]:
     """Build the ffmpeg call re-encoding sound to small mono opus."""
     return [
         "ffmpeg",
-        "-y",
         "-i",
-        str(source),
+        source_path(source),
         "-vn",
         "-ac",
         "1",
@@ -314,21 +346,28 @@ def audio_command(source: Path, target: Path) -> list[str]:
         "libopus",
         "-b:a",
         AUDIO_BITRATE,
-        str(target),
+        "-f",
+        "ogg",
+        "pipe:1",
     ]
 
 
-async def _run(command: list[str]) -> bytes | None:
-    """Run one ffmpeg-family command; return its stdout, or ``None``.
+async def _run(command: list[str], source: int) -> bytes | None:
+    """Run one ffmpeg-family command over ``source``; stdout, or ``None``.
 
-    Failures are logged and swallowed: a file that will not decode is a
-    file without a description, never an exception reaching a handler.
+    The command already names the descriptor as a path; handing the
+    descriptor itself to the child (``pass_fds``) is what makes that path
+    resolve there. Failures are logged and swallowed: a file that will
+    not decode is a file without a description, never an exception
+    reaching a handler.
     """
     try:
         process = await asyncio.create_subprocess_exec(
             *command,
+            stdin=asyncio.subprocess.DEVNULL,
             stdout=asyncio.subprocess.PIPE,
             stderr=asyncio.subprocess.PIPE,
+            pass_fds=(source,),
         )
     except OSError:
         log.exception("could not start %s", command[0])
@@ -353,7 +392,7 @@ async def _run(command: list[str]) -> bytes | None:
     return stdout
 
 
-async def probe_duration(source: Path) -> float:
+async def probe_duration(source: int) -> float:
     """Return a media file's duration in seconds, or 0 when unknown."""
     output = await _run(
         [
@@ -364,13 +403,94 @@ async def probe_duration(source: Path) -> float:
             "format=duration",
             "-of",
             "default=noprint_wrappers=1:nokey=1",
-            str(source),
-        ]
+            source_path(source),
+        ],
+        source,
     )
     try:
         return max(0.0, float((output or b"").decode().strip()))
     except ValueError:
         return 0.0
+
+
+# ==========================================================
+#                       Refusals
+# ==========================================================
+
+
+class _Refusal(Exception):
+    """The model declined to look at a file, as a matter of policy."""
+
+
+#: The machine-readable labels a provider gives a refusal. Matched
+#: whole, against the error's code and type only.
+_POLICY_CODES = frozenset(
+    {
+        "content_policy_violation",
+        "content_filter",
+        "invalid_prompt",
+        "moderation_blocked",
+        "prompt_blocked",
+    }
+)
+
+#: What marks the *message* of an uncoded 400 as the provider saying no
+#: rather than us asking wrong. Every one is a phrase, and only the
+#: message is searched: a bare word tested against the whole error reads
+#: "safety" out of a rejected ``safety_identifier`` parameter and retires
+#: an innocent file for good, and nothing ever clears a refusal.
+_POLICY_PHRASES = (
+    "content policy",
+    "content management policy",
+    "content filter",
+    "usage policy",
+    "usage policies",
+    "safety system",
+    "flagged as",
+)
+
+
+def _error_labels(error: BadRequestError) -> set[str]:
+    """Collect the codes a 400 carries, from wherever it carries them.
+
+    The client fills ``code`` from an OpenAI-shaped body; a provider
+    that answers in its own shape leaves it empty and names the reason
+    inside the body instead.
+    """
+    labels = {str(getattr(error, "code", "") or "")}
+    body = getattr(error, "body", None)
+    detail = body.get("error") if isinstance(body, dict) else None
+    if isinstance(detail, dict):
+        labels |= {str(detail.get(key) or "") for key in ("code", "type")}
+    return {label.lower() for label in labels if label}
+
+
+def _policy_error(error: BadRequestError) -> bool:
+    """Whether a 400 refuses the content instead of the request.
+
+    A plain bad request is our bug and must stay retryable; only a
+    policy no retires the file for good, so this errs towards no.
+    """
+    if _error_labels(error) & _POLICY_CODES:
+        return True
+    message = str(getattr(error, "message", "") or "").lower()
+    return any(phrase in message for phrase in _POLICY_PHRASES)
+
+
+def _refusal_reason(response: Any) -> str | None:
+    """Return the refusal a response carries in place of an answer.
+
+    The Responses API marks a refusal as its own content part rather
+    than a status: a message item whose content holds a ``refusal``
+    part instead of (or beside) the usual ``output_text``.
+    """
+    for item in getattr(response, "output", None) or []:
+        if getattr(item, "type", None) != "message":
+            continue
+        for part in getattr(item, "content", None) or []:
+            if getattr(part, "type", None) == "refusal":
+                return getattr(part, "refusal", None) or "refused"
+    return None
 
 
 # ==========================================================
@@ -394,7 +514,6 @@ class MediaLens:
         bot: Bot,
         client: AsyncOpenAI,
         model: str,
-        media_dir: Path,
         describe_prompt: str,
         answer_prompt: str = "",
         transcribe_model: str | None = None,
@@ -408,7 +527,6 @@ class MediaLens:
         self.bot = bot
         self.client = client
         self.model = model
-        self.media_dir = media_dir
         self.describe_prompt = describe_prompt
         self.answer_prompt = answer_prompt
         self.transcribe_model = transcribe_model
@@ -448,7 +566,6 @@ class MediaLens:
             bot=bot,
             client=AsyncOpenAI(api_key=settings.api_key, base_url=settings.base_url),
             model=settings.media_model,
-            media_dir=settings.media_dir,
             describe_prompt=prompts.media_describe,
             answer_prompt=prompts.media_answer,
             transcribe_model=settings.transcribe_model or None,
@@ -457,23 +574,6 @@ class MediaLens:
             answer_chars=settings.media_answer_chars,
             wait_seconds=settings.media_wait_seconds,
         )
-
-    def ensure(self) -> None:
-        """Create the media directories, emptying leftover temporaries.
-
-        Nothing in ``tmp/`` is meant to outlive the job that put it
-        there — an original waiting for ffmpeg, an artifact waiting to be
-        whole — so whatever is still there is debris from a killed
-        process.
-        """
-        self.media_dir.mkdir(parents=True, exist_ok=True)
-        shutil.rmtree(self._tmp_dir, ignore_errors=True)
-        self._tmp_dir.mkdir(parents=True, exist_ok=True)
-
-    @property
-    def _tmp_dir(self) -> Path:
-        """Directory holding a job's files until they are wanted."""
-        return self.media_dir / "tmp"
 
     # ---------------------- entry points ----------------------
 
@@ -505,6 +605,12 @@ class MediaLens:
         breed the dog is, which frame the cup falls in. The answer is not
         written to ``media_notes``: it answers a question rather than
         describing the file, and every later transcript would carry it.
+        The file is fetched from Telegram anew — nothing of the first
+        look was kept to reuse.
+
+        A file already retired answers nothing, but a refusal here does
+        not retire one: the model was asked a question about the file,
+        and a no can be about either.
 
         Audio has no such second look — a transcription endpoint takes no
         question — so a voice message answers with its transcript, which
@@ -516,11 +622,34 @@ class MediaLens:
         try:
             if ref.source == "audio":
                 return await self._note(chat_id, message_id, ref)
-            async with self._file_lock(ref.file_unique_id), self._jobs:
-                artifact = await self._artifact(ref)
-                if artifact is None:
+            async with self._file_lock(ref.file_unique_id):
+                # Inside the lock, like the describing path's check: a
+                # look and a question about the same file run together
+                # often enough, and reading the flag outside means
+                # downloading and sending a file the look just had
+                # refused.
+                if await self.db.media_refused(ref.file_unique_id):
                     return None
-                return await self._describe_image(ref, artifact, question=question)
+                async with self._jobs:
+                    upload = await self._build(ref)
+                    if upload is None:
+                        return None
+                try:
+                    return await self._describe_image(ref, upload, question=question)
+                except _Refusal as refusal:
+                    # The call carried the agent's question as well as
+                    # the file, so a no here does not name the file as
+                    # the reason — "who is the person in this photo?"
+                    # is refused over the asking. Retiring on it would
+                    # cost the file its description, permanently, for a
+                    # question nobody has to ask twice.
+                    log.info(
+                        "model would not answer about %s (%s): %s",
+                        ref.kind,
+                        ref.file_unique_id,
+                        refusal,
+                    )
+                    return None
         except Exception:
             log.exception("answering about %s in chat %s failed", ref.kind, chat_id)
             return None
@@ -592,7 +721,13 @@ class MediaLens:
         async with self._file_lock(ref.file_unique_id):
             note = await self.db.media_note(ref.file_unique_id)
             if note is None:
-                note = await self._describe(ref)
+                if await self.db.media_refused(ref.file_unique_id):
+                    return None
+                try:
+                    note = await self._describe(ref)
+                except _Refusal as refusal:
+                    await self._flag_refusal(ref, str(refusal))
+                    return None
                 if note is not None:
                     await self.db.save_media_note(
                         ref.file_unique_id, ref.kind, note, self._model_for(ref)
@@ -610,71 +745,68 @@ class MediaLens:
             return self.transcribe_model or ""
         return self.model
 
-    async def _artifact(self, ref: MediaRef) -> Path | None:
-        """Return a file's compressed artifact, building it if needed.
+    async def _flag_refusal(self, ref: MediaRef, reason: str) -> None:
+        """Retire a file a model said no to; it is never sent again."""
+        log.warning(
+            "model refused %s (%s), retiring it: %s",
+            ref.kind,
+            ref.file_unique_id,
+            reason,
+        )
+        await self.db.save_media_refusal(
+            ref.file_unique_id, ref.kind, self._model_for(ref)
+        )
 
-        One that survived an earlier look is reused as it stands, so a
-        second question about the same picture touches neither Telegram
-        nor ffmpeg.
+    async def _describe(self, ref: MediaRef) -> str | None:
+        """Fetch and compress the file, then ask a model what it is."""
+        if ref.source == "audio" and not self.transcribe_model:
+            return None
+        async with self._jobs:
+            upload = await self._build(ref)
+            if upload is None:
+                return None
+            if ref.source == "audio":
+                return await self._transcribe(upload)
+            return await self._describe_image(ref, upload)
+
+    async def _build(self, ref: MediaRef) -> bytes | None:
+        """Download the original and compress it, all in memory.
+
+        The original exists only as an anonymous in-memory file between
+        the Telegram download and the ffmpeg run; what comes back down
+        ffmpeg's stdout is the small webp or opus the model is sent.
+        Nothing is written to disk, so there is no half-written file to
+        trust later and nothing to clean up after a crash — the memfd
+        goes away with the ``with``, crash or not.
+
+        A clip is probed and encoded off that one descriptor, so the
+        bytes are held once however many runs read them.
         """
         if ref.size > MAX_DOWNLOAD_BYTES:
             log.info(
                 "skipping %s: %d bytes is past Telegram's limit", ref.kind, ref.size
             )
             return None
-        # Named by container, not codec: a transcription endpoint reads
-        # the format off the filename it is handed, and ".ogg" is on
-        # every provider's list where ".opus" is on few.
-        suffix = ".ogg" if ref.source == "audio" else ".webp"
-        artifact = self.media_dir / artifact_name(ref.file_unique_id, suffix)
-        if artifact.exists():
-            return artifact
-        return artifact if await self._build(ref, artifact) else None
-
-    async def _describe(self, ref: MediaRef) -> str | None:
-        """Build the artifact if needed, then ask a model what it is."""
-        if ref.source == "audio" and not self.transcribe_model:
+        buffer = await self.bot.download(ref.file_id)
+        original = buffer.read() if buffer is not None else b""
+        if not original:
             return None
-        async with self._jobs:
-            artifact = await self._artifact(ref)
-            if artifact is None:
-                return None
-            if ref.source == "audio":
-                return await self._transcribe(artifact)
-            return await self._describe_image(ref, artifact)
-
-    async def _build(self, ref: MediaRef, artifact: Path) -> bool:
-        """Download the original and compress it into ``artifact``.
-
-        Both intermediate files live in ``tmp/`` and neither survives the
-        call: the original because it is the one file here nobody wants
-        on disk, the half-encoded artifact because everything in
-        ``media_dir`` is trusted and described without a second look. A
-        process killed mid-encode therefore loses the work, rather than
-        leaving behind a truncated picture it would describe forever.
-        """
-        original = self._tmp_dir / artifact_name(ref.file_unique_id, ".bin")
-        staged = self._tmp_dir / artifact.name
-        self._tmp_dir.mkdir(parents=True, exist_ok=True)
-        try:
-            await self.bot.download(ref.file_id, destination=original)
+        with in_memory_file(original) as source:
+            # The download's own copies are dead weight once the memfd
+            # holds the bytes, and this path runs on machines where 20 MB
+            # twice over is worth not carrying through an ffmpeg run.
+            del buffer, original
             if ref.source == "video":
-                duration = await probe_duration(original)
-                command = frames_command(original, staged, self.max_frames, duration)
+                duration = await probe_duration(source)
+                command = frames_command(source, self.max_frames, duration)
             elif ref.source == "audio":
-                command = audio_command(original, staged)
+                command = audio_command(source)
             else:
-                command = image_command(original, staged)
-            if await _run(command) is None or not staged.exists():
-                return False
-            staged.replace(artifact)
-        finally:
-            original.unlink(missing_ok=True)
-            staged.unlink(missing_ok=True)
-        return artifact.exists()
+                command = image_command(source)
+            return await _run(command, source) or None
 
     async def _describe_image(
-        self, ref: MediaRef, artifact: Path, question: str | None = None
+        self, ref: MediaRef, upload: bytes, question: str | None = None
     ) -> str | None:
         """Ask the vision model to put one small image into words.
 
@@ -682,7 +814,7 @@ class MediaLens:
         answer may run longer: it is read once, by the agent that asked,
         rather than stored and carried by every later transcript.
         """
-        data = base64.b64encode(artifact.read_bytes()).decode("ascii")
+        data = base64.b64encode(upload).decode("ascii")
         hint = ref.hint
         if ref.source == "video":
             hint += (
@@ -697,42 +829,58 @@ class MediaLens:
             # not taking orders from the turn that asked.
             asked = " ".join(question.split())
             prompt += f'\nAnswer this about it: "{asked}"'
-        response = await self.client.responses.create(
-            model=self.model,
-            instructions=self.answer_prompt if question else self.describe_prompt,
-            input=[
-                {
-                    "role": "user",
-                    "content": [
-                        {"type": "input_text", "text": prompt},
-                        {
-                            "type": "input_image",
-                            "image_url": f"data:image/webp;base64,{data}",
-                            # Cheapest tier every provider offers: enough
-                            # to say what is going on at this size.
-                            "detail": "low",
-                        },
-                    ],
-                }
-            ],
-            store=False,
-        )
+        try:
+            response = await self.client.responses.create(
+                model=self.model,
+                instructions=self.answer_prompt if question else self.describe_prompt,
+                input=[
+                    {
+                        "role": "user",
+                        "content": [
+                            {"type": "input_text", "text": prompt},
+                            {
+                                "type": "input_image",
+                                "image_url": f"data:image/webp;base64,{data}",
+                                # Cheapest tier every provider offers:
+                                # enough to say what is going on at this
+                                # size.
+                                "detail": "low",
+                            },
+                        ],
+                    }
+                ],
+                store=False,
+            )
+        except BadRequestError as error:
+            if _policy_error(error):
+                raise _Refusal(str(error)) from error
+            raise
+        if reason := _refusal_reason(response):
+            raise _Refusal(reason)
         cap = self.answer_chars if question else self.note_chars
         return self._clean(response.output_text, cap)
 
-    async def _transcribe(self, artifact: Path) -> str | None:
-        """Send one voice/audio artifact to the speech-to-text endpoint.
+    async def _transcribe(self, upload: bytes) -> str | None:
+        """Send one voice/audio recording to the speech-to-text endpoint.
 
-        ``json`` rather than ``text``: it is the one response format
-        every transcription endpoint offers (OpenRouter rejects ``text``
-        outright), and the answer is read the same either way — some
-        compatible endpoints hand back the bare string regardless.
+        The upload is named ``.ogg`` rather than ``.opus`` — an endpoint
+        reads the format off the filename it is handed, and ``.ogg`` is
+        on every provider's list where ``.opus`` is on few. ``json``
+        rather than ``text`` for the same reason: it is the one response
+        format every transcription endpoint offers (OpenRouter rejects
+        ``text`` outright), and the answer is read the same either way —
+        some compatible endpoints hand back the bare string regardless.
         """
-        response = await self.client.audio.transcriptions.create(
-            model=self.transcribe_model or "",
-            file=(artifact.name, artifact.read_bytes(), "audio/ogg"),
-            response_format="json",
-        )
+        try:
+            response = await self.client.audio.transcriptions.create(
+                model=self.transcribe_model or "",
+                file=("voice.ogg", upload, "audio/ogg"),
+                response_format="json",
+            )
+        except BadRequestError as error:
+            if _policy_error(error):
+                raise _Refusal(str(error)) from error
+            raise
         text = response if isinstance(response, str) else getattr(response, "text", "")
         return self._clean(text)
 

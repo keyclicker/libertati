@@ -88,6 +88,18 @@ media_notes = Table(
     Column("created_at", Text, nullable=False, server_default=_NOW),
 )
 
+# Files a describer refused to look at, for policy reasons of its own.
+# A refusal is permanent: the file is never downloaded or sent to a
+# model again, so one no is the last thing the provider sees of it.
+media_refusals = Table(
+    "media_refusals",
+    metadata,
+    Column("file_unique_id", Text, primary_key=True),
+    Column("kind", Text, nullable=False),
+    Column("model", Text, nullable=False),
+    Column("refused_at", Text, nullable=False, server_default=_NOW),
+)
+
 # Last message exposed through get_recent_messages, per chat/topic.  Zero
 # represents a whole-chat cursor; Telegram topic ids are positive.
 message_read_cursors = Table(
