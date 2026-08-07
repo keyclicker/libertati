@@ -934,3 +934,40 @@ async def test_wrap_narrows_the_laid_out_text() -> None:
         assert narrow.view.blocks[0].height >= wide_height + 3
 
     conn.close()
+
+
+@pytest.mark.asyncio
+async def test_search_pages_past_rows_that_render_to_nothing() -> None:
+    """A page of empty envelopes does not strand an older match.
+
+    Empty final-output envelopes render to no lines at all; paging past
+    a whole page of them must still count as progress, or the search
+    gives up with the match one page out of reach.
+    """
+    conn = make_context_db(0)
+    append_event(conn, "needle here")
+    empty = json.dumps(
+        {
+            "type": "message",
+            "role": "assistant",
+            "content": [{"type": "output_text", "text": ""}],
+        }
+    )
+    for _ in range(6):
+        conn.execute(insert(schema.context).values(item=empty))
+    for index in range(30):
+        append_event(conn, f"filler {index}")
+    app = SpyApp(conn, last_id=tail_anchor(conn, 10), page_size=5)
+
+    async with app.run_test(size=(80, 10)) as pilot:
+        await pilot.pause()
+        await pilot.press("slash")
+        await pilot.press(*"needle")
+        await pilot.press("enter")
+        await pilot.pause()
+
+        assert app.matches == [Match(1, 0)]
+        assert app.view.cursor == Match(1, 0)
+        assert app.view.oldest_id == 1
+
+    conn.close()

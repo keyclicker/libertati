@@ -638,11 +638,21 @@ class ContextView(ScrollView):
         return True
 
     def _ensure_loaded(self, row_id: int) -> bool:
-        """Page history in until ``row_id`` is among the loaded blocks."""
+        """Page history in until ``row_id`` is among the loaded blocks.
+
+        Progress is measured by the oldest loaded row, not by lines
+        prepended: a page of rows that all render to nothing (empty
+        output envelopes) still moves the boundary, and stopping on it
+        would strand every match older than that page.
+        """
         for _ in range(SEARCH_PAGES):
             if self.oldest_id is not None and row_id >= self.oldest_id:
                 return True
-            if not self.has_older or not self.load_older():
+            if not self.has_older:
+                break
+            before = self.oldest_id
+            self.load_older()
+            if self.oldest_id == before:
                 break
         return self.oldest_id is not None and row_id >= self.oldest_id
 
