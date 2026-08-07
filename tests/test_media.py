@@ -585,13 +585,15 @@ async def test_a_files_lock_is_forgotten_once_nobody_holds_it(db: Database) -> N
 # ==========================================================
 
 
-def api_error(status: int, message: str) -> Exception:
+def api_error(
+    status: int, message: str, body: dict[str, Any] | None = None
+) -> Exception:
     """Build the exception the OpenAI client raises for one status."""
     request = httpx.Request("POST", "http://provider.test")
     response = httpx.Response(status, request=request)
     if status == 400:
-        return BadRequestError(message, response=response, body=None)
-    return InternalServerError(message, response=response, body=None)
+        return BadRequestError(message, response=response, body=body)
+    return InternalServerError(message, response=response, body=body)
 
 
 async def test_a_refusal_retires_the_file_for_good(db: Database) -> None:
@@ -614,11 +616,44 @@ async def test_a_refusal_retires_the_file_for_good(db: Database) -> None:
 async def test_a_content_policy_400_is_a_refusal_too(db: Database) -> None:
     """Some providers say no as an error rather than a refusal part."""
     client = FakeClient()
-    client.responses.error = api_error(400, "your input was flagged")
+    client.responses.error = api_error(
+        400, "your input was flagged as violating our usage policy"
+    )
     lens = make_lens(db, client)
 
     assert await lens.look(10, 1, {"sticker": STICKER}) is None
     assert await db.media_refused("sticker-uid")
+
+
+async def test_a_400_that_names_its_reason_needs_no_phrase(db: Database) -> None:
+    """A provider that labels the refusal is believed over its wording."""
+    client = FakeClient()
+    client.responses.error = api_error(
+        400,
+        "we could not process this request",
+        {"error": {"code": "content_policy_violation", "message": "no"}},
+    )
+    lens = make_lens(db, client)
+
+    assert await lens.look(10, 1, {"sticker": STICKER}) is None
+    assert await db.media_refused("sticker-uid")
+
+
+async def test_a_parameter_that_reads_like_policy_is_not_a_refusal(
+    db: Database,
+) -> None:
+    """A word inside a rejected parameter name must not retire a file.
+
+    Nothing ever clears a refusal, so a 400 about how we asked — here a
+    parameter the provider has never heard of — has to stay retryable
+    however much of a policy word its name contains.
+    """
+    client = FakeClient()
+    client.responses.error = api_error(400, "Unknown parameter: 'safety_identifier'.")
+    lens = make_lens(db, client)
+
+    assert await lens.look(10, 1, {"sticker": STICKER}) is None
+    assert not await db.media_refused("sticker-uid")
 
 
 async def test_a_transient_error_is_not_a_refusal(db: Database) -> None:
