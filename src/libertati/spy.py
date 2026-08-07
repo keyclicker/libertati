@@ -26,6 +26,9 @@ nothing is pinned and the view is following, a starting dream is picked
 up on its own and dropped again on waking. ``--dream ID`` opens a past
 dream directly.
 
+Block text wraps at ``--wrap`` columns (default 80), narrower than the
+terminal when the terminal is wide; ``--wrap 0`` follows the terminal.
+
 Per-item token figures are estimates from UTF-8 byte length, scaled per
 content shape (dense JSON framing, multi-byte prose, base64 reasoning
 blobs). The projected next context is anchored on the newest API usage
@@ -52,6 +55,7 @@ from sqlalchemy.pool import NullPool
 from textual import events
 from textual.app import App, ComposeResult
 from textual.binding import Binding
+from textual.containers import Horizontal
 from textual.geometry import Size
 from textual.scroll_view import ScrollView
 from textual.strip import Strip
@@ -211,6 +215,7 @@ def scan_matches(
     pattern: re.Pattern[str],
     dream_id: int | None = None,
     after: int = 0,
+    upto: int | None = None,
 ) -> list[Match]:
     """Index every occurrence of a pattern in the stored context.
 
@@ -218,6 +223,10 @@ def scan_matches(
     holds a tail of history, and a match older than that tail has to be
     findable all the same. Occurrences are counted in the very body the
     block renders, so counts and highlights cannot disagree.
+
+    ``upto`` bounds the scan to rows the caller has already counted as
+    scanned, so a row appended mid-scan waits for the next incremental
+    pass instead of being indexed twice.
     """
     table, conditions = source(dream_id)
     stmt = (
@@ -225,6 +234,8 @@ def scan_matches(
         .where(*conditions, table.c.id > after)
         .order_by(table.c.id)
     )
+    if upto is not None:
+        stmt = stmt.where(table.c.id <= upto)
     result = conn.execute(stmt)
     matches: list[Match] = []
     while chunk := result.fetchmany(SCAN_CHUNK):
@@ -499,13 +510,19 @@ class ContextView(ScrollView):
         conn: Connection,
         page_size: int,
         dream_id: int | None = None,
+        wrap: int = 80,
         **kwargs: Any,
     ) -> None:
-        """Create a view over an open read-only database connection."""
+        """Create a view over an open read-only database connection.
+
+        ``wrap`` caps the width text is laid out at; zero means the full
+        viewport width.
+        """
         super().__init__(**kwargs)
         self.conn = conn
         self.page_size = max(1, page_size)
         self.dream_id = dream_id
+        self.wrap = max(0, wrap)
         self.full = False
         self.pattern: re.Pattern[str] | None = None
         self.cursor: Match | None = None
@@ -621,11 +638,21 @@ class ContextView(ScrollView):
         return True
 
     def _ensure_loaded(self, row_id: int) -> bool:
-        """Page history in until ``row_id`` is among the loaded blocks."""
+        """Page history in until ``row_id`` is among the loaded blocks.
+
+        Progress is measured by the oldest loaded row, not by lines
+        prepended: a page of rows that all render to nothing (empty
+        output envelopes) still moves the boundary, and stopping on it
+        would strand every match older than that page.
+        """
         for _ in range(SEARCH_PAGES):
             if self.oldest_id is not None and row_id >= self.oldest_id:
                 return True
-            if not self.has_older or not self.load_older():
+            if not self.has_older:
+                break
+            before = self.oldest_id
+            self.load_older()
+            if self.oldest_id == before:
                 break
         return self.oldest_id is not None and row_id >= self.oldest_id
 
@@ -650,8 +677,14 @@ class ContextView(ScrollView):
     # ----- Rendering -----
 
     def _build(self, rows: list[Row], start: int) -> list[Block]:
-        """Render rows to strips, laid out from line ``start``."""
-        width = max(1, self.scrollable_content_region.width)
+        """Render rows to strips, laid out from line ``start``.
+
+        Text wraps at ``self.wrap`` columns when the viewport is wider;
+        the strips are still padded to the full viewport width so the
+        compositor never has to guess what fills the rest of a line.
+        """
+        region = max(1, self.scrollable_content_region.width)
+        width = min(region, self.wrap) if self.wrap else region
         options = self.app.console.options.update(
             width=width, height=None, no_wrap=False, overflow="fold"
         )
@@ -673,8 +706,10 @@ class ContextView(ScrollView):
             if text is None:
                 continue
             rendered = self.app.console.render_lines(text, options, pad=False)
-            lines = [Strip(segments).adjust_cell_length(width) for segments in rendered]
-            lines.append(Strip.blank(width))  # one blank line between blocks
+            lines = [
+                Strip(segments).adjust_cell_length(region) for segments in rendered
+            ]
+            lines.append(Strip.blank(region))  # one blank line between blocks
             blocks.append(
                 Block(
                     row,
@@ -814,29 +849,54 @@ class SpyApp(App[None]):
     # transparent, and every style follows its palette.
     THEME = "ansi-dark"
 
+    # The prompt bars live on their own layer: docked to the same edge
+    # as the status they would otherwise fight it for the bottom rows,
+    # and the loser is painted over. On a layer they overlay the second
+    # status line only while open, vim-style, and the context view never
+    # reflows (a reflow re-wraps every loaded block).
     CSS = """
     Screen {
         background: transparent;
         layout: vertical;
+        layers: base prompt;
     }
 
     ContextView {
         height: 1fr;
     }
 
-    #search, #steer {
-        dock: bottom;
-        display: none;
-        height: 1;
-        border: none;
-        padding: 0 1;
-        background: transparent;
-    }
-
     #status {
         dock: bottom;
         height: 2;
         padding: 0 1;
+        background: transparent;
+    }
+
+    #searchbar, #steerbar {
+        layer: prompt;
+        dock: bottom;
+        display: none;
+        height: 1;
+        background: transparent;
+    }
+
+    #search-prefix {
+        width: auto;
+        padding: 0 0 0 1;
+        background: transparent;
+    }
+
+    #steer-prefix {
+        width: auto;
+        padding: 0 1;
+        background: transparent;
+    }
+
+    #search, #steer {
+        width: 1fr;
+        height: 1;
+        border: none;
+        padding: 0 1 0 0;
         background: transparent;
     }
     """
@@ -862,11 +922,13 @@ class SpyApp(App[None]):
         max_items: int = 300,
         dream_id: int | None = None,
         db_path: Path | None = None,
+        wrap: int = 80,
     ) -> None:
         """Create a viewer over an open read-only database connection.
 
         ``db_path`` is what instructions are posted through; without one
-        the viewer is read-only in every sense.
+        the viewer is read-only in every sense. ``wrap`` caps the width
+        block text is laid out at; zero follows the terminal.
         """
         super().__init__()
         self.conn = conn
@@ -874,13 +936,13 @@ class SpyApp(App[None]):
         self.page_size = page_size
         self.max_items = max_items
         self.dream_id = dream_id
+        self.wrap = wrap
         # Newest row already on screen for the mode being viewed;
         # re-anchored to a tail on every switch.
         self.last_id = last_id
         # Opening straight into a dream is a deliberate choice; don't
         # then drag the view somewhere else.
         self.auto = dream_id is None
-        self.running_dream: int | None = None
         self.last_activity: str | None = None
         self.usage: Usage | None = None
         self.next_tokens: int | None = None
@@ -899,6 +961,11 @@ class SpyApp(App[None]):
         self.matches: list[Match] = []
         self.match_at: int | None = None
         self.scanned_id = 0
+        # A full index being rebuilt off the UI thread; while one runs,
+        # the incremental per-poll scan stands down (its low-water mark
+        # is not meaningful yet, and rescanning from it would block the
+        # very thread the rebuild was moved off of).
+        self.indexing = False
 
     @property
     def view(self) -> ContextView:
@@ -906,11 +973,17 @@ class SpyApp(App[None]):
         return self.query_one(ContextView)
 
     def compose(self) -> ComposeResult:
-        """Create the context view, both prompts and the status."""
-        yield ContextView(self.conn, self.page_size, self.dream_id, id="context")
-        yield SearchInput(id="search")
-        yield SteerInput(id="steer", max_length=STEERING_MAX_CHARS)
+        """Create the context view, both prompt bars and the status."""
+        yield ContextView(
+            self.conn, self.page_size, self.dream_id, self.wrap, id="context"
+        )
         yield Static(id="status")
+        with Horizontal(id="searchbar"):
+            yield Static(id="search-prefix")
+            yield SearchInput(id="search", placeholder="pattern")
+        with Horizontal(id="steerbar"):
+            yield Static(id="steer-prefix")
+            yield SteerInput(id="steer", max_length=STEERING_MAX_CHARS)
 
     def on_mount(self) -> None:
         """Load the initial tail and start polling for new rows."""
@@ -974,12 +1047,14 @@ class SpyApp(App[None]):
         self.usage = None
         self.next_tokens = None
         self.view.switch(dream_id)
-        # An index belongs to the context it was built from.
+        # An index belongs to the context it was built from; rebuilding
+        # one for the new context happens off the UI thread, like the
+        # scan a fresh search runs.
         self.matches = []
         self.match_at = None
         self.scanned_id = 0
         if self.view.pattern is not None:
-            self.index_matches(self.view.pattern)
+            self.run_worker(self.reindex(self.view.pattern))
 
     def update_status(self) -> None:
         """Redraw the status line."""
@@ -1020,12 +1095,14 @@ class SpyApp(App[None]):
     # ----- Search -----
 
     def action_search(self, direction: str) -> None:
-        """Open the search prompt."""
+        """Open the search prompt, prefixed with its direction."""
         self.search_backward = direction == "backward"
+        self.query_one("#search-prefix", Static).update(
+            "?" if self.search_backward else "/"
+        )
         prompt = self.query_one("#search", SearchInput)
         prompt.value = ""
-        prompt.placeholder = "?pattern" if self.search_backward else "/pattern"
-        prompt.display = True
+        self.query_one("#searchbar", Horizontal).display = True
         prompt.focus()
 
     async def on_input_submitted(self, event: Input.Submitted) -> None:
@@ -1033,9 +1110,9 @@ class SpyApp(App[None]):
         if event.input.id == "steer":
             await self.submit_steering(event.value)
         else:
-            self.submit_search(event.value)
+            await self.submit_search(event.value)
 
-    def submit_search(self, pattern: str) -> None:
+    async def submit_search(self, pattern: str) -> None:
         """Index the typed search, close the prompt and jump to a hit."""
         self.close_search()
         if not pattern:
@@ -1048,24 +1125,48 @@ class SpyApp(App[None]):
             self.update_status()
             return
         self.view.set_pattern(compiled)
-        self.index_matches(compiled)
-        self.jump_match(self.search_backward, first=True)
+        self.note = "indexing…"
+        self.update_status()
+        if await self.reindex(compiled):
+            self.note = ""
+            self.jump_match(self.search_backward, first=True)
 
-    def index_matches(self, pattern: re.Pattern[str]) -> None:
-        """Index a pattern over the whole stored context."""
-        self.matches = scan_matches(self.conn, pattern, self.dream_id)
-        self.match_at = None
-        self.scanned_id = newest_id(self.conn, self.dream_id)
+    async def reindex(self, compiled: re.Pattern[str]) -> bool:
+        """Rebuild the match index off the UI thread.
+
+        Indexing reads the whole stored history, which on a large
+        database takes long enough to feel; the scan runs in a thread on
+        a connection of its own, so the viewer keeps scrolling and the
+        UI connection is never shared across threads. ``False`` means
+        the pattern was cleared or replaced while the scan ran and its
+        result was thrown away.
+        """
+        self.indexing = True
+        try:
+            matches, scanned = await asyncio.to_thread(self._index_offline, compiled)
+        finally:
+            self.indexing = False
+        if self.view.pattern is not compiled:
+            return False
+        self.matches, self.match_at, self.scanned_id = matches, None, scanned
+        return True
+
+    def _index_offline(self, pattern: re.Pattern[str]) -> tuple[list[Match], int]:
+        """Scan one full index on a connection of this thread's own."""
+        with self.conn.engine.connect() as conn:
+            newest = newest_id(conn, self.dream_id)
+            return scan_matches(conn, pattern, self.dream_id, upto=newest), newest
 
     def extend_matches(self) -> None:
         """Index the rows appended since the last scan, if searching."""
         pattern = self.view.pattern
-        if pattern is None:
+        if pattern is None or self.indexing:
             return
+        newest = newest_id(self.conn, self.dream_id)
         self.matches.extend(
-            scan_matches(self.conn, pattern, self.dream_id, self.scanned_id)
+            scan_matches(self.conn, pattern, self.dream_id, self.scanned_id, newest)
         )
-        self.scanned_id = newest_id(self.conn, self.dream_id)
+        self.scanned_id = newest
 
     def jump_match(self, backward: bool, first: bool = False) -> None:
         """Move the cursor to the next occurrence and put it on screen.
@@ -1136,8 +1237,7 @@ class SpyApp(App[None]):
 
     def close_search(self) -> None:
         """Hide the search prompt and focus the context again."""
-        prompt = self.query_one("#search", SearchInput)
-        prompt.display = False
+        self.query_one("#searchbar", Horizontal).display = False
         self.view.focus()
 
     # ----- Steering -----
@@ -1146,22 +1246,28 @@ class SpyApp(App[None]):
         """Open the prompt for an instruction to the agent."""
         prompt = self.query_one("#steer", SteerInput)
         prompt.value = ""
-        prompt.display = True
+        self.query_one("#steerbar", Horizontal).display = True
         self.set_steer_urgent(urgent)
         prompt.focus()
 
     def set_steer_urgent(self, urgent: bool) -> None:
         """Choose when the instruction lands, and say so in the prompt.
 
-        The two differ enough to be worth naming: one waits for whatever
-        the agent is doing, the other cuts into it at the next round.
+        The two differ enough to be worth naming — one waits for
+        whatever the agent is doing, the other cuts into it at the next
+        round — and the mode lives in the prefix label, not the
+        placeholder: a placeholder vanishes under the first keystroke,
+        and ctrl+t is pressed mid-sentence more often than not.
         """
         self.steer_urgent = urgent
-        self.query_one("#steer", SteerInput).placeholder = (
-            "instruct now (ctrl+t: after this turn)"
-            if urgent
-            else "instruct (ctrl+t: interrupt)"
-        )
+        prefix = self.query_one("#steer-prefix", Static)
+        if urgent:
+            prefix.update(Text("instruct now!", style="bold red"))
+            hint = "interrupts the turn (ctrl+t: queue)"
+        else:
+            prefix.update(Text("instruct:", style="bold"))
+            hint = "queued for the next turn (ctrl+t: interrupt)"
+        self.query_one("#steer", SteerInput).placeholder = hint
 
     async def submit_steering(self, text: str) -> None:
         """Post the typed instruction for the bot process to deliver.
@@ -1205,8 +1311,7 @@ class SpyApp(App[None]):
 
     def close_steering(self) -> None:
         """Hide the instruction prompt and focus the context again."""
-        prompt = self.query_one("#steer", SteerInput)
-        prompt.display = False
+        self.query_one("#steerbar", Horizontal).display = False
         self.view.focus()
 
 
@@ -1249,6 +1354,13 @@ def main() -> None:
         default=50,
         help="initial items and history page size (default 50)",
     )
+    parser.add_argument(
+        "--wrap",
+        type=int,
+        default=80,
+        metavar="COLS",
+        help="wrap block text at this many columns; 0 = terminal width (default 80)",
+    )
     args = parser.parse_args()
 
     settings = load_settings()
@@ -1283,7 +1395,7 @@ def main() -> None:
         parser.error(f"no dream #{args.dream} in {db_path}")
     anchor = tail_anchor(conn, args.tail, args.dream)
     try:
-        SpyApp(conn, anchor, args.tail, max_items, args.dream, db_path).run()
+        SpyApp(conn, anchor, args.tail, max_items, args.dream, db_path, args.wrap).run()
     except KeyboardInterrupt:
         pass
     finally:
