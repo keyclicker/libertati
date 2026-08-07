@@ -47,8 +47,9 @@ One package, `src/libertati/`, no sub-packages:
   into one cached text note (frames tiled into a single image), voice
   into a transcript; `media_ref` resolves what a raw payload carries.
   Wholly in memory: downloads are buffers, ffmpeg reads stdin and
-  writes stdout, nothing binary lands on disk. Off unless `media_model`
-  is set; runs on `base_url` with the one `api_key`, so a model named
+  writes stdout, nothing binary lands on disk. A file the model refuses
+  is retired for good (`media_refusals`). Off unless `media_model` is
+  set; runs on `base_url` with the one `api_key`, so a model named
   there must be one that provider serves. Needs ffmpeg on PATH.
 - `memory.py` — `Mind`: the five markdown mind files under
   `data/memory/`.
@@ -106,7 +107,10 @@ One package, `src/libertati/`, no sub-packages:
   downloaded into memory, piped through ffmpeg (stdin to stdout) and
   sent to the model as bytes. Nothing binary is kept — a second look
   (`look_at_media` with a question) fetches the file from Telegram
-  again.
+  again. A file a model refused (a Responses refusal part, or a 400
+  that smells of content policy) is retired via `media_refusals` and
+  never downloaded or sent again; transient errors and our own bad
+  requests are not refusals and stay retryable.
 - **Events arrive in the order they were sent.** aiogram runs every
   update in its own task and `on_message` waits up to
   `media_wait_seconds` for a description, so the push happens under

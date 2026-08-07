@@ -12,6 +12,12 @@ small image, which any vision model reads — no native video input, no
 whole file uploaded anywhere. Voice notes take the other branch and go to
 a speech-to-text endpoint.
 
+A model may refuse a file — its provider's content policy, not ours.
+A refusal is remembered (``media_refusals``) and is final: that file is
+never downloaded or sent to a model again, so the provider sees any
+given file at most once. Only an actual no counts — a timeout or a
+server error is not a refusal and stays retryable.
+
 Nothing binary touches disk either. A file is downloaded into memory,
 piped through ffmpeg's stdin and out of its stdout, and sent to the
 model as bytes; when the note lands, the bytes are gone. What survives a
@@ -30,7 +36,7 @@ from dataclasses import dataclass
 from typing import Any
 
 from aiogram import Bot
-from openai import AsyncOpenAI
+from openai import AsyncOpenAI, BadRequestError
 
 from libertati.config import Settings
 from libertati.db import Database
@@ -372,6 +378,49 @@ async def probe_duration(data: bytes) -> float:
 
 
 # ==========================================================
+#                       Refusals
+# ==========================================================
+
+
+class _Refusal(Exception):
+    """The model declined to look at a file, as a matter of policy."""
+
+
+#: What marks a 400 as the provider saying no rather than us asking
+#: wrong. A plain bad request is our bug and must stay retryable; only
+#: a policy no retires the file for good.
+_POLICY_MARKERS = (
+    "content_policy",
+    "content policy",
+    "moderation",
+    "flagged",
+    "safety",
+)
+
+
+def _policy_error(error: BadRequestError) -> bool:
+    """Whether a 400 refuses the content instead of the request."""
+    detail = str(error).lower()
+    return any(marker in detail for marker in _POLICY_MARKERS)
+
+
+def _refusal_reason(response: Any) -> str | None:
+    """Return the refusal a response carries in place of an answer.
+
+    The Responses API marks a refusal as its own content part rather
+    than a status: a message item whose content holds a ``refusal``
+    part instead of (or beside) the usual ``output_text``.
+    """
+    for item in getattr(response, "output", None) or []:
+        if getattr(item, "type", None) != "message":
+            continue
+        for part in getattr(item, "content", None) or []:
+            if getattr(part, "type", None) == "refusal":
+                return getattr(part, "refusal", None) or "refused"
+    return None
+
+
+# ==========================================================
 #                       Describing
 # ==========================================================
 
@@ -496,11 +545,17 @@ class MediaLens:
         try:
             if ref.source == "audio":
                 return await self._note(chat_id, message_id, ref)
+            if await self.db.media_refused(ref.file_unique_id):
+                return None
             async with self._file_lock(ref.file_unique_id), self._jobs:
                 upload = await self._build(ref)
                 if upload is None:
                     return None
-                return await self._describe_image(ref, upload, question=question)
+                try:
+                    return await self._describe_image(ref, upload, question=question)
+                except _Refusal as refusal:
+                    await self._flag_refusal(ref, str(refusal))
+                    return None
         except Exception:
             log.exception("answering about %s in chat %s failed", ref.kind, chat_id)
             return None
@@ -572,7 +627,13 @@ class MediaLens:
         async with self._file_lock(ref.file_unique_id):
             note = await self.db.media_note(ref.file_unique_id)
             if note is None:
-                note = await self._describe(ref)
+                if await self.db.media_refused(ref.file_unique_id):
+                    return None
+                try:
+                    note = await self._describe(ref)
+                except _Refusal as refusal:
+                    await self._flag_refusal(ref, str(refusal))
+                    return None
                 if note is not None:
                     await self.db.save_media_note(
                         ref.file_unique_id, ref.kind, note, self._model_for(ref)
@@ -589,6 +650,18 @@ class MediaLens:
         if ref.source == "audio":
             return self.transcribe_model or ""
         return self.model
+
+    async def _flag_refusal(self, ref: MediaRef, reason: str) -> None:
+        """Retire a file a model said no to; it is never sent again."""
+        log.warning(
+            "model refused %s (%s), retiring it: %s",
+            ref.kind,
+            ref.file_unique_id,
+            reason,
+        )
+        await self.db.save_media_refusal(
+            ref.file_unique_id, ref.kind, self._model_for(ref)
+        )
 
     async def _describe(self, ref: MediaRef) -> str | None:
         """Fetch and compress the file, then ask a model what it is."""
@@ -653,26 +726,34 @@ class MediaLens:
             # not taking orders from the turn that asked.
             asked = " ".join(question.split())
             prompt += f'\nAnswer this about it: "{asked}"'
-        response = await self.client.responses.create(
-            model=self.model,
-            instructions=self.answer_prompt if question else self.describe_prompt,
-            input=[
-                {
-                    "role": "user",
-                    "content": [
-                        {"type": "input_text", "text": prompt},
-                        {
-                            "type": "input_image",
-                            "image_url": f"data:image/webp;base64,{data}",
-                            # Cheapest tier every provider offers: enough
-                            # to say what is going on at this size.
-                            "detail": "low",
-                        },
-                    ],
-                }
-            ],
-            store=False,
-        )
+        try:
+            response = await self.client.responses.create(
+                model=self.model,
+                instructions=self.answer_prompt if question else self.describe_prompt,
+                input=[
+                    {
+                        "role": "user",
+                        "content": [
+                            {"type": "input_text", "text": prompt},
+                            {
+                                "type": "input_image",
+                                "image_url": f"data:image/webp;base64,{data}",
+                                # Cheapest tier every provider offers:
+                                # enough to say what is going on at this
+                                # size.
+                                "detail": "low",
+                            },
+                        ],
+                    }
+                ],
+                store=False,
+            )
+        except BadRequestError as error:
+            if _policy_error(error):
+                raise _Refusal(str(error)) from error
+            raise
+        if reason := _refusal_reason(response):
+            raise _Refusal(reason)
         cap = self.answer_chars if question else self.note_chars
         return self._clean(response.output_text, cap)
 
@@ -687,11 +768,16 @@ class MediaLens:
         ``text`` outright), and the answer is read the same either way —
         some compatible endpoints hand back the bare string regardless.
         """
-        response = await self.client.audio.transcriptions.create(
-            model=self.transcribe_model or "",
-            file=("voice.ogg", upload, "audio/ogg"),
-            response_format="json",
-        )
+        try:
+            response = await self.client.audio.transcriptions.create(
+                model=self.transcribe_model or "",
+                file=("voice.ogg", upload, "audio/ogg"),
+                response_format="json",
+            )
+        except BadRequestError as error:
+            if _policy_error(error):
+                raise _Refusal(str(error)) from error
+            raise
         text = response if isinstance(response, str) else getattr(response, "text", "")
         return self._clean(text)
 
