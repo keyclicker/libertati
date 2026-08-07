@@ -26,6 +26,9 @@ nothing is pinned and the view is following, a starting dream is picked
 up on its own and dropped again on waking. ``--dream ID`` opens a past
 dream directly.
 
+Block text wraps at ``--wrap`` columns (default 80), narrower than the
+terminal when the terminal is wide; ``--wrap 0`` follows the terminal.
+
 Per-item token figures are estimates from UTF-8 byte length, scaled per
 content shape (dense JSON framing, multi-byte prose, base64 reasoning
 blobs). The projected next context is anchored on the newest API usage
@@ -500,13 +503,19 @@ class ContextView(ScrollView):
         conn: Connection,
         page_size: int,
         dream_id: int | None = None,
+        wrap: int = 80,
         **kwargs: Any,
     ) -> None:
-        """Create a view over an open read-only database connection."""
+        """Create a view over an open read-only database connection.
+
+        ``wrap`` caps the width text is laid out at; zero means the full
+        viewport width.
+        """
         super().__init__(**kwargs)
         self.conn = conn
         self.page_size = max(1, page_size)
         self.dream_id = dream_id
+        self.wrap = max(0, wrap)
         self.full = False
         self.pattern: re.Pattern[str] | None = None
         self.cursor: Match | None = None
@@ -651,8 +660,14 @@ class ContextView(ScrollView):
     # ----- Rendering -----
 
     def _build(self, rows: list[Row], start: int) -> list[Block]:
-        """Render rows to strips, laid out from line ``start``."""
-        width = max(1, self.scrollable_content_region.width)
+        """Render rows to strips, laid out from line ``start``.
+
+        Text wraps at ``self.wrap`` columns when the viewport is wider;
+        the strips are still padded to the full viewport width so the
+        compositor never has to guess what fills the rest of a line.
+        """
+        region = max(1, self.scrollable_content_region.width)
+        width = min(region, self.wrap) if self.wrap else region
         options = self.app.console.options.update(
             width=width, height=None, no_wrap=False, overflow="fold"
         )
@@ -674,8 +689,10 @@ class ContextView(ScrollView):
             if text is None:
                 continue
             rendered = self.app.console.render_lines(text, options, pad=False)
-            lines = [Strip(segments).adjust_cell_length(width) for segments in rendered]
-            lines.append(Strip.blank(width))  # one blank line between blocks
+            lines = [
+                Strip(segments).adjust_cell_length(region) for segments in rendered
+            ]
+            lines.append(Strip.blank(region))  # one blank line between blocks
             blocks.append(
                 Block(
                     row,
@@ -888,11 +905,13 @@ class SpyApp(App[None]):
         max_items: int = 300,
         dream_id: int | None = None,
         db_path: Path | None = None,
+        wrap: int = 80,
     ) -> None:
         """Create a viewer over an open read-only database connection.
 
         ``db_path`` is what instructions are posted through; without one
-        the viewer is read-only in every sense.
+        the viewer is read-only in every sense. ``wrap`` caps the width
+        block text is laid out at; zero follows the terminal.
         """
         super().__init__()
         self.conn = conn
@@ -900,6 +919,7 @@ class SpyApp(App[None]):
         self.page_size = page_size
         self.max_items = max_items
         self.dream_id = dream_id
+        self.wrap = wrap
         # Newest row already on screen for the mode being viewed;
         # re-anchored to a tail on every switch.
         self.last_id = last_id
@@ -932,7 +952,9 @@ class SpyApp(App[None]):
 
     def compose(self) -> ComposeResult:
         """Create the context view, both prompt bars and the status."""
-        yield ContextView(self.conn, self.page_size, self.dream_id, id="context")
+        yield ContextView(
+            self.conn, self.page_size, self.dream_id, self.wrap, id="context"
+        )
         yield Static(id="status")
         with Horizontal(id="searchbar"):
             yield Static(id="search-prefix")
@@ -1284,6 +1306,13 @@ def main() -> None:
         default=50,
         help="initial items and history page size (default 50)",
     )
+    parser.add_argument(
+        "--wrap",
+        type=int,
+        default=80,
+        metavar="COLS",
+        help="wrap block text at this many columns; 0 = terminal width (default 80)",
+    )
     args = parser.parse_args()
 
     settings = load_settings()
@@ -1318,7 +1347,7 @@ def main() -> None:
         parser.error(f"no dream #{args.dream} in {db_path}")
     anchor = tail_anchor(conn, args.tail, args.dream)
     try:
-        SpyApp(conn, anchor, args.tail, max_items, args.dream, db_path).run()
+        SpyApp(conn, anchor, args.tail, max_items, args.dream, db_path, args.wrap).run()
     except KeyboardInterrupt:
         pass
     finally:

@@ -123,7 +123,8 @@ vim-like: `j`/`k` and `ctrl+e`/`ctrl+y` by line, `ctrl+d`/`ctrl+u` by
 half a screen, `ctrl+f`/`ctrl+b` by screen, `g`/`G` for the ends,
 `/`, `?`, `n`, `N` to search (smartcase, highlighted), `f` to un-truncate
 long bodies, `i`/`I` to instruct the agent, `q` to quit. Older history
-pages in as you scroll up.
+pages in as you scroll up. Text wraps at 80 columns on a wider terminal;
+`--wrap` moves that limit, `--wrap 0` uses the full width.
 
 Search covers the whole stored context, not the part currently on
 screen: the pattern is indexed occurrence by occurrence out of the

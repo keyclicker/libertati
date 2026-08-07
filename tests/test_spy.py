@@ -910,3 +910,23 @@ async def test_steer_prefix_names_the_mode_while_typing() -> None:
         assert "instruct:" in str(prefix.render())
 
     conn.close()
+
+
+@pytest.mark.asyncio
+async def test_wrap_narrows_the_laid_out_text() -> None:
+    """Block text wraps at the configured width, not the terminal's."""
+    conn = make_context_db(0)
+    append_event(conn, "x" * 100)
+    wide = SpyApp(conn, last_id=0)
+    async with wide.run_test(size=(80, 12)) as pilot:
+        await pilot.pause()
+        wide_height = wide.view.blocks[0].height
+
+    narrow = SpyApp(conn, last_id=0, wrap=20)
+    async with narrow.run_test(size=(80, 12)) as pilot:
+        await pilot.pause()
+        # 100 characters at 20 columns are five lines; at the default
+        # width they fit in two.
+        assert narrow.view.blocks[0].height >= wide_height + 3
+
+    conn.close()
