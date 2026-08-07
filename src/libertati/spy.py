@@ -38,7 +38,6 @@ dependencies; run via ``uv run libertati-spy``.
 import argparse
 import asyncio
 import re
-import sqlite3
 from dataclasses import dataclass, field
 from datetime import UTC, datetime
 from pathlib import Path
@@ -47,6 +46,9 @@ from typing import Any, ClassVar, cast
 from pydantic import ValidationError
 from rich.segment import Segment
 from rich.text import Text
+from sqlalchemy import Connection, Table, create_engine, func, insert, select
+from sqlalchemy.exc import SQLAlchemyError
+from sqlalchemy.pool import NullPool
 from textual import events
 from textual.app import App, ComposeResult
 from textual.binding import Binding
@@ -64,6 +66,7 @@ from libertati.render import (
     estimate_tokens,
     searchable,
 )
+from libertati.schema import api_usage, context, dream_context, dreams, steering
 
 #: Seconds between polls for newly appended context rows.
 POLL_SECONDS = 0.5
@@ -159,49 +162,52 @@ def render_row(
 # ===== Queries =====
 
 
-def source(dream_id: int | None) -> tuple[str, str, tuple[int, ...]]:
-    """Return the table, ``WHERE`` scope and params for one view mode.
+def source(dream_id: int | None) -> tuple[Table, tuple[Any, ...]]:
+    """Return the table and ``WHERE`` conditions for one view mode.
 
-    The scope is always a complete condition (``1`` for the waking
-    context) so every caller can ``AND`` its own onto it.
+    The conditions come as a tuple so every caller can add its own to
+    the same ``where()``.
     """
     if dream_id is None:
-        return "context", "1", ()
-    return "dream_context", "dream_id = ?", (dream_id,)
+        return context, ()
+    return dream_context, (dream_context.c.dream_id == dream_id,)
 
 
 def fetch_after(
-    conn: sqlite3.Connection,
+    conn: Connection,
     last_id: int,
     dream_id: int | None = None,
 ) -> list[Row]:
     """Return all rows of the viewed context with id greater than ``last_id``."""
-    table, scope, params = source(dream_id)
-    return conn.execute(
-        f"SELECT id, created_at, item FROM {table}"
-        f" WHERE {scope} AND id > ? ORDER BY id",
-        (*params, last_id),
-    ).fetchall()
+    table, conditions = source(dream_id)
+    stmt = (
+        select(table.c.id, table.c.created_at, table.c.item)
+        .where(*conditions, table.c.id > last_id)
+        .order_by(table.c.id)
+    )
+    return [(row[0], row[1], row[2]) for row in conn.execute(stmt)]
 
 
 def fetch_before(
-    conn: sqlite3.Connection,
+    conn: Connection,
     first_id: int,
     limit: int,
     dream_id: int | None = None,
 ) -> list[Row]:
     """Return up to ``limit`` rows before ``first_id``, oldest first."""
-    table, scope, params = source(dream_id)
-    rows = conn.execute(
-        f"SELECT id, created_at, item FROM {table}"
-        f" WHERE {scope} AND id < ? ORDER BY id DESC LIMIT ?",
-        (*params, first_id, limit),
-    ).fetchall()
+    table, conditions = source(dream_id)
+    stmt = (
+        select(table.c.id, table.c.created_at, table.c.item)
+        .where(*conditions, table.c.id < first_id)
+        .order_by(table.c.id.desc())
+        .limit(limit)
+    )
+    rows = [(row[0], row[1], row[2]) for row in conn.execute(stmt)]
     return list(reversed(rows))
 
 
 def scan_matches(
-    conn: sqlite3.Connection,
+    conn: Connection,
     pattern: re.Pattern[str],
     dream_id: int | None = None,
     after: int = 0,
@@ -213,13 +219,15 @@ def scan_matches(
     findable all the same. Occurrences are counted in the very body the
     block renders, so counts and highlights cannot disagree.
     """
-    table, scope, params = source(dream_id)
-    cursor = conn.execute(
-        f"SELECT id, item FROM {table} WHERE {scope} AND id > ? ORDER BY id",
-        (*params, after),
+    table, conditions = source(dream_id)
+    stmt = (
+        select(table.c.id, table.c.item)
+        .where(*conditions, table.c.id > after)
+        .order_by(table.c.id)
     )
+    result = conn.execute(stmt)
     matches: list[Match] = []
-    while chunk := cursor.fetchmany(SCAN_CHUNK):
+    while chunk := result.fetchmany(SCAN_CHUNK):
         for row_id, raw in chunk:
             matches.extend(
                 Match(row_id, index)
@@ -228,16 +236,20 @@ def scan_matches(
     return matches
 
 
-#: Usage columns the status line needs, in :class:`Usage` field order.
-USAGE_SELECT = """
-    SELECT input_tokens, cached_tokens, cache_write_tokens,
-           output_tokens, reasoning_tokens, input_context_id
-    FROM api_usage
-"""
+def _usage_select():
+    """Usage columns the status line needs, in :class:`Usage` field order."""
+    return select(
+        api_usage.c.input_tokens,
+        api_usage.c.cached_tokens,
+        api_usage.c.cache_write_tokens,
+        api_usage.c.output_tokens,
+        api_usage.c.reasoning_tokens,
+        api_usage.c.input_context_id,
+    )
 
 
 def fetch_usage(
-    conn: sqlite3.Connection,
+    conn: Connection,
     dream_id: int | None = None,
 ) -> Usage | None:
     """Return exact usage from the newest API response of one mode.
@@ -249,60 +261,53 @@ def fetch_usage(
     skipped too: they say nothing about the window this viewer shows,
     and one of them lands after the round that made it.
     """
-    scope = "dream_id IS NULL" if dream_id is None else "dream_id = ?"
-    params = () if dream_id is None else (dream_id,)
-    try:
-        row = conn.execute(
-            f"{USAGE_SELECT} WHERE {scope} AND input_context_id > 0"
-            " ORDER BY id DESC LIMIT 1",
-            params,
-        ).fetchone()
-    except sqlite3.OperationalError:
-        if dream_id is not None:
-            return None
-        # A database written before dreams had usage rows: everything in
-        # the table is waking usage anyway.
-        try:
-            row = conn.execute(f"{USAGE_SELECT} ORDER BY id DESC LIMIT 1").fetchone()
-        except sqlite3.OperationalError:
-            return None
+    scope = (
+        api_usage.c.dream_id.is_(None)
+        if dream_id is None
+        else api_usage.c.dream_id == dream_id
+    )
+    stmt = (
+        _usage_select()
+        .where(scope, api_usage.c.input_context_id > 0)
+        .order_by(api_usage.c.id.desc())
+        .limit(1)
+    )
+    row = conn.execute(stmt).first()
     return Usage(*row) if row else None
 
 
 def post_steering(db_path: Path, text: str, urgent: bool) -> int:
     """Queue one operator instruction for the bot; return its row id.
 
-    The one thing this viewer writes, and it opens its own connection to
-    do it: the guarantee that watching the agent cannot disturb it is
-    worth keeping for the connection everything else goes through.
+    The one thing this viewer writes, and it opens its own engine to do
+    it: the guarantee that watching the agent cannot disturb it is worth
+    keeping for the connection everything else goes through.
     """
-    conn = sqlite3.connect(db_path, timeout=STEERING_TIMEOUT)
+    engine = create_engine(
+        f"sqlite:///{db_path}",
+        poolclass=NullPool,
+        connect_args={"timeout": STEERING_TIMEOUT},
+    )
     try:
-        cursor = conn.execute(
-            "INSERT INTO steering (text, urgent) VALUES (?, ?)",
-            (text, int(urgent)),
-        )
-        conn.commit()
-        return int(cursor.lastrowid or 0)
+        with engine.begin() as conn:
+            stmt = (
+                insert(steering)
+                .values(text=text, urgent=int(urgent))
+                .returning(steering.c.id)
+            )
+            return int(conn.execute(stmt).scalar_one())
     finally:
-        conn.close()
+        engine.dispose()
 
 
-def newest_id(conn: sqlite3.Connection, dream_id: int | None = None) -> int:
+def newest_id(conn: Connection, dream_id: int | None = None) -> int:
     """Return the newest row id of one view mode, or zero when it is empty."""
-    table, scope, params = source(dream_id)
-    try:
-        row = conn.execute(
-            f"SELECT COALESCE(MAX(id), 0) FROM {table} WHERE {scope}", params
-        ).fetchone()
-    except sqlite3.OperationalError:
-        return 0
-    return row[0] if row else 0
+    table, conditions = source(dream_id)
+    stmt = select(func.coalesce(func.max(table.c.id), 0)).where(*conditions)
+    return int(conn.execute(stmt).scalar_one())
 
 
-def tail_anchor(
-    conn: sqlite3.Connection, tail: int, dream_id: int | None = None
-) -> int:
+def tail_anchor(conn: Connection, tail: int, dream_id: int | None = None) -> int:
     """Row id a view opens just after, to start on its newest ``tail`` rows.
 
     Always measured against the table actually being viewed: dream ids
@@ -312,24 +317,17 @@ def tail_anchor(
     return max(0, newest_id(conn, dream_id) - tail)
 
 
-def latest_dream(conn: sqlite3.Connection) -> tuple[int, str] | None:
+def latest_dream(conn: Connection) -> tuple[int, str] | None:
     """Return the newest dream's id and status, if the ledger has one."""
-    try:
-        row = conn.execute(
-            "SELECT id, status FROM dreams ORDER BY id DESC LIMIT 1"
-        ).fetchone()
-    except sqlite3.OperationalError:
-        return None
+    stmt = select(dreams.c.id, dreams.c.status).order_by(dreams.c.id.desc()).limit(1)
+    row = conn.execute(stmt).first()
     return (row[0], row[1]) if row else None
 
 
-def latest_recorded_dream(conn: sqlite3.Connection) -> int | None:
+def latest_recorded_dream(conn: Connection) -> int | None:
     """Return the newest dream that actually has context rows."""
-    try:
-        row = conn.execute("SELECT MAX(dream_id) FROM dream_context").fetchone()
-    except sqlite3.OperationalError:
-        return None
-    return row[0] if row and row[0] is not None else None
+    newest = conn.execute(select(func.max(dream_context.c.dream_id))).scalar_one()
+    return newest if newest is not None else None
 
 
 def _estimate_rows(rows: list[tuple[str, str]]) -> int:
@@ -338,7 +336,7 @@ def _estimate_rows(rows: list[tuple[str, str]]) -> int:
 
 
 def predict_context(
-    conn: sqlite3.Connection,
+    conn: Connection,
     usage: Usage | None,
     max_items: int,
     dream_id: int | None = None,
@@ -351,19 +349,23 @@ def predict_context(
     window when there is no usage row yet, or when so much has piled up
     since one that the window would have been trimmed anyway.
     """
-    table, scope, params = source(dream_id)
-    select = f"SELECT item, COALESCE(json_extract(item, '$.type'), '') FROM {table}"
+    table, conditions = source(dream_id)
+    columns = select(
+        table.c.item, func.coalesce(func.json_extract(table.c.item, "$.type"), "")
+    )
     if usage is not None:
-        pending = conn.execute(
-            f"{select} WHERE {scope} AND id > ? ORDER BY id LIMIT ?",
-            (*params, usage.context_id, max_items),
-        ).fetchall()
+        pending_stmt = (
+            columns.where(*conditions, table.c.id > usage.context_id)
+            .order_by(table.c.id)
+            .limit(max_items)
+        )
+        pending = [(row[0], row[1]) for row in conn.execute(pending_stmt)]
         if len(pending) < max_items:
             return usage.input_tokens + _estimate_rows(pending)
-    window = conn.execute(
-        f"{select} WHERE {scope} ORDER BY id DESC LIMIT ?",
-        (*params, max_items),
-    ).fetchall()
+    window_stmt = (
+        columns.where(*conditions).order_by(table.c.id.desc()).limit(max_items)
+    )
+    window = [(row[0], row[1]) for row in conn.execute(window_stmt)]
     return _estimate_rows(window) or None
 
 
@@ -494,7 +496,7 @@ class ContextView(ScrollView):
 
     def __init__(
         self,
-        conn: sqlite3.Connection,
+        conn: Connection,
         page_size: int,
         dream_id: int | None = None,
         **kwargs: Any,
@@ -854,7 +856,7 @@ class SpyApp(App[None]):
 
     def __init__(
         self,
-        conn: sqlite3.Connection,
+        conn: Connection,
         last_id: int,
         page_size: int = 50,
         max_items: int = 300,
@@ -1183,7 +1185,7 @@ class SpyApp(App[None]):
             steering_id = await asyncio.to_thread(
                 post_steering, self.db_path, text, urgent
             )
-        except sqlite3.Error as error:
+        except SQLAlchemyError as error:
             self.note = f"instruction failed: {error}"
         else:
             self.note = f"instruction #{steering_id} {self._steering_fate(urgent)}"
@@ -1261,14 +1263,23 @@ def main() -> None:
     if not db_path.exists():
         parser.error(f"database not found: {db_path}")
 
-    conn = sqlite3.connect(f"file:{db_path}?mode=ro", uri=True)
-    if (
-        args.dream is not None
-        and not conn.execute(
-            "SELECT 1 FROM dreams WHERE id = ?", (args.dream,)
-        ).fetchone()
+    # Read-only by URI: watching the agent must not be able to disturb
+    # it, so the viewer's one long-lived connection cannot write at all.
+    # Autocommit keeps every poll on a fresh snapshot — a transaction
+    # left open across polls would pin the first one and go blind to
+    # everything the bot writes after it.
+    engine = create_engine(
+        f"sqlite:///file:{db_path}?mode=ro&uri=true",
+        poolclass=NullPool,
+        isolation_level="AUTOCOMMIT",
+    )
+    conn = engine.connect()
+    if args.dream is not None and (
+        conn.execute(select(dreams.c.id).where(dreams.c.id == args.dream)).first()
+        is None
     ):
         conn.close()
+        engine.dispose()
         parser.error(f"no dream #{args.dream} in {db_path}")
     anchor = tail_anchor(conn, args.tail, args.dream)
     try:
@@ -1277,3 +1288,4 @@ def main() -> None:
         pass
     finally:
         conn.close()
+        engine.dispose()

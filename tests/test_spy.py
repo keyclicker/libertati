@@ -1,11 +1,13 @@
 """Tests for the context spy."""
 
 import json
-import sqlite3
 from pathlib import Path
 
 import pytest
+from sqlalchemy import Connection, create_engine, insert, select, text
+from sqlalchemy.pool import StaticPool
 
+from libertati import schema
 from libertati.render import TRUNCATE_AT
 from libertati.spy import (
     STEERING_MAX_CHARS,
@@ -19,109 +21,80 @@ from libertati.spy import (
     fetch_after,
     fetch_before,
     fetch_usage,
-    latest_dream,
     latest_recorded_dream,
     predict_context,
     tail_anchor,
 )
 
 
-def make_context_db(rows: int = 30, path: Path | None = None) -> sqlite3.Connection:
+def make_context_db(rows: int = 30, path: Path | None = None) -> Connection:
     """Create a context database with enough rows to scroll.
 
     In memory unless ``path`` is given; a file is what the tests that
     post instructions need, since those open a connection of their own.
+    The real schema, straight from the metadata — a hand-written subset
+    would drift. Autocommit, like the viewer's own connection: each
+    write lands at once and each poll reads a fresh snapshot.
     """
-    conn = sqlite3.connect(path or ":memory:")
-    conn.execute(
-        """CREATE TABLE context (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            created_at TEXT NOT NULL DEFAULT (datetime('now')),
-            item TEXT NOT NULL
-        )"""
+    engine = create_engine(
+        f"sqlite:///{path}" if path else "sqlite://",
+        poolclass=StaticPool,
+        isolation_level="AUTOCOMMIT",
     )
-    conn.execute(
-        """CREATE TABLE api_usage (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            dream_id INTEGER,
-            input_tokens INTEGER NOT NULL,
-            cached_tokens INTEGER NOT NULL,
-            cache_write_tokens INTEGER NOT NULL,
-            output_tokens INTEGER NOT NULL,
-            reasoning_tokens INTEGER NOT NULL,
-            input_context_id INTEGER NOT NULL
-        )"""
-    )
-    conn.execute(
-        """CREATE TABLE dreams (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            trigger TEXT NOT NULL,
-            status TEXT NOT NULL DEFAULT 'running'
-        )"""
-    )
-    conn.execute(
-        """CREATE TABLE dream_context (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            dream_id INTEGER NOT NULL,
-            created_at TEXT NOT NULL DEFAULT (datetime('now')),
-            item TEXT NOT NULL
-        )"""
-    )
-    conn.execute(
-        """CREATE TABLE steering (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            text TEXT NOT NULL,
-            urgent INTEGER NOT NULL DEFAULT 0,
-            done INTEGER NOT NULL DEFAULT 0
-        )"""
-    )
-    conn.executemany(
-        "INSERT INTO context (item) VALUES (?)",
-        [(json.dumps({"role": "user", "content": f"event {i}"}),) for i in range(rows)],
-    )
-    # A file database keeps a write lock until this lands, and the
-    # instruction prompt writes through a second connection.
-    conn.commit()
+    schema.metadata.create_all(engine)
+    conn = engine.connect()
+    for i in range(rows):
+        append_event(conn, f"event {i}")
     return conn
 
 
-def append_event(conn: sqlite3.Connection, text: str) -> None:
+def append_event(conn: Connection, body: str) -> None:
     """Append one event to a test context database."""
     conn.execute(
-        "INSERT INTO context (item) VALUES (?)",
-        (json.dumps({"role": "user", "content": text}),),
+        insert(schema.context).values(
+            item=json.dumps({"role": "user", "content": body})
+        )
     )
 
 
-def start_dream(conn: sqlite3.Connection, status: str = "running") -> int:
+def start_dream(conn: Connection, status: str = "running") -> int:
     """Open a dream ledger row and return its id."""
-    cursor = conn.execute(
-        "INSERT INTO dreams (trigger, status) VALUES ('idle', ?)", (status,)
+    result = conn.execute(
+        insert(schema.dreams)
+        .values(trigger="idle", status=status)
+        .returning(schema.dreams.c.id)
     )
-    return int(cursor.lastrowid or 0)
+    return int(result.scalar_one())
 
 
-def append_dream_event(conn: sqlite3.Connection, dream_id: int, text: str) -> None:
+def append_dream_event(conn: Connection, dream_id: int, body: str) -> None:
     """Append one event to a dream's recorded context."""
     conn.execute(
-        "INSERT INTO dream_context (dream_id, item) VALUES (?, ?)",
-        (dream_id, json.dumps({"role": "user", "content": text})),
+        insert(schema.dream_context).values(
+            dream_id=dream_id, item=json.dumps({"role": "user", "content": body})
+        )
     )
 
 
 def append_usage(
-    conn: sqlite3.Connection,
+    conn: Connection,
     tokens: int,
     context_id: int,
     dream_id: int | None = None,
 ) -> None:
     """Record one authoritative API usage snapshot."""
     conn.execute(
-        """INSERT INTO api_usage (
-            dream_id, input_tokens, cached_tokens, cache_write_tokens,
-            output_tokens, reasoning_tokens, input_context_id
-        ) VALUES (?, ?, ?, 100, 1200, 900, ?)""",
-        (dream_id, tokens, tokens // 2, context_id),
+        insert(schema.api_usage).values(
+            dream_id=dream_id,
+            model="m",
+            input_tokens=tokens,
+            cached_tokens=tokens // 2,
+            cache_write_tokens=100,
+            output_tokens=1200,
+            reasoning_tokens=900,
+            total_tokens=tokens + 1200,
+            input_context_id=context_id,
+        )
     )
 
 
@@ -209,7 +182,9 @@ def test_prediction_anchors_on_last_authoritative_usage() -> None:
     append_event(conn, "queued since the last call")
 
     usage = fetch_usage(conn)
-    pending = conn.execute("SELECT item FROM context WHERE id > 1").fetchall()
+    pending = conn.execute(
+        select(schema.context.c.item).where(schema.context.c.id > 1)
+    ).fetchall()
     predicted = predict_context(conn, usage, 300)
 
     assert usage == Usage(18400, 9200, 100, 1200, 900, 1)
@@ -310,38 +285,6 @@ def test_usage_ignores_calls_that_never_read_the_context() -> None:
     usage = fetch_usage(conn)
 
     assert usage == Usage(18400, 9200, 100, 1200, 900, 1)
-    conn.close()
-
-
-def test_usage_survives_a_database_without_the_dream_column() -> None:
-    """An unmigrated database still shows its waking usage."""
-    conn = sqlite3.connect(":memory:")
-    conn.execute(
-        """CREATE TABLE api_usage (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            input_tokens INTEGER NOT NULL,
-            cached_tokens INTEGER NOT NULL,
-            cache_write_tokens INTEGER NOT NULL,
-            output_tokens INTEGER NOT NULL,
-            reasoning_tokens INTEGER NOT NULL,
-            input_context_id INTEGER NOT NULL
-        )"""
-    )
-    conn.execute(
-        "INSERT INTO api_usage VALUES (1, 18400, 9200, 100, 1200, 900, 1)",
-    )
-
-    assert fetch_usage(conn) == Usage(18400, 9200, 100, 1200, 900, 1)
-    assert fetch_usage(conn, 1) is None
-    conn.close()
-
-
-def test_dream_lookups_tolerate_a_database_without_dreams() -> None:
-    """Opening an old database must not crash the viewer."""
-    conn = sqlite3.connect(":memory:")
-
-    assert latest_dream(conn) is None
-    assert latest_recorded_dream(conn) is None
     conn.close()
 
 
@@ -704,7 +647,9 @@ async def test_a_running_dream_is_followed_and_let_go_on_waking() -> None:
         assert app.dream_id == dream
         assert "wandering" in app.view.blocks[0].plain
 
-        conn.execute("UPDATE dreams SET status = 'woke' WHERE id = ?", (dream,))
+        conn.execute(
+            text("UPDATE dreams SET status = 'woke' WHERE id = :id"), {"id": dream}
+        )
         append_event(conn, "[dream #1 ended] say hi to Bob")
         app.poll()
         await pilot.pause()
@@ -779,9 +724,9 @@ async def test_instruction_prompt_posts_to_the_database(tmp_path: Path) -> None:
         await pilot.press("enter")
         await pilot.pause()
 
-        assert conn.execute("SELECT text, urgent, done FROM steering").fetchall() == [
-            ("stop replying to bob", 0, 0)
-        ]
+        assert conn.execute(
+            text("SELECT text, urgent, done FROM steering")
+        ).fetchall() == [("stop replying to bob", 0, 0)]
         assert app.note == "instruction #1 queued"
 
     conn.close()
@@ -807,7 +752,7 @@ async def test_instruction_urgency_starts_from_the_key_and_toggles(
         await pilot.press("enter")
         await pilot.pause()
 
-        assert conn.execute("SELECT text, urgent FROM steering").fetchall() == [
+        assert conn.execute(text("SELECT text, urgent FROM steering")).fetchall() == [
             ("drop it", 1)
         ]
         assert app.note == "instruction #1 interrupting"
@@ -823,7 +768,6 @@ async def test_instruction_during_a_dream_promises_no_interruption(
     path = tmp_path / "context.db"
     conn = make_context_db(0, path)
     dream = start_dream(conn)
-    conn.commit()
     app = SpyApp(conn, last_id=0, db_path=path)
 
     async with app.run_test(size=(80, 10)) as pilot:
@@ -833,7 +777,7 @@ async def test_instruction_during_a_dream_promises_no_interruption(
         await pilot.press("enter")
         await pilot.pause()
 
-        assert conn.execute("SELECT urgent FROM steering").fetchall() == [(1,)]
+        assert conn.execute(text("SELECT urgent FROM steering")).fetchall() == [(1,)]
         assert app.note == f"instruction #1 queued (dream #{dream} first)"
 
     conn.close()
@@ -869,7 +813,7 @@ async def test_empty_instruction_writes_nothing(tmp_path: Path) -> None:
         await pilot.press("escape")
         await pilot.pause()
 
-        assert conn.execute("SELECT COUNT(*) FROM steering").fetchone() == (0,)
+        assert conn.execute(text("SELECT COUNT(*) FROM steering")).fetchone() == (0,)
         assert app.note == ""
 
     conn.close()
@@ -900,8 +844,7 @@ async def test_instruction_reports_a_database_that_refuses_it(
     """A database without the table (an old bot) fails visibly, not silently."""
     path = tmp_path / "context.db"
     conn = make_context_db(0, path)
-    conn.execute("DROP TABLE steering")
-    conn.commit()
+    conn.execute(text("DROP TABLE steering"))
     app = SpyApp(conn, last_id=0, db_path=path)
 
     async with app.run_test(size=(80, 10)) as pilot:

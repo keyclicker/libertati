@@ -13,6 +13,7 @@ uv run ruff format --check . # formatting
 uv run ty check              # type check
 uv run libertati             # run the bot (needs .env + settings.toml)
 uv run libertati-spy         # dev TUI over the live context DB
+uv run alembic revision --autogenerate -m "..."  # new schema revision
 ```
 
 CI runs all four checks plus tests; keep every one green.
@@ -32,8 +33,16 @@ One package, `src/libertati/`, no sub-packages:
 - `dream.py` — `Dreamer(ModelLoop)` and `DreamGate`: the offline
   reflection session; budget, cooldown and idle triggers.
 - `tools.py` — every function-tool schema and its handler (`Toolbox`).
-- `db.py` — aiosqlite persistence: messages/chats/users, append-only
-  agent context, turns, usage, dreams, wakeups, console instructions.
+- `db.py` — SQLAlchemy (async, Core) persistence: messages/chats/users,
+  append-only agent context, turns, usage, dreams, wakeups, console
+  instructions. Every method is one unit of work on the single pooled
+  connection and returns plain dicts.
+- `schema.py` — the tables as SQLAlchemy metadata, shared by `db.py`,
+  the spy's sync engines and Alembic. Must not import aiogram/openai.
+- `migrations/` — Alembic environment and revisions, shipped as package
+  data; `upgrade_to_head` builds its config in code and `bot.run()`
+  calls it before connecting. The repo-root `alembic.ini` is only for
+  dev-time `revision --autogenerate`.
 - `media.py` — `MediaLens`: turns a message's picture/sticker/gif/video
   into one cached text note (frames tiled into a single image), voice
   into a transcript; `media_ref` resolves what a raw payload carries.
@@ -52,8 +61,9 @@ One package, `src/libertati/`, no sub-packages:
   model (history tools and the context events carry).
 - `spy.py` — standalone TUI over the live database; must not import
   aiogram/openai at module level (keeps `libertati-spy` startup fast).
-  Reads through a `mode=ro` connection and writes exactly one thing —
-  an operator instruction, through a connection of its own.
+  Reads through a `mode=ro` autocommit engine and writes exactly one
+  thing — an operator instruction, through a short-lived engine of its
+  own.
 - `render.py` — how the spy lays out one context item: a layout per
   kind, each falling back to the generic body, plus `searchable()`,
   the text a spy search matches against. Pure functions over decoded
@@ -101,6 +111,14 @@ One package, `src/libertati/`, no sub-packages:
   `ChatOrder`'s per-chat lock. Anything else that makes the handler wait
   belongs inside that lock too, or a later message overtakes an earlier
   one on the way to the agent.
+- **One connection, so writes queue instead of racing.** `Database`
+  opens its engine with `pool_size=1, max_overflow=0`. SQLite admits
+  one writer at a time and no caller retries — `Agent._process` calls
+  `_remember` and `mark_messages_read` outside its `try`, so a raised
+  "database is locked" escapes `run_forever` and the agent stops
+  consuming events for good. A wider pool makes that reachable as soon
+  as a write backlog outlasts `busy_timeout`; the timeout is there for
+  the spy, which writes from a process this pool cannot queue behind.
 - **Timestamps**: UTC in the DB (`clock.utc_stamp`, matches SQLite's
   `datetime('now')`), the configured timezone for anything the model
   sees (`clock.format_local`).
@@ -157,9 +175,11 @@ it in `READ_ONLY_MESSAGING_TOOLS`.
   the two in the same order. Secrets only in `.env` (`LIBERTATI_*`).
 - New `prompts.toml` keys must be added to `Prompts` and `load_prompts`
   in `prompts.py` (all keys required) and to the tests.
-- Schema changes: `SCHEMA` uses `CREATE TABLE IF NOT EXISTS`, which
-  never alters existing tables — add columns for existing DBs via
-  `Database._ensure_column` in `connect()`.
+- Schema changes: edit `schema.py`, then add an Alembic revision
+  (`uv run alembic revision --autogenerate` against a head-migrated
+  scratch DB — see `alembic.ini`). The bot upgrades to head on startup;
+  the test fixture uses `metadata.create_all` and `test_migrations.py`
+  pins head == metadata, so a missing revision fails CI.
 - Tests are plain functions with plain asserts; async tests need no
   decorator (asyncio_mode = auto). Real SQLite via the `db` fixture in
   `conftest.py`; minimal hand-rolled fakes (`SimpleNamespace`, small
@@ -178,8 +198,9 @@ it in `READ_ONLY_MESSAGING_TOOLS`.
   plain text when parsing fails (`_markdown_send`); `@username`
   underscores are pre-escaped.
 - SQLite string ops (LIKE, NOCASE) fold case for ASCII only; message
-  search uses the custom `casefold` SQL function registered in
-  `Database.connect`.
+  search uses the custom `casefold` SQL function registered per pooled
+  connection by the engine `connect` listener in `db.py`, together with
+  the WAL/foreign-key/busy-timeout pragmas.
 - Same-second message bursts are real: any query ordering by `date`
   needs `message_id` as a tiebreaker.
 - The four background loops in `bot.py` must survive transient
@@ -210,10 +231,9 @@ it in `READ_ONLY_MESSAGING_TOOLS`.
   asks for `response_format="json"`, not `"text"`: an endpoint reads the
   format off the filename, and OpenRouter rejects `text` outright. Both
   were found by running real files through the lens, not by tests.
-- `Database.message_thread` spells its columns out instead of reusing
-  `_MESSAGE_ROW` (a recursive CTE gets in the way), so a column added to
-  one has to be added to the other — a transcript rendered from rows
-  missing a column just quietly loses what it carried.
+- Every history query, `Database.message_thread` included, builds on
+  `_message_select()` in `db.py`; a column a transcript needs is added
+  there once and reaches all of them.
 - Not every `api_usage` row measures the context window: a memory
   extraction (`recall`, `summarize_memory`) books itself against the
   turn with `input_context_id = 0`, and lands after the round it served.

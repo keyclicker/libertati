@@ -7,6 +7,7 @@ from typing import Any, cast
 
 import pytest
 from aiogram import Bot
+from conftest import run_sql
 from openai import AsyncOpenAI
 
 from libertati.db import Database
@@ -300,14 +301,13 @@ async def test_a_described_message_is_linked_to_its_file(
     """The link is the join a transcript renders the note through."""
     lens = make_lens(db, tmp_path)
     (lens.media_dir / artifact_name("sticker-uid", ".webp")).write_bytes(b"webp")
-    await db.conn.execute(
-        "INSERT INTO chats (id, type, raw) VALUES (10, 'private', '{}')"
-    )
-    await db.conn.execute(
+    await run_sql(db, "INSERT INTO chats (id, type, raw) VALUES (10, 'private', '{}')")
+    await run_sql(
+        db,
         """
         INSERT INTO messages (chat_id, message_id, date, content_type, raw)
         VALUES (10, 1, '2026-08-04T05:46:31+00:00', 'sticker', '{}')
-        """
+        """,
     )
 
     await lens.look(10, 1, {"sticker": STICKER})
