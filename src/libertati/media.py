@@ -19,19 +19,20 @@ given file at most once. Only an actual no counts — a timeout or a
 server error is not a refusal and stays retryable.
 
 Nothing binary touches disk either. A file is downloaded into memory,
-piped through ffmpeg's stdin and out of its stdout, and sent to the
-model as bytes; when the note lands, the bytes are gone. What survives a
-look is text in the database — a machine this bot runs on never holds a
-stranger's picture at rest. A second look at the same file (a
-``look_at_media`` question) downloads it again; Telegram keeps the
-original, so the ``file_id`` is the cache.
+handed to ffmpeg as an anonymous in-memory file, and sent to the model
+as the bytes ffmpeg writes back down its stdout; when the note lands,
+the bytes are gone. What survives a look is text in the database — a
+machine this bot runs on never holds a stranger's picture at rest. A
+second look at the same file (a ``look_at_media`` question) downloads it
+again; Telegram keeps the original, so the ``file_id`` is the cache.
 """
 
 import asyncio
 import base64
 import logging
-from collections.abc import AsyncIterator
-from contextlib import asynccontextmanager
+import os
+from collections.abc import AsyncIterator, Iterator
+from contextlib import asynccontextmanager, contextmanager
 from dataclasses import dataclass
 from typing import Any
 
@@ -245,19 +246,50 @@ def media_ref(payload: dict[str, Any]) -> MediaRef | None:
 #                      Building frames
 # ==========================================================
 
-# Every command reads the original from stdin and writes the result to
-# stdout: files are what this module is built to avoid. Piped input
-# rules out formats that need seeking, but everything Telegram serves
-# here is written to stream — its videos and gifs are faststart mp4,
-# stickers webm, voice ogg.
+# Every command reads the original out of an anonymous in-memory file
+# and writes the result to stdout: files on disk are what this module is
+# built to avoid, but a *seekable* input is not optional. A pipe is not
+# seekable, and an mp4 whose moov atom sits at the end — which is most
+# of what people upload, Telegram stores it as sent — cannot be demuxed
+# without one. So the descriptor goes to the child instead of the bytes.
 
 
-def image_command() -> list[str]:
+@contextmanager
+def in_memory_file(data: bytes) -> Iterator[int]:
+    """Hold ``data`` in an anonymous file and yield its descriptor.
+
+    A memfd lives in RAM, has no name in any directory and is gone when
+    the last descriptor closes — so ffmpeg gets something it can seek in
+    without a stranger's file ever existing on disk. The child reads it
+    by path (:func:`source_path`) rather than by inheriting our offset,
+    so several runs over the same original are free and independent.
+    """
+    fd = os.memfd_create("libertati-media", os.MFD_CLOEXEC)
+    try:
+        view = memoryview(data)
+        while view:
+            view = view[os.write(fd, view) :]
+        yield fd
+    finally:
+        os.close(fd)
+
+
+def source_path(source: int) -> str:
+    """Name a descriptor as the path the ffmpeg child opens it by.
+
+    ``pass_fds`` leaves the descriptor at the same number in the child,
+    where ``/proc/self/fd`` resolves to the child's own table — so this
+    path means the memfd there, opened afresh at offset zero.
+    """
+    return f"/proc/self/fd/{source}"
+
+
+def image_command(source: int) -> list[str]:
     """Build the ffmpeg call turning one picture into a small webp."""
     return [
         "ffmpeg",
         "-i",
-        "pipe:0",
+        source_path(source),
         "-vf",
         f"scale={FRAME_WIDTH}:-2:force_original_aspect_ratio=decrease",
         "-frames:v",
@@ -272,7 +304,7 @@ def image_command() -> list[str]:
     ]
 
 
-def frames_command(frames: int, duration: float) -> list[str]:
+def frames_command(source: int, frames: int, duration: float) -> list[str]:
     """Build the ffmpeg call tiling a clip's frames into one webp.
 
     Frames are sampled at an even rate across the clip and laid out left
@@ -281,12 +313,12 @@ def frames_command(frames: int, duration: float) -> list[str]:
     alone rather than risking a half-empty tile.
     """
     if frames < 2 or duration <= 0:
-        return image_command()
+        return image_command(source)
     scale = f"scale={FRAME_WIDTH}:-2:force_original_aspect_ratio=decrease"
     return [
         "ffmpeg",
         "-i",
-        "pipe:0",
+        source_path(source),
         "-vf",
         f"fps={frames}/{duration:.3f},{scale},tile={frames}x1",
         "-frames:v",
@@ -301,12 +333,12 @@ def frames_command(frames: int, duration: float) -> list[str]:
     ]
 
 
-def audio_command() -> list[str]:
+def audio_command(source: int) -> list[str]:
     """Build the ffmpeg call re-encoding sound to small mono opus."""
     return [
         "ffmpeg",
         "-i",
-        "pipe:0",
+        source_path(source),
         "-vn",
         "-ac",
         "1",
@@ -320,25 +352,29 @@ def audio_command() -> list[str]:
     ]
 
 
-async def _run(command: list[str], data: bytes) -> bytes | None:
-    """Feed ``data`` to one ffmpeg-family command; stdout, or ``None``.
+async def _run(command: list[str], source: int) -> bytes | None:
+    """Run one ffmpeg-family command over ``source``; stdout, or ``None``.
 
-    Failures are logged and swallowed: a file that will not decode is a
-    file without a description, never an exception reaching a handler.
+    The command already names the descriptor as a path; handing the
+    descriptor itself to the child (``pass_fds``) is what makes that path
+    resolve there. Failures are logged and swallowed: a file that will
+    not decode is a file without a description, never an exception
+    reaching a handler.
     """
     try:
         process = await asyncio.create_subprocess_exec(
             *command,
-            stdin=asyncio.subprocess.PIPE,
+            stdin=asyncio.subprocess.DEVNULL,
             stdout=asyncio.subprocess.PIPE,
             stderr=asyncio.subprocess.PIPE,
+            pass_fds=(source,),
         )
     except OSError:
         log.exception("could not start %s", command[0])
         return None
     try:
         stdout, stderr = await asyncio.wait_for(
-            process.communicate(data), timeout=FFMPEG_TIMEOUT
+            process.communicate(), timeout=FFMPEG_TIMEOUT
         )
     except TimeoutError:
         process.kill()
@@ -356,7 +392,7 @@ async def _run(command: list[str], data: bytes) -> bytes | None:
     return stdout
 
 
-async def probe_duration(data: bytes) -> float:
+async def probe_duration(source: int) -> float:
     """Return a media file's duration in seconds, or 0 when unknown."""
     output = await _run(
         [
@@ -367,9 +403,9 @@ async def probe_duration(data: bytes) -> float:
             "format=duration",
             "-of",
             "default=noprint_wrappers=1:nokey=1",
-            "pipe:0",
+            source_path(source),
         ],
-        data,
+        source,
     )
     try:
         return max(0.0, float((output or b"").decode().strip()))
@@ -678,11 +714,15 @@ class MediaLens:
     async def _build(self, ref: MediaRef) -> bytes | None:
         """Download the original and compress it, all in memory.
 
-        The original exists only as bytes between the Telegram download
-        and the pipe into ffmpeg; what comes back out of the pipe is the
-        small webp or opus the model is sent. Nothing is written
-        anywhere, so there is no half-written file to trust later and
-        nothing to clean up after a crash.
+        The original exists only as an anonymous in-memory file between
+        the Telegram download and the ffmpeg run; what comes back down
+        ffmpeg's stdout is the small webp or opus the model is sent.
+        Nothing is written to disk, so there is no half-written file to
+        trust later and nothing to clean up after a crash — the memfd
+        goes away with the ``with``, crash or not.
+
+        A clip is probed and encoded off that one descriptor, so the
+        bytes are held once however many runs read them.
         """
         if ref.size > MAX_DOWNLOAD_BYTES:
             log.info(
@@ -693,14 +733,19 @@ class MediaLens:
         original = buffer.read() if buffer is not None else b""
         if not original:
             return None
-        if ref.source == "video":
-            duration = await probe_duration(original)
-            command = frames_command(self.max_frames, duration)
-        elif ref.source == "audio":
-            command = audio_command()
-        else:
-            command = image_command()
-        return await _run(command, original) or None
+        with in_memory_file(original) as source:
+            # The download's own copies are dead weight once the memfd
+            # holds the bytes, and this path runs on machines where 20 MB
+            # twice over is worth not carrying through an ffmpeg run.
+            del buffer, original
+            if ref.source == "video":
+                duration = await probe_duration(source)
+                command = frames_command(source, self.max_frames, duration)
+            elif ref.source == "audio":
+                command = audio_command(source)
+            else:
+                command = image_command(source)
+            return await _run(command, source) or None
 
     async def _describe_image(
         self, ref: MediaRef, upload: bytes, question: str | None = None
