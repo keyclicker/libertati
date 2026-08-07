@@ -6,6 +6,7 @@ from pathlib import Path
 import pytest
 from sqlalchemy import Connection, create_engine, insert, select, text
 from sqlalchemy.pool import StaticPool
+from textual.widgets import Static
 
 from libertati import schema
 from libertati.render import TRUNCATE_AT
@@ -34,12 +35,16 @@ def make_context_db(rows: int = 30, path: Path | None = None) -> Connection:
     post instructions need, since those open a connection of their own.
     The real schema, straight from the metadata — a hand-written subset
     would drift. Autocommit, like the viewer's own connection: each
-    write lands at once and each poll reads a fresh snapshot.
+    write lands at once and each poll reads a fresh snapshot. Search
+    indexing runs in a thread, so the shared in-memory connection must
+    be allowed to cross threads — a file database gets that from the
+    sqlite dialect by default, in memory it has to be asked for.
     """
     engine = create_engine(
         f"sqlite:///{path}" if path else "sqlite://",
         poolclass=StaticPool,
         isolation_level="AUTOCOMMIT",
+        connect_args={"check_same_thread": False},
     )
     schema.metadata.create_all(engine)
     conn = engine.connect()
@@ -856,5 +861,113 @@ async def test_instruction_reports_a_database_that_refuses_it(
 
         assert app.note.startswith("instruction failed:")
         assert app.is_running
+
+    conn.close()
+
+
+@pytest.mark.asyncio
+async def test_prompts_paint_over_the_status_not_under_it() -> None:
+    """An open prompt owns the bottom row; the status never covers it.
+
+    The bars live on a layer above the status because both dock to the
+    bottom edge; before they did, the status was painted last and the
+    prompts were typed into blind.
+    """
+    conn = make_context_db(5)
+    app = SpyApp(conn, last_id=0)
+
+    async with app.run_test(size=(80, 12)) as pilot:
+        await pilot.pause()
+        widget, _ = app.screen.get_widget_at(5, 11)
+        assert widget.id == "status"
+
+        await pilot.press("slash")
+        await pilot.pause()
+        widget, _ = app.screen.get_widget_at(5, 11)
+        assert widget.id == "search"
+
+        await pilot.press("escape")
+        await pilot.press("i")
+        await pilot.pause()
+        widget, _ = app.screen.get_widget_at(20, 11)
+        assert widget.id == "steer"
+        widget, _ = app.screen.get_widget_at(1, 11)
+        assert widget.id == "steer-prefix"
+
+    conn.close()
+
+
+@pytest.mark.asyncio
+async def test_steer_prefix_names_the_mode_while_typing() -> None:
+    """ctrl+t mid-typing changes the visible mode, not just the flag."""
+    conn = make_context_db(1)
+    app = SpyApp(conn, last_id=0)
+
+    async with app.run_test(size=(80, 12)) as pilot:
+        await pilot.pause()
+        await pilot.press("I")
+        await pilot.press(*"wait")
+        prefix = app.query_one("#steer-prefix", Static)
+        assert "instruct now!" in str(prefix.render())
+
+        await pilot.press("ctrl+t")
+        assert "instruct:" in str(prefix.render())
+
+    conn.close()
+
+
+@pytest.mark.asyncio
+async def test_wrap_narrows_the_laid_out_text() -> None:
+    """Block text wraps at the configured width, not the terminal's."""
+    conn = make_context_db(0)
+    append_event(conn, "x" * 100)
+    wide = SpyApp(conn, last_id=0)
+    async with wide.run_test(size=(80, 12)) as pilot:
+        await pilot.pause()
+        wide_height = wide.view.blocks[0].height
+
+    narrow = SpyApp(conn, last_id=0, wrap=20)
+    async with narrow.run_test(size=(80, 12)) as pilot:
+        await pilot.pause()
+        # 100 characters at 20 columns are five lines; at the default
+        # width they fit in two.
+        assert narrow.view.blocks[0].height >= wide_height + 3
+
+    conn.close()
+
+
+@pytest.mark.asyncio
+async def test_search_pages_past_rows_that_render_to_nothing() -> None:
+    """A page of empty envelopes does not strand an older match.
+
+    Empty final-output envelopes render to no lines at all; paging past
+    a whole page of them must still count as progress, or the search
+    gives up with the match one page out of reach.
+    """
+    conn = make_context_db(0)
+    append_event(conn, "needle here")
+    empty = json.dumps(
+        {
+            "type": "message",
+            "role": "assistant",
+            "content": [{"type": "output_text", "text": ""}],
+        }
+    )
+    for _ in range(6):
+        conn.execute(insert(schema.context).values(item=empty))
+    for index in range(30):
+        append_event(conn, f"filler {index}")
+    app = SpyApp(conn, last_id=tail_anchor(conn, 10), page_size=5)
+
+    async with app.run_test(size=(80, 10)) as pilot:
+        await pilot.pause()
+        await pilot.press("slash")
+        await pilot.press(*"needle")
+        await pilot.press("enter")
+        await pilot.pause()
+
+        assert app.matches == [Match(1, 0)]
+        assert app.view.cursor == Match(1, 0)
+        assert app.view.oldest_id == 1
 
     conn.close()
