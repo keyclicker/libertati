@@ -608,6 +608,10 @@ class MediaLens:
         The file is fetched from Telegram anew — nothing of the first
         look was kept to reuse.
 
+        A file already retired answers nothing, but a refusal here does
+        not retire one: the model was asked a question about the file,
+        and a no can be about either.
+
         Audio has no such second look — a transcription endpoint takes no
         question — so a voice message answers with its transcript, which
         is everything there is to know about it.
@@ -627,7 +631,18 @@ class MediaLens:
                 try:
                     return await self._describe_image(ref, upload, question=question)
                 except _Refusal as refusal:
-                    await self._flag_refusal(ref, str(refusal))
+                    # The call carried the agent's question as well as
+                    # the file, so a no here does not name the file as
+                    # the reason — "who is the person in this photo?"
+                    # is refused over the asking. Retiring on it would
+                    # cost the file its description, permanently, for a
+                    # question nobody has to ask twice.
+                    log.info(
+                        "model would not answer about %s (%s): %s",
+                        ref.kind,
+                        ref.file_unique_id,
+                        refusal,
+                    )
                     return None
         except Exception:
             log.exception("answering about %s in chat %s failed", ref.kind, chat_id)

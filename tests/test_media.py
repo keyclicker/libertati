@@ -688,14 +688,18 @@ async def test_a_question_about_a_retired_file_is_never_asked(db: Database) -> N
     assert client.responses.calls == []
 
 
-async def test_a_refused_question_retires_the_file_too(db: Database) -> None:
-    """Both model calls carry the same media; a no on either retires it."""
+async def test_a_refused_question_does_not_retire_the_file(db: Database) -> None:
+    """A no about a question is not a no about the file it came with."""
     client = FakeClient()
-    client.responses.refusal = "not this one"
+    client.responses.refusal = "I can't identify people in photos"
     lens = make_lens(db, client)
 
-    assert await lens.ask(10, 1, {"sticker": STICKER}, "what is it?") is None
-    assert await db.media_refused("sticker-uid")
+    assert await lens.ask(10, 1, {"sticker": STICKER}, "who is that?") is None
+    assert not await db.media_refused("sticker-uid")
+
+    # Describing it is a different question, and still gets asked.
+    client.responses.refusal = None
+    assert await lens.look(10, 1, {"sticker": STICKER}) == "a cat knocking a mug over"
 
 
 async def test_media_without_eyes_is_never_looked_at(db: Database) -> None:

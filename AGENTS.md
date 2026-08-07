@@ -236,7 +236,9 @@ it in `READ_ONLY_MESSAGING_TOOLS`.
   was kept), answers with the looser `[media].answer` prompt under
   `media_answer_chars`, and stores nothing. Only the describing path
   writes `media_notes`, because only it describes the file rather than
-  answering about it.
+  answering about it — and for the same reason only it writes
+  `media_refusals`: the answering call carries a question too, so a no
+  on it names no file.
 - ffmpeg reads a memfd, not stdin, and that is not a style choice: a
   pipe cannot be seeked, and an mp4 whose moov atom sits at the end —
   most of what people upload, since Telegram stores a video as sent —
