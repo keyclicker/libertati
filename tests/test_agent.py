@@ -456,6 +456,7 @@ def make_turn_agent(
     reasoning: dict[str, Any] | None = None,
     tools: Any = None,
     api_retries: int = 0,
+    delivery_nudge: bool = True,
 ) -> tuple[Agent, list[dict[str, Any]], FakeContextDB]:
     """Build a bare agent whose API client replays a scripted sequence.
 
@@ -481,6 +482,7 @@ def make_turn_agent(
     agent.mind = cast(Any, SimpleNamespace(resident=lambda: "## Soul\nsoul"))
     agent.base_prompt = "base"
     agent.max_rounds = max_rounds
+    agent.delivery_nudge = delivery_nudge
     agent.max_context_items = MAX_CONTEXT_ITEMS
     agent.trim_context_items = TRIM_CONTEXT_ITEMS
     agent._context = context
@@ -539,6 +541,23 @@ async def test_turn_retries_private_final_output_once() -> None:
     assert calls[1]["input"][-2] == MESSAGE
     assert db.turns == [
         {"start_context_id": 0, "end_context_id": 2, "status": "completed"}
+    ]
+
+
+async def test_turn_leaves_private_output_alone_when_nudge_is_off() -> None:
+    """A model that never mistakes private text for a reply pays no round."""
+    agent, calls, db = make_turn_agent(
+        [api_response([MESSAGE], output_text="This should have been sent")],
+        [EVENT],
+        max_rounds=3,
+        delivery_nudge=False,
+    )
+
+    await agent._turn()
+
+    assert len(calls) == 1
+    assert db.turns == [
+        {"start_context_id": 0, "end_context_id": 1, "status": "completed"}
     ]
 
 
