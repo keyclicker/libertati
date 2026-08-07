@@ -39,8 +39,12 @@ media_dir = "data/media"
 # Any OpenAI-compatible endpoint works: the OpenAI URL below, or e.g.
 # OpenRouter with "https://openrouter.ai/api/v1" and an "openai/…" model.
 # (the key goes in LIBERTATI_API_KEY in .env)
-base_url = "https://api.openai.com/v1"
-model = "gpt-5.6-luna"
+base_url = "https://openrouter.ai/api/v1"
+# model = "mistralai/mistral-small-2603"
+# model = "x-ai/grok-4.20"
+# model = "openai/gpt-5.6-luna"
+# model = "meta-llama/llama-4-scout"
+model = "deepseek/deepseek-v4-flash-0731"
 
 # Reasoning effort for reasoning models.
 # Allowed (model-dependent): none, minimal, low, medium, high, xhigh, max.
@@ -55,11 +59,13 @@ reasoning_context = "current_turn"
 # from the live model window while retaining them in SQLite. Requires
 # reasoning_context = "current_turn". This shrinks serialized input but
 # can reduce prompt-cache reuse for the completed-turn suffix.
-prune_completed_reasoning = false
+prune_completed_reasoning = true
 
 # Model for the one-shot recall extraction that answers `recall` and
 # `summarize_memory` from the mind files.
-recall_model = "gpt-5.6-luna"
+# recall_model = "openai/gpt-5.6-luna"
+# recall_model = "meta-llama/llama-4-scout"
+# recall_model = "mistralai/mistral-small-2603"
 
 # Reasoning effort for that extraction call. Recall is a lookup over notes
 # already present in its input, so thinking tokens buy little and are paid
@@ -67,7 +73,7 @@ recall_model = "gpt-5.6-luna"
 recall_reasoning_effort = "none"
 
 # Model used while dreaming.
-dream_model = "gpt-5.6-luna"
+# dream_model = "gpt-5.6-luna"
 
 # Extra attempts for a model call that failed for a transient reason:
 # the endpoint was unreachable, overloaded or rate limiting. Nothing
@@ -122,11 +128,11 @@ media_wait_seconds = 6.0
 # context_max_items. Chunked trims keep the prompt prefix byte-stable,
 # avoiding a prefix rewrite on every append. Actual cache hits depend on
 # model-specific cache keys and breakpoints.
-context_max_items = 300
-context_trim_items = 200
+context_max_items = 125
+context_trim_items = 75
 
 # Max model/tool rounds per agent turn (one turn per event batch).
-max_rounds = 8
+max_rounds = 12
 
 # When a turn ends in plain text instead of a tool call, spend one more
 # round telling the model that text reached nobody. Weaker models end
@@ -162,7 +168,7 @@ chat_approval = true
 chats_path = "data/chats.toml"
 
 # Minutes between heartbeat status events (0 disables, ±20% jitter).
-heartbeat_minutes = 5
+heartbeat_minutes = 60
 
 # Simulated typing speed for outgoing messages, chars/second (0 disables).
 typing_chars_per_second = 15.0
