@@ -15,6 +15,12 @@ uv run alembic stamp head
 (with `alembic.ini`'s `sqlalchemy.url` pointing at the file). For
 anything older, delete the file and let the bot recreate it.
 
+Stamping is only safe for a database *born* current. One whose schema
+looks current because `_ensure_column` patched it on the way is exactly
+the case removals 2 and 3 below describe: its old rows still carry a
+NULL `message_thread_id` and reply links into topic-creation service
+messages, and after the stamp nothing ever repairs them.
+
 ## What was removed
 
 1. **`Database._ensure_column`** and its five column adds:
