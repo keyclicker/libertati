@@ -906,7 +906,6 @@ class SpyApp(App[None]):
         # Opening straight into a dream is a deliberate choice; don't
         # then drag the view somewhere else.
         self.auto = dream_id is None
-        self.running_dream: int | None = None
         self.last_activity: str | None = None
         self.usage: Usage | None = None
         self.next_tokens: int | None = None
