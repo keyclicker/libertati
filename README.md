@@ -37,8 +37,9 @@ when to reply. Plain assistant output is ignored and sends nothing.
   keyed by Telegram's `file_unique_id`, so the sticker a group spams all
   day is paid for once; the describer runs on the same endpoint and key
   as the agent itself. Nothing binary touches disk either: a file is
-  downloaded into memory, piped through ffmpeg and sent to the model as
-  bytes, and what survives a look is the text in the database — a second
+  downloaded into an anonymous file in memory, read from there by ffmpeg
+  and sent to the model as bytes, and what survives a look is the text
+  in the database — a second
   look fetches the file from Telegram again. A file the model refuses to
   look at is remembered and never downloaded or sent again. Media that
   arrives while nobody is addressing the bot

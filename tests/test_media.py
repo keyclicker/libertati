@@ -2,6 +2,7 @@
 
 import asyncio
 import io
+import os
 from pathlib import Path
 from types import SimpleNamespace
 from typing import Any, cast
@@ -14,11 +15,14 @@ from openai import AsyncOpenAI, BadRequestError, InternalServerError
 
 from libertati.db import Database
 from libertati.media import (
+    MAX_DOWNLOAD_BYTES,
     MediaLens,
     audio_command,
     frames_command,
     image_command,
+    in_memory_file,
     media_ref,
+    source_path,
 )
 
 STICKER = {
@@ -118,17 +122,19 @@ class FakeBot:
 
 @pytest.fixture(autouse=True)
 def ffmpeg(monkeypatch: pytest.MonkeyPatch) -> list[tuple[list[str], bytes]]:
-    """Stand in for ffmpeg: every pipe run "encodes" to placeholder bytes.
+    """Stand in for ffmpeg: every run "encodes" to placeholder bytes.
 
-    Records each (command, stdin) pair, so a test can check what would
-    have been piped where. ffprobe runs go through the same stub; its
-    non-numeric answer reads as an unknown duration, which is fine —
-    duration only shapes the ffmpeg filter, and no real ffmpeg runs.
+    Records each (command, source contents) pair — the descriptor is read
+    from the start, the way the child would open it — so a test can check
+    what would have been handed where. ffprobe runs go through the same
+    stub; its non-numeric answer reads as an unknown duration, which is
+    fine — duration only shapes the ffmpeg filter, and no real ffmpeg
+    runs.
     """
     calls: list[tuple[list[str], bytes]] = []
 
-    async def fake_run(command: list[str], data: bytes) -> bytes | None:
-        calls.append((command, data))
+    async def fake_run(command: list[str], source: int) -> bytes | None:
+        calls.append((command, os.pread(source, MAX_DOWNLOAD_BYTES, 0)))
         return b"encoded"
 
     monkeypatch.setattr("libertati.media._run", fake_run)
@@ -267,16 +273,32 @@ def test_messages_without_describable_media_resolve_to_nothing() -> None:
 # ==========================================================
 
 
-def test_every_command_reads_stdin_and_writes_stdout() -> None:
-    """Files are what this module avoids; ffmpeg touches pipes only."""
-    for command in (image_command(), frames_command(3, 4.0), audio_command()):
-        assert command[command.index("-i") + 1] == "pipe:0"
+def test_every_command_reads_a_descriptor_and_writes_stdout() -> None:
+    """Files on disk are what this module avoids, not seekable input."""
+    for command in (image_command(7), frames_command(7, 3, 4.0), audio_command(7)):
+        assert command[command.index("-i") + 1] == "/proc/self/fd/7"
         assert command[-1] == "pipe:1"
+
+
+def test_the_source_is_an_anonymous_file_ffmpeg_can_seek_in() -> None:
+    """A pipe cannot be seeked, and an mp4 with a trailing moov needs it."""
+    with in_memory_file(b"video-bytes") as source:
+        # What the child would do: open the path, read it whole, and do
+        # it again from the start — neither of which a pipe allows.
+        with open(source_path(source), "rb") as opened:
+            assert opened.read() == b"video-bytes"
+        with open(source_path(source), "rb") as reopened:
+            reopened.seek(6)
+            assert reopened.read() == b"bytes"
+        held = source
+    # Nothing of the file outlives the block: no name, no descriptor.
+    with pytest.raises(OSError):
+        os.fstat(held)
 
 
 def test_frames_command_tiles_the_clip_across_its_duration() -> None:
     """Three frames of a four-second gif, sampled evenly, side by side."""
-    command = frames_command(3, 4.0)
+    command = frames_command(7, 3, 4.0)
     filters = command[command.index("-vf") + 1]
     assert "fps=3/4.000" in filters
     assert "tile=3x1" in filters
@@ -284,12 +306,12 @@ def test_frames_command_tiles_the_clip_across_its_duration() -> None:
 
 def test_frames_command_falls_back_to_one_still() -> None:
     """A clip of unknown length would tile into a half-empty image."""
-    assert frames_command(3, 0.0) == image_command()
+    assert frames_command(7, 3, 0.0) == image_command(7)
 
 
 def test_audio_command_produces_small_mono_opus() -> None:
     """Voice is kept re-transcribable, not hi-fi."""
-    command = audio_command()
+    command = audio_command(7)
     assert "libopus" in command
     assert command[command.index("-ac") + 1] == "1"
 
@@ -317,10 +339,10 @@ async def test_a_file_is_described_once_and_read_back_forever(
     assert await db.media_note("sticker-uid") == first
 
 
-async def test_the_original_reaches_ffmpeg_as_bytes_never_a_file(
+async def test_the_original_reaches_ffmpeg_in_memory_never_as_a_file(
     db: Database, ffmpeg: list[tuple[list[str], bytes]]
 ) -> None:
-    """What Telegram hands over is piped straight through, byte for byte."""
+    """What Telegram hands over is what ffmpeg reads, byte for byte."""
     bot = FakeBot(b"webm-bytes")
     lens = make_lens(db, bot=bot)
 
@@ -330,6 +352,9 @@ async def test_the_original_reaches_ffmpeg_as_bytes_never_a_file(
     probe, encode = (command for command, _ in ffmpeg)
     assert probe[0] == "ffprobe"
     assert encode[0] == "ffmpeg"
+    # Probing and encoding read one descriptor, so the download is held
+    # once however many runs go over it.
+    assert probe[-1] == encode[encode.index("-i") + 1]
 
 
 async def test_the_model_is_sent_what_ffmpeg_piped_out(db: Database) -> None:
@@ -348,7 +373,7 @@ async def test_a_file_ffmpeg_cannot_decode_stays_undescribed(
 ) -> None:
     """A decode failure is a missing note, never an exception or a call."""
 
-    async def broken_run(command: list[str], data: bytes) -> bytes | None:
+    async def broken_run(command: list[str], source: int) -> bytes | None:
         return None
 
     monkeypatch.setattr("libertati.media._run", broken_run)

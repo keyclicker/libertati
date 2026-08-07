@@ -46,8 +46,9 @@ One package, `src/libertati/`, no sub-packages:
 - `media.py` — `MediaLens`: turns a message's picture/sticker/gif/video
   into one cached text note (frames tiled into a single image), voice
   into a transcript; `media_ref` resolves what a raw payload carries.
-  Wholly in memory: downloads are buffers, ffmpeg reads stdin and
-  writes stdout, nothing binary lands on disk. A file the model refuses
+  Wholly in memory: a download goes into an anonymous memfd, ffmpeg
+  reads that descriptor and writes stdout, nothing binary lands on
+  disk. A file the model refuses
   is retired for good (`media_refusals`). Off unless `media_model` is
   set; runs on `base_url` with the one `api_key`, so a model named
   there must be one that provider serves. Needs ffmpeg on PATH.
@@ -104,8 +105,9 @@ One package, `src/libertati/`, no sub-packages:
   Notes are keyed by `file_unique_id` (describe once, ever) and reach a
   transcript through `messages.media_uid`, which is written only after a
   description exists. Media never touches disk either: the original is
-  downloaded into memory, piped through ffmpeg (stdin to stdout) and
-  sent to the model as bytes. Nothing binary is kept — a second look
+  downloaded into an anonymous in-memory file (`in_memory_file`), read
+  from there by ffmpeg and sent to the model as the bytes ffmpeg writes
+  back. Nothing binary is kept — a second look
   (`look_at_media` with a question) fetches the file from Telegram
   again. A file a model refused (a Responses refusal part, or a 400
   that smells of content policy) is retired via `media_refusals` and
@@ -232,8 +234,16 @@ it in `READ_ONLY_MESSAGING_TOOLS`.
   `media_answer_chars`, and stores nothing. Only the describing path
   writes `media_notes`, because only it describes the file rather than
   answering about it.
+- ffmpeg reads a memfd, not stdin, and that is not a style choice: a
+  pipe cannot be seeked, and an mp4 whose moov atom sits at the end —
+  most of what people upload, since Telegram stores a video as sent —
+  fails to demux without seeking (`Invalid data found when processing
+  input`, empty output, no note). `_run` passes the descriptor to the
+  child (`pass_fds`) and the command names it as `/proc/self/fd/N`, so
+  the media path needs Linux (`os.memfd_create`) as well as ffmpeg.
 - ffmpeg is a hard dependency of the media path only; tests never invoke
-  it (the autouse `ffmpeg` fixture stubs `_run`), so CI needs no ffmpeg.
+  it (the autouse `ffmpeg` fixture stubs `_run`, recording each command
+  with what its descriptor held), so CI needs no ffmpeg.
 - The voice upload is named `.ogg`, not `.opus`, and transcription
   asks for `response_format="json"`, not `"text"`: an endpoint reads the
   format off the filename, and OpenRouter rejects `text` outright. Both
