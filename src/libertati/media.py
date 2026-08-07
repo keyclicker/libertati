@@ -622,12 +622,18 @@ class MediaLens:
         try:
             if ref.source == "audio":
                 return await self._note(chat_id, message_id, ref)
-            if await self.db.media_refused(ref.file_unique_id):
-                return None
-            async with self._file_lock(ref.file_unique_id), self._jobs:
-                upload = await self._build(ref)
-                if upload is None:
+            async with self._file_lock(ref.file_unique_id):
+                # Inside the lock, like the describing path's check: a
+                # look and a question about the same file run together
+                # often enough, and reading the flag outside means
+                # downloading and sending a file the look just had
+                # refused.
+                if await self.db.media_refused(ref.file_unique_id):
                     return None
+                async with self._jobs:
+                    upload = await self._build(ref)
+                    if upload is None:
+                        return None
                 try:
                     return await self._describe_image(ref, upload, question=question)
                 except _Refusal as refusal:

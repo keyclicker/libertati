@@ -688,6 +688,25 @@ async def test_a_question_about_a_retired_file_is_never_asked(db: Database) -> N
     assert client.responses.calls == []
 
 
+async def test_a_question_racing_a_refusal_waits_for_it(db: Database) -> None:
+    """The flag is read under the file's lock, so it is read in time."""
+    client = FakeClient(delay=0.02)
+    client.responses.refusal = "I can't help with that"
+    bot = FakeBot()
+    lens = make_lens(db, client, bot)
+
+    # The look is what refuses; the question about the same file arrives
+    # while it is still in flight and must not send the file again.
+    described, answered = await asyncio.gather(
+        lens.look(10, 1, {"sticker": STICKER}),
+        lens.ask(10, 2, {"sticker": STICKER}, "what is it?"),
+    )
+
+    assert (described, answered) == (None, None)
+    assert bot.downloads == ["sticker-file"]
+    assert len(client.responses.calls) == 1
+
+
 async def test_a_refused_question_does_not_retire_the_file(db: Database) -> None:
     """A no about a question is not a no about the file it came with."""
     client = FakeClient()
